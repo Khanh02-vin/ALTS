@@ -11,6 +11,7 @@
 //! CoreML / DirectML execution providers (Pro tier only). Free tier stays on CPU.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use image::RgbImage;
 use ort::environment::Environment;
@@ -41,35 +42,23 @@ pub struct AiEngine {
     env: Environment,
 }
 
+/// The process-wide ONNX Runtime environment: the C API allows exactly one per
+/// process, so every detector shares this instance instead of building its own.
+static ENGINE: OnceLock<Result<Environment, String>> = OnceLock::new();
+
 impl AiEngine {
-    /// Creates a new engine.
+    /// Creates a new engine handle backed by the process-wide environment.
     ///
     /// When the `gpu` feature is enabled, CUDA / CoreML / DirectML execution
     /// providers are tried in preference order; on any failure the engine falls
     /// back to the CPU provider so the app never crashes on a machine without a
     /// supported GPU.
     pub fn new() -> AiResult<Self> {
-        let builder = ort::environment::init();
-        #[cfg(feature = "gpu")]
-        {
-            let mut builder = builder;
-            // CUDA (NVIDIA) first on Windows/Linux.
-            if let Ok(ep) = ort::execution_providers::CUDA::default().build() {
-                builder = builder.with_execution_providers([ep]);
-            }
-            // CoreML (Apple Silicon / Intel Macs).
-            if let Ok(ep) = ort::execution_providers::CoreML::default().build() {
-                builder = builder.with_execution_providers([ep]);
-            }
-            // DirectML (Windows Intel/AMD iGPU).
-            if let Ok(ep) = ort::execution_providers::DirectML::default().build() {
-                builder = builder.with_execution_providers([ep]);
-            }
-        }
-        let env = builder
-            .build()
-            .map_err(|e| AiError::Session(e.to_string()))?;
-        Ok(Self { env })
+        ENGINE
+            .get_or_init(build_environment)
+            .as_ref()
+            .map(|env| Self { env: env.clone() })
+            .map_err(|error| AiError::Session(error.clone()))
     }
 
     /// Resolves a bundled model path: resource dir first, then the dev-tree fallback.
@@ -102,6 +91,28 @@ impl AiEngine {
                 .unwrap_or_else(|_| PathBuf::from("models").join(name)),
         ))
     }
+}
+
+/// Builds the one ONNX Runtime environment this process is allowed to have.
+fn build_environment() -> Result<Environment, String> {
+    let builder = ort::environment::init();
+    #[cfg(feature = "gpu")]
+    {
+        let mut builder = builder;
+        // CUDA (NVIDIA) first on Windows/Linux.
+        if let Ok(ep) = ort::execution_providers::CUDA::default().build() {
+            builder = builder.with_execution_providers([ep]);
+        }
+        // CoreML (Apple Silicon / Intel Macs).
+        if let Ok(ep) = ort::execution_providers::CoreML::default().build() {
+            builder = builder.with_execution_providers([ep]);
+        }
+        // DirectML (Windows Intel/AMD iGPU).
+        if let Ok(ep) = ort::execution_providers::DirectML::default().build() {
+            builder = builder.with_execution_providers([ep]);
+        }
+    }
+    builder.build().map_err(|e| e.to_string())
 }
 
 /// Runs the bundled PP-OCRv6 DB text detector and returns one normalized union

@@ -690,14 +690,22 @@ pub(crate) fn auto_person_layouts(
 
 /// Detects stable source text boxes locally for the burned-caption cover. Only
 /// normalized geometry is returned; OCR strings and frame contents are discarded.
+///
+/// Like `auto_person_layouts`, sampling never blocks a render: without the OCR
+/// model the render just proceeds with no burned-caption boxes.
 pub(crate) fn auto_text_boxes(
     app: &tauri::AppHandle,
     input: &Path,
     ranges: &[(f64, f64)],
     source_artifact_id: &str,
 ) -> Result<Vec<Value>, String> {
-    let mut detector =
-        TextRegionDetector::load(app).map_err(|error| format!("OCR_MODEL_REQUIRED:{error}"))?;
+    let mut detector = match TextRegionDetector::load(app) {
+        Ok(detector) => detector,
+        Err(error) => {
+            eprintln!("OCR_MODEL_REQUIRED:{error}");
+            return Ok(Vec::new());
+        }
+    };
     const MAX_OCR_SAMPLES_PER_RENDER: usize = 60;
     if ranges.len() > MAX_OCR_SAMPLES_PER_RENDER {
         return Err("OCR_SAMPLE_LIMIT_EXCEEDED".into());
