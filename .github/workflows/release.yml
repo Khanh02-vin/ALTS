@@ -193,7 +193,9 @@ jobs:
           path: apps/desktop/src-tauri/target/release/portable-windows.zip
 
   linux:
-    runs-on: ubuntu-24.04
+    # Newer bundled WebKitGTK is required for current Mesa; this raises the
+    # AppImage build baseline to Ubuntu 26.04 (glibc 2.43).
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -229,6 +231,12 @@ jobs:
           cd apps/desktop
           npm install
           npx tauri build -b appimage
+      - name: Smoke-test Linux AppImage
+        run: |
+          sudo -n apt-get install -y xvfb xauth xdotool
+          APPIMAGE=$(find apps/desktop/src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)
+          test -n "$APPIMAGE"
+          xvfb-run -a bash scripts/appimage-smoke.sh "$APPIMAGE"
       - uses: actions/upload-artifact@v4
         with:
           name: linux-installer
