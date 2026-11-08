@@ -5,6 +5,7 @@ import { fileURLToPath } from "node:url";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
+import { snapHighlightsToPauses } from "../../services/ai-pipeline/pause-snap.ts";
 import { chooseHeuristicHighlights } from "../../services/ai-pipeline/heuristic.ts";
 import { chooseContentHighlights } from "../../services/ai-pipeline/content-highlights.ts";
 import { generateSemanticHighlights, createMockSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
@@ -165,7 +166,15 @@ async function main(): Promise<void> {
         const predictions = typeof (pending as Promise<Highlight[]>).then === "function"
           ? await Promise.race([pending, new Promise<Highlight[]>((_, reject) => setTimeout(() => reject(new Error("EVAL_CASE_TIMEOUT")), 240_000).unref())])
           : (pending as Highlight[]);
-        for (const p of predictions) validateHighlights([p], transcript.duration);
+        for (const p of predictions) {
+          validateHighlights([p], transcript.duration);
+          assert.ok(p.scores, `${row.name} must emit component scores`);
+          for (const axis of ["hook", "summary", "impact"] as const) {
+            assert.ok(Number.isFinite(p.scores[axis]) && p.scores[axis] >= 0 && p.scores[axis] <= 100, `${row.name} emitted invalid ${axis} score`);
+          }
+          const dominant = (["hook", "summary", "impact"] as const).reduce((best, axis) => p.scores[axis] > p.scores[best] ? axis : best, "hook");
+          assert.equal(p.dominantAxis, p.scores[dominant] >= 70 ? dominant : undefined, `${row.name} dominant axis must be the ≥70 component maximum`);
+        }
         const result = scoreCase(item.expected, predictions, ks);
         results.push(result);
         if (result.meanIou < worst.iou) worst = { id: item.id, iou: result.meanIou };
@@ -202,6 +211,116 @@ async function main(): Promise<void> {
   assert.equal(scoreOf(gapped, 6), scoreOf(gapped, 0), "contiguous segments must not earn the pause bonus");
   const tight = mkPauseCase(0.2);     // 0.2s gap — below threshold
   assert.equal(scoreOf(tight, 12), scoreOf(tight, 6), "sub-threshold gap must not lift score");
+
+  // Post-selection pause snapping moves only boundaries already selected by the
+  // ranker, is bounded to 0.5s, and refreshes the associated word IDs.
+  const snapTranscript: Transcript = {
+    version: 1, sourceArtifactId: "snap", language: "en", duration: 32, provider: "test",
+    words: [
+      { id: "before", text: "before", start: 9.2, end: 9.8 },
+      { id: "first", text: "first", start: 10.15, end: 12 },
+      { id: "last", text: "last", start: 17, end: 19.8 },
+      { id: "after", text: "after", start: 20.2, end: 21 },
+      { id: "distant", text: "distant", start: 25, end: 26 },
+    ],
+    segments: [],
+  };
+  const selected: Highlight[] = [{
+    version: 1, id: "selected", sourceArtifactId: "snap", start: 10.4, end: 19.9,
+    wordIds: ["stale"], title: "Selected", score: 82,
+  }];
+  const snapped = snapHighlightsToPauses(selected, snapTranscript);
+  assert.equal(snapped[0].start, 10.15, "a ≥0.3s pause can snap the start to the following word");
+  assert.equal(snapped[0].end, 19.8, "a ≥0.3s pause can snap the end to the preceding word");
+  assert.deepEqual(snapped[0].wordIds, ["first", "last"], "word IDs are refreshed after snapping");
+  assert.equal(snapped[0].score, selected[0].score, "snapping must not change aggregate score");
+  assert.equal(snapped[0].id, selected[0].id, "snapping must preserve selected identity/order");
+
+  const ineligibleTranscript: Transcript = {
+    ...snapTranscript,
+    words: [
+      { id: "a", text: "a", start: 9.2, end: 9.8 },
+      { id: "b", text: "b", start: 10, end: 12 }, // only a 0.2s pause
+      { id: "c", text: "c", start: 17, end: 19.8 },
+      { id: "d", text: "d", start: 20, end: 21 }, // only a 0.2s pause
+    ],
+  };
+  assert.deepEqual(snapHighlightsToPauses(selected, ineligibleTranscript), selected, "gaps below 0.3s do not snap");
+  const cappedTranscript: Transcript = {
+    ...snapTranscript,
+    words: [
+      { id: "before", text: "before", start: 9.2, end: 9.8 },
+      { id: "first", text: "first", start: 10.15, end: 12 },
+      { id: "last", text: "last", start: 17, end: 19.8 },
+      { id: "after", text: "after", start: 20.2, end: 21 },
+    ],
+  };
+  const beyondCap = [{ ...selected[0], start: 10.8 }];
+  assert.equal(snapHighlightsToPauses(beyondCap, cappedTranscript)[0].start, 10.8, "snaps beyond 0.5s are rejected");
+  const blockedStart = snapHighlightsToPauses(
+    [{ ...selected[0], start: 10.4 }],
+    { ...snapTranscript, words: [
+      { id: "before", text: "before", start: 9.2, end: 9.8 },
+      { id: "first", text: "first", start: 10.15, end: 12 },
+      { id: "last", text: "last", start: 17, end: 19.8 },
+      { id: "after", text: "after", start: 20.2, end: 21 },
+    ] },
+  );
+  // The preceding highlight makes only the proposed start invalid; keep the valid end snap.
+  const withPrevious = snapHighlightsToPauses(
+    [
+      { ...selected[0], id: "previous", start: 9.8, end: 10.25, wordIds: ["before"] },
+      { ...selected[0], start: 10.4 },
+    ],
+    { ...snapTranscript, words: [
+      { id: "before", text: "before", start: 9.2, end: 9.8 },
+      { id: "first", text: "first", start: 10.15, end: 12 },
+      { id: "last", text: "last", start: 17, end: 19.8 },
+      { id: "after", text: "after", start: 20.2, end: 21 },
+    ] },
+  );
+  assert.equal(withPrevious[1]!.start, 10.4, "invalid start snap must retain its original boundary");
+  assert.equal(withPrevious[1]!.end, 19.8, "a valid end snap should survive an invalid start snap");
+  assert.equal(blockedStart[0]!.end, 19.8, "snapping remains valid without neighboring selections");
+
+  const segmentOnly: Transcript = {
+    version: 1, sourceArtifactId: "segment-only", language: "en", duration: 25, provider: "test", words: [],
+    segments: [
+      { id: "before-segment", text: "before", start: 9.2, end: 9.8, wordIds: ["before-word"] },
+      { id: "first-segment", text: "first", start: 10.15, end: 12, wordIds: ["first-word"] },
+      { id: "last-segment", text: "last", start: 17, end: 19.8, wordIds: ["last-word"] },
+      { id: "after-segment", text: "after", start: 20.2, end: 21, wordIds: ["after-word"] },
+    ],
+  };
+  const segmentSnapped = snapHighlightsToPauses([{ ...selected[0], sourceArtifactId: "segment-only" }], segmentOnly);
+  assert.deepEqual(segmentSnapped[0]!.wordIds, ["first-word", "last-word"], "segment-only snapping refreshes segment word IDs");
+
+  const sentenceTranscript: Transcript = {
+    ...snapTranscript,
+    words: [
+      { id: "opening", text: "Opening", start: 0, end: 0.8 },
+      { id: "sentence-end", text: "complete.", start: 0.85, end: 1.5 },
+      { id: "next", text: "Next", start: 1.55, end: 2.1 },
+      { id: "thought-end", text: "thought!", start: 2.15, end: 2.8 },
+      { id: "tail", text: "Tail", start: 2.85, end: 3.5 },
+    ],
+  };
+  const sentenceSnapped = snapHighlightsToPauses([{
+    ...selected[0], start: 1.52, end: 2.84, wordIds: ["stale"],
+  }], sentenceTranscript)[0]!;
+  assert.equal(sentenceSnapped.start, 1.55, "sentence start should snap to the first word after punctuation");
+  assert.equal(sentenceSnapped.end, 2.8, "sentence end should snap to a punctuation-ending word");
+  assert.deepEqual(sentenceSnapped.wordIds, ["next", "thought-end"], "sentence snapping refreshes word IDs");
+
+  // Snapping is a timestamp refinement, not another selector: evaluate the
+  // selector's chosen set before/after on every fixture and protect aggregate IoU.
+  const snapBaselines = transcripts.map(({ item, transcript }) => {
+    const baseline = chooseHeuristicHighlights(transcript, LIMIT);
+    return { expected: item.expected, baseline, snapped: snapHighlightsToPauses(baseline, transcript) };
+  });
+  const baselineMeanIou = aggregate(snapBaselines.map(({ expected, baseline }) => scoreCase(expected, baseline, ks))).meanIou;
+  const snappedMeanIou = aggregate(snapBaselines.map(({ expected, snapped }) => scoreCase(expected, snapped, ks))).meanIou;
+  assert.ok(snappedMeanIou >= baselineMeanIou, `pause snapping must not regress aggregate heuristic IoU (${snappedMeanIou} < ${baselineMeanIou})`);
 
   // --- CI assertions (offline rows only) ------------------------------------
   // Prompt shape: compact word lines, never full word-object JSON — this is

@@ -3,7 +3,7 @@
   import { goto } from "$app/navigation";
   import { invoke, isTauri } from "@tauri-apps/api/core";
   import { studioState } from "../studio-state.svelte.ts";
-  import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
+  import { isActiveHighlight, type Highlight } from "../../../../../packages/contracts/highlight.ts";
   import type { RenderPlan } from "../../../../../packages/contracts/render-plan.ts";
 
   type Project = {
@@ -42,8 +42,9 @@
       studioState.sourceDuration = project.sourceDuration;
       studioState.transcript = project.transcript as typeof studioState.transcript;
       studioState.highlights = project.highlights ?? [];
-      studioState.selectedId = project.selectedId ?? project.highlights[0]?.id ?? "";
-      studioState.selectedIds = project.selectedIds?.length ? project.selectedIds : (studioState.selectedId ? [studioState.selectedId] : []);
+      const activeIds = new Set(studioState.highlights.filter(isActiveHighlight).map((item) => item.id));
+      studioState.selectedId = activeIds.has(project.selectedId ?? "") ? (project.selectedId as string) : (studioState.highlights.find(isActiveHighlight)?.id ?? "");
+      studioState.selectedIds = project.selectedIds?.length ? project.selectedIds.filter((id) => activeIds.has(id)) : (studioState.selectedId ? [studioState.selectedId] : []);
       studioState.plans = project.plans ?? {};
       studioState.plan = studioState.plans[studioState.selectedId] ?? null;
       await goto("/");

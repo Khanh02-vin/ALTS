@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import { OpenAIChatHighlightProvider } from "../../services/ai-pipeline/providers.ts";
+import { GeminiHighlightProvider, HIGHLIGHT_OUTPUT_SCHEMA, OpenAIChatHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
 
 /**
  * OpenAI-compatible chat highlight provider: POST {baseUrl}/chat/completions
@@ -123,6 +123,45 @@ const okChoices = (content: string) =>
   const provider = new OpenAIChatHighlightProvider("https://api.example.com/v1", "k", "m");
   for (let i = 0; i < 5; i++) await assert.rejects(() => provider.choose({ transcript: makeTranscript() }), /OPENAI_CHAT_PROVIDER_503/);
   await assert.rejects(() => provider.choose({ transcript: makeTranscript() }), /CIRCUIT_BREAKER_OPEN/);
+}
+
+// 9. Provider schemas/prompt request component scores, while legacy mappings remain accepted.
+{
+  const fields = HIGHLIGHT_OUTPUT_SCHEMA.properties.highlights.items.properties;
+  assert.deepEqual(Object.keys(fields.scores.properties), ["hook", "summary", "impact"]);
+  assert.ok(!("dominantAxis" in fields), "dominantAxis is derived locally");
+  const prompt = highlightPrompt(makeTranscript());
+  assert.match(prompt, /"scores":\{"hook":0-100,"summary":0-100,"impact":0-100\}/);
+  assert.doesNotMatch(prompt, /dominantAxis/);
+
+  const [legacy] = mapWordRangeProposals(makeTranscript(), [{ from: 0, to: 2, title: "Why this works?", score: 0.9 }]);
+  assert.equal(legacy.score, 90, "aggregate score normalization remains unchanged");
+  assert.ok(legacy.scores);
+  assert.deepEqual(Object.keys(legacy.scores), ["hook", "summary", "impact"]);
+  assert.equal(legacy.dominantAxis, undefined, "fallback components remain below the dominant-axis threshold where appropriate");
+
+  const [scored] = mapWordRangeProposals(makeTranscript(), [{
+    from: 0, to: 2, title: "Moment", score: 82,
+    scores: { hook: 80, summary: 60, impact: 72 }, dominantAxis: "summary",
+  }]);
+  assert.equal(scored.score, 82);
+  assert.deepEqual(scored.scores, { hook: 80, summary: 60, impact: 72 });
+  assert.equal(scored.dominantAxis, "hook", "dominant axis is derived from locally normalized components");
+}
+
+// 10. Gemini sends the same component-score schema in its response configuration.
+{
+  let request: Record<string, unknown> | undefined;
+  globalThis.fetch = (async (_url: unknown, init?: RequestInit) => {
+    request = JSON.parse(String(init?.body));
+    return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text: cannedBody }] } }] }), { status: 200 });
+  }) as typeof fetch;
+  const provider = new GeminiHighlightProvider("gemini-key");
+  await provider.chooseTranscript(makeTranscript());
+  const config = request?.generationConfig as { responseSchema: typeof HIGHLIGHT_OUTPUT_SCHEMA };
+  const fields = config.responseSchema.properties.highlights.items.properties;
+  assert.deepEqual(Object.keys(fields.scores.properties), ["hook", "summary", "impact"]);
+  assert.ok(!("dominantAxis" in fields));
 }
 
 console.log("openai-chat provider tests passed");

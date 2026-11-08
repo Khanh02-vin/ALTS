@@ -25,6 +25,10 @@ pub struct Project {
     #[serde(default)]
     pub variants: Vec<Value>,
     #[serde(default)]
+    pub summary_variants: Vec<Value>,
+    #[serde(default)]
+    pub script_outline: Vec<Value>,
+    #[serde(default)]
     pub selected_variant_id: Option<String>,
     #[serde(default)]
     pub speaker_face_matches: Option<Value>,
@@ -49,6 +53,16 @@ fn validate_project(project: &Project) -> Result<(), String> {
     validate_id(&project.id)?;
     if !project.source_duration.is_finite() || project.source_duration < 0.0 {
         return Err("INVALID_SOURCE_DURATION".into());
+    }
+    // Highlights persist as opaque JSON values; per-highlight status
+    // (saved/discarded) rides along additively with no schema change.
+    for highlight in &project.highlights {
+        if let Some(status) = highlight.get("status") {
+            let status = status.as_str().ok_or("INVALID_HIGHLIGHT_STATUS")?;
+            if !matches!(status, "active" | "saved" | "discarded") {
+                return Err("INVALID_HIGHLIGHT_STATUS".into());
+            }
+        }
     }
     // Keep the project's established plans shape (an object keyed by highlight id).
     let plans = project.plans.as_object().ok_or("INVALID_PROJECT_PLANS")?;
@@ -114,7 +128,8 @@ fn import_json_projects(db: &Connection, dir: &Path) -> Result<(), String> {
         if !exists {
             let record =
                 serde_json::to_string(&project).map_err(|e| format!("PROJECT_JSON:{e}"))?;
-            let revision = i64::try_from(project.revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
+            let revision =
+                i64::try_from(project.revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
             db.execute(
                 "INSERT INTO projects(id,record_json,updated_at,revision) VALUES(?1,?2,?3,?4)",
                 params![project.id, record, project.updated_at, revision],
@@ -144,7 +159,11 @@ pub fn save(dir: &Path, mut project: Project) -> Result<Project, String> {
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|e| format!("PROJECT_DB:{e}"))?;
     let current: Option<i64> = tx
-        .query_row("SELECT revision FROM projects WHERE id=?1", [&project.id], |row| row.get(0))
+        .query_row(
+            "SELECT revision FROM projects WHERE id=?1",
+            [&project.id],
+            |row| row.get(0),
+        )
         .optional()
         .map_err(|e| format!("PROJECT_DB:{e}"))?;
     let expected = i64::try_from(project.revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
@@ -153,9 +172,7 @@ pub fn save(dir: &Path, mut project: Project) -> Result<Project, String> {
         None if expected != 0 => return Err("PROJECT_REVISION_CONFLICT".into()),
         _ => {}
     }
-    let next_revision = expected
-        .checked_add(1)
-        .ok_or("PROJECT_REVISION_OVERFLOW")?;
+    let next_revision = expected.checked_add(1).ok_or("PROJECT_REVISION_OVERFLOW")?;
     project.revision = u64::try_from(next_revision).map_err(|_| "PROJECT_REVISION_OVERFLOW")?;
     project.updated_at = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -178,8 +195,11 @@ pub fn delete(dir: &Path, id: &str) -> Result<Project, String> {
     validate_id(id)?;
     let mut db = open(dir)?;
     let project = read_project(&db, id)?.ok_or_else(|| "PROJECT_NOT_FOUND".to_string())?;
-    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).map_err(|e| format!("PROJECT_DB:{e}"))?;
-    tx.execute("DELETE FROM projects WHERE id=?1", [id]).map_err(|e| format!("PROJECT_DB:{e}"))?;
+    let tx = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| format!("PROJECT_DB:{e}"))?;
+    tx.execute("DELETE FROM projects WHERE id=?1", [id])
+        .map_err(|e| format!("PROJECT_DB:{e}"))?;
     tx.commit().map_err(|e| format!("PROJECT_DB:{e}"))?;
     Ok(project)
 }
@@ -229,6 +249,8 @@ mod tests {
             selected_ids: vec![],
             plans: serde_json::json!({}),
             variants: Vec::new(),
+            summary_variants: Vec::new(),
+            script_outline: Vec::new(),
             selected_variant_id: None,
             speaker_face_matches: None,
             renders: vec![],
@@ -288,6 +310,25 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
+    fn persists_highlight_status_across_reopen_and_rejects_unknown() {
+        let dir = temp();
+        let mut project = sample("status-1");
+        project.highlights = vec![
+            serde_json::json!({"id":"h1","status":"discarded"}),
+            serde_json::json!({"id":"h2","status":"saved"}),
+            serde_json::json!({"id":"h3"}),
+        ];
+        save(&dir, project.clone()).unwrap();
+        assert_eq!(
+            get(&dir, "status-1").unwrap().highlights,
+            project.highlights
+        );
+        let mut bad = sample("status-2");
+        bad.highlights = vec![serde_json::json!({"id":"h1","status":"archived"})];
+        assert_eq!(save(&dir, bad).unwrap_err(), "INVALID_HIGHLIGHT_STATUS");
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
     fn imports_json_projects_idempotently_without_removing_source() {
         let dir = temp();
         let folder = dir.join("projects");
@@ -296,8 +337,20 @@ mod tests {
         let source = folder.join("legacy-1.json");
         let bytes = serde_json::to_vec(&project).unwrap();
         fs::write(&source, &bytes).unwrap();
-        assert_eq!(list(&dir).unwrap(), vec![Project { revision: 0, ..project.clone() }]);
-        assert_eq!(list(&dir).unwrap(), vec![Project { revision: 0, ..project.clone() }]);
+        assert_eq!(
+            list(&dir).unwrap(),
+            vec![Project {
+                revision: 0,
+                ..project.clone()
+            }]
+        );
+        assert_eq!(
+            list(&dir).unwrap(),
+            vec![Project {
+                revision: 0,
+                ..project.clone()
+            }]
+        );
         assert_eq!(fs::read(source).unwrap(), bytes);
         fs::remove_dir_all(dir).unwrap();
     }
@@ -320,10 +373,15 @@ mod tests {
         project.plans =
             serde_json::json!({"highlight-1":{"version":1,"sourceArtifactId":"source-1"}});
         project.variants = vec![serde_json::json!({"id":"variant-1","title":"Short"})];
+        project.summary_variants = vec![serde_json::json!({"id":"summary-1","title":"Summary 1"})];
+        project.script_outline =
+            vec![serde_json::json!({"id":"outline-1","start":0.0,"end":2.0,"text":"Opening."})];
         project.selected_variant_id = Some("variant-1".into());
         let saved = save(&dir, project).unwrap();
         let reopened = get(&dir, "variant-project").unwrap();
         assert_eq!(reopened.variants, saved.variants);
+        assert_eq!(reopened.summary_variants, saved.summary_variants);
+        assert_eq!(reopened.script_outline, saved.script_outline);
         assert_eq!(reopened.selected_variant_id.as_deref(), Some("variant-1"));
         assert!(reopened.plans.get("highlight-1").is_some());
         fs::remove_dir_all(dir).unwrap();

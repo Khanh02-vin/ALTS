@@ -24,6 +24,35 @@ import sys
 from urllib.parse import parse_qs, urlparse
 
 
+def valid_video_url(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme != "https"
+            or parsed.username is not None or parsed.password is not None or parsed.port is not None
+            or parsed.fragment
+            or host not in ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be")
+        ):
+            return False
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        if "list" in query or "playlist" in query:
+            return False
+        parts = [part for part in parsed.path.split("/") if part]
+        if host == "youtu.be":
+            video_id = parts[0] if len(parts) == 1 else ""
+        elif parsed.path == "/watch":
+            ids = query.get("v", [])
+            video_id = ids[0] if len(ids) == 1 else ""
+        elif len(parts) == 2 and parts[0] in ("embed", "shorts"):
+            video_id = parts[1]
+        else:
+            return False
+        return len(video_id) == 11 and all(char.isascii() and (char.isalnum() or char in "-_") for char in video_id)
+    except (ValueError, KeyError):
+        return False
+
+
 def valid_playlist_url(value: str) -> bool:
     try:
         parsed = urlparse(value)
@@ -63,7 +92,9 @@ def enumerate_playlist(url: str) -> list[tuple[str, str]]:
 
 
 def video_info(url: str) -> tuple[str, str, float]:
-    """Return (videoId, title, duration) for a single video — metadata only."""
+    """Return (videoId, title, duration) for a validated single YouTube video."""
+    if not valid_video_url(url):
+        raise ValueError("video URL must be a public, single-video YouTube URL")
     proc = subprocess.run(
         [sys.executable, "-m", "yt_dlp", "--skip-download", "--no-playlist",
          "--print", "%(id)s\t%(title)s\t%(duration)s", url],

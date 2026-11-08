@@ -15,7 +15,7 @@ use crate::paths::{
 use crate::project_store::save;
 use crate::youtube::resolve_stream_url;
 use render_engine::contracts::{RenderProgress, RenderRequest};
-use render_engine::engine::render_segments;
+use render_engine::engine::{has_confirmed_crop_keyframes, render_segments};
 use serde_json::Value;
 
 /// Set while a render is being asked to stop. This is the engine's own flag: the app
@@ -94,9 +94,13 @@ pub(crate) async fn render_video(
             // crop; ranges without a stable face get no layout and keep the centre
             // crop. Local single-file sources only — remote streams are never decoded
             // for sampling, and user-provided layouts are never overwritten.
+            //
+            // A confirmed manual crop path is the user's own composition, so no
+            // automatic layout is generated for a plan that already carries one.
             if request.plan.aspect_ratio == "9:16"
                 && media.len() == 1
                 && !is_remote_input(&request.input)
+                && !has_confirmed_crop_keyframes(&plan)
                 && plan
                     .get("compositionLayouts")
                     .and_then(Value::as_array)

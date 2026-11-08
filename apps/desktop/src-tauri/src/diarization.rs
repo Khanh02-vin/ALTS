@@ -7,7 +7,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use crate::paths::{app_render_temp_dir, data_dir, ffmpeg_bin, is_remote_input, runtime_env, tool};
+use crate::paths::{
+    app_render_temp_dir, data_dir, ffmpeg_bin, is_remote_input, runtime_env, tool, venv_python,
+};
+use crate::youtube::{youtube_video_url, yt_video_meta};
 use ai_engine::{
     diarize_segments, merge_segments, FaceDetector, SpeakerEmbedder, TextBox, TextRegionDetector,
     VadSegmenter,
@@ -17,6 +20,61 @@ use render_engine::engine::{
     create_temporary_render_dir, stable_subject_pair, subject_pair_continues, TemporaryRenderDir,
 };
 use serde_json::Value;
+
+/// Selected-section deep preview for a remote YouTube video. The window is held
+/// to the same 600 s ceiling used by analysis, and the section is materialised
+/// once in a fresh app-private directory before the local crop analyzer runs on
+/// it. No other diarization command can reach this path.
+pub(crate) const REMOTE_CROP_MAX_SECONDS: f64 = 600.0;
+pub(crate) const REMOTE_CROP_MAX_BYTES: u64 = 600 * 1024 * 1024;
+
+pub(crate) fn remote_section_allowed(url: &str, start: f64, end: f64, download_bytes: u64) -> bool {
+    youtube_video_url(url)
+        && start.is_finite()
+        && end.is_finite()
+        && start >= 0.0
+        && end > start
+        && end - start <= REMOTE_CROP_MAX_SECONDS
+        && download_bytes < REMOTE_CROP_MAX_BYTES
+}
+
+pub(crate) fn remote_section_download_args(_url: &str, start: f64, end: f64) -> Vec<String> {
+    vec![
+        "--download-sections".to_string(),
+        format!("*{start:.3}-{end:.3}"),
+        "--force-keyframes-at-cuts".to_string(),
+    ]
+}
+
+pub(crate) fn remap_crop_path_time(path: &[Value], start: f64) -> Result<Vec<Value>, String> {
+    path.iter()
+        .map(|point| {
+            let time = point["time"]
+                .as_f64()
+                .ok_or("REMOTE_SECTION_TIME_INVALID")?;
+            if !time.is_finite() || time < start {
+                return Err("REMOTE_SECTION_TIME_INVALID".into());
+            }
+            let mut remapped = point.clone();
+            remapped["time"] = serde_json::json!(time - start);
+            Ok(remapped)
+        })
+        .collect()
+}
+
+fn dir_size(path: &Path) -> Result<u64, String> {
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path).map_err(|e| format!("REMOTE_SECTION_READ:{e}"))? {
+        let entry = entry.map_err(|e| format!("REMOTE_SECTION_READ:{e}"))?;
+        let metadata = entry
+            .metadata()
+            .map_err(|e| format!("REMOTE_SECTION_STAT:{e}"))?;
+        if metadata.is_file() {
+            total += metadata.len();
+        }
+    }
+    Ok(total)
+}
 
 /// Asks the AI pipeline to propose ordered transcript ranges as alternative edits.
 ///
@@ -147,19 +205,15 @@ fn parse_variants_json(text: &str) -> Result<Value, String> {
 }
 
 #[tauri::command]
-pub(crate) fn diarization_setup_status() -> serde_json::Value {
-    let ort_available = std::env::consts::ARCH != "unknown"; // ort is compiled into the binary
-    let face_model = data_dir().join("models/face-detection.onnx");
-    let vad_model = data_dir().join("models/silero_vad.onnx");
-    // Also check bundled resources via runtime_env for the app handle is unavailable here;
-    // report file presence as a heuristic.
-    let face_ready = face_model.is_file();
-    let vad_ready = vad_model.is_file();
+pub(crate) fn diarization_setup_status(app: tauri::AppHandle) -> serde_json::Value {
+    let ort_available = ai_engine::AiEngine::new().is_ok();
+    let face_ready = ai_engine::AiEngine::model_path(&app, "face-detection.onnx").is_ok();
+    let vad_ready = ai_engine::AiEngine::model_path(&app, "silero_vad.onnx").is_ok();
     serde_json::json!({
-        "ort_available": ort_available,
+        "ortAvailable": ort_available,
         "faceModelReady": face_ready,
         "vadModelReady": vad_ready,
-        "ready": ort_available && face_ready && vad_ready,
+        "ready": ort_available && vad_ready,
     })
 }
 
@@ -881,6 +935,145 @@ fn analyze_crop_path_blocking(
     Ok(serde_json::json!(output))
 }
 
+/// Explicit selected-highlight deep preview for one YouTube section.
+///
+/// The command validates HTTPS YouTube-only input via `youtube_video_url`,
+/// validates the requested interval against the video duration, downloads only
+/// that interval into a fresh app-private temporary directory, enforces a byte
+/// limit, then reuses the local crop analyzer on the materialised section.
+/// Section-relative times are returned only after the existing tracker has run;
+/// relative artifacts (the section video/frame paths are never exposed) cannot
+/// leak because the temporary directory is owned by this call and is removed on
+/// every exit path by `TemporaryRenderDir`.
+#[tauri::command]
+pub(crate) async fn analyze_remote_crop_section(
+    app: tauri::AppHandle,
+    url: String,
+    start: f64,
+    end: f64,
+    speaker_intervals: serde_json::Value,
+    face_mapping: serde_json::Value,
+    source_artifact_id: String,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        analyze_remote_crop_section_blocking(
+            &app,
+            &url,
+            start,
+            end,
+            &speaker_intervals,
+            &face_mapping,
+            &source_artifact_id,
+        )
+    })
+    .await
+    .map_err(|error| format!("CROP_WORKER:{error}"))?
+}
+
+fn analyze_remote_crop_section_blocking(
+    app: &tauri::AppHandle,
+    url: &str,
+    start: f64,
+    end: f64,
+    speaker_intervals: &serde_json::Value,
+    face_mapping: &serde_json::Value,
+    source_artifact_id: &str,
+) -> Result<serde_json::Value, String> {
+    if !youtube_video_url(url) {
+        return Err("INVALID_PUBLIC_VIDEO_URL".into());
+    }
+    if !start.is_finite()
+        || !end.is_finite()
+        || start < 0.0
+        || end <= start
+        || end - start > REMOTE_CROP_MAX_SECONDS
+    {
+        return Err("CROP_DURATION_LIMIT".into());
+    }
+    let (_title, source_duration) = yt_video_meta(app, url)?;
+    if !source_duration.is_finite() || source_duration <= 0.0 || end > source_duration + 0.05 {
+        return Err("CROP_DURATION_LIMIT".into());
+    }
+    let intervals = speaker_intervals
+        .as_array()
+        .ok_or("CROP_SPEAKERS_INVALID")?;
+    if intervals.len() > 10_000 {
+        return Err("CROP_SPEAKER_LIMIT".into());
+    }
+    let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
+    let temp = create_temporary_render_dir(&temp_dir)?;
+    let python = venv_python();
+    if !python.is_file() {
+        return Err("PYTHON_VENV_MISSING: remote crop requires yt-dlp".into());
+    }
+    let section_path = temp.0.join("section.%(ext)s");
+    let mut command = tool(&python);
+    command
+        .args([
+            "-m",
+            "yt_dlp",
+            "--no-playlist",
+            "-f",
+            "bestvideo[ext=mp4]/bestvideo/best",
+            "-o",
+        ])
+        .arg(&section_path);
+    for arg in remote_section_download_args(url, start, end) {
+        command.arg(arg);
+    }
+    command.arg(url);
+    let output = command
+        .output()
+        .map_err(|e| format!("REMOTE_SECTION_DOWNLOAD:{e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "REMOTE_SECTION_DOWNLOAD:{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    if dir_size(&temp.0)? >= REMOTE_CROP_MAX_BYTES {
+        return Err("REMOTE_SECTION_SIZE_LIMIT".into());
+    }
+    let source = std::fs::read_dir(&temp.0)
+        .map_err(|e| format!("REMOTE_SECTION_READ:{e}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|entry| entry.is_file())
+        .ok_or("REMOTE_SECTION_EMPTY")?;
+    if std::fs::metadata(&source)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        >= REMOTE_CROP_MAX_BYTES
+    {
+        return Err("REMOTE_SECTION_SIZE_LIMIT".into());
+    }
+    let mut detector = FaceDetector::load(app).map_err(|e| format!("FACE_DETECTOR_LOAD:{e}"))?;
+    let frames: Vec<serde_json::Value> = extract_and_detect(
+        app,
+        &mut detector,
+        &source,
+        5.0,
+        360,
+        end - start,
+        &temp,
+        "remote-crop",
+    )?
+    .into_iter()
+    .map(|(time, faces)| serde_json::json!({"time": time + start, "faces": faces}))
+    .collect();
+    let mapping_confirmed = face_mapping["confirmed"].as_bool() == Some(true)
+        && face_mapping["sourceArtifactId"].as_str() == Some(source_artifact_id);
+    let matches = face_mapping["matches"].as_object();
+    let path = track_crop_path(
+        &frames,
+        intervals,
+        matches,
+        mapping_confirmed,
+        source_artifact_id,
+    );
+    Ok(serde_json::json!(remap_crop_path_time(&path, start)?))
+}
+
 /// One FFmpeg pass writes every sampled frame; each frame is then run through the
 /// ONNX `FaceDetector`. Replaces the per-sample Python spawn loop — hundreds of
 /// process spawns for a long video became one ffmpeg pass plus one ort session.
@@ -1010,7 +1203,14 @@ pub(crate) fn track_crop_path(
             scene_id += 1;
         }
         let (smooth_x, smooth_y) = previous_selected
-            .map(|(px, py)| (px + 0.35 * (x - px), py + 0.35 * (y - py)))
+            .map(|(px, py)| {
+                let (target_x, target_y) = if (x - px).hypot(y - py) < 0.04 {
+                    (px, py)
+                } else {
+                    (x, y)
+                };
+                (px + 0.35 * (target_x - px), py + 0.35 * (target_y - py))
+            })
             .unwrap_or((x, y));
         previous_selected = Some((smooth_x, smooth_y));
         previous_time = at;
@@ -1102,7 +1302,11 @@ fn analyze_scene_layouts_blocking(
 
 #[cfg(test)]
 mod tests {
-    use super::{aggregate_person_box, dominant_face, track_crop_path};
+    use super::{
+        aggregate_person_box, dominant_face, remap_crop_path_time, remote_section_allowed,
+        remote_section_download_args, track_crop_path, REMOTE_CROP_MAX_BYTES,
+        REMOTE_CROP_MAX_SECONDS,
+    };
 
     fn face(x: f64, y: f64, width: f64, height: f64, confidence: f64) -> serde_json::Value {
         serde_json::json!({"x": x, "y": y, "width": width, "height": height, "confidence": confidence})
@@ -1170,6 +1374,36 @@ mod tests {
         assert!(
             second > 0.4,
             "the crop must keep following the subject, not lag behind it"
+        );
+    }
+
+    /// Small tracking jitter is ignored relative to the previous smoothed center.
+    #[test]
+    fn crop_path_holds_sub_deadzone_jitter_without_adding_ema_drift() {
+        let (intervals, matches) = tracking_setup();
+        let frames = vec![
+            frame(0.0, vec![face(0.45, 0.45, 0.1, 0.1, 0.9)]),
+            frame(1.0, vec![face(0.47, 0.46, 0.1, 0.1, 0.9)]),
+        ];
+        let path = track_crop_path(&frames, &intervals, Some(&matches), true, "src");
+        assert_eq!(path.len(), 2);
+        assert!((path[1]["centerX"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+        assert!((path[1]["centerY"].as_f64().unwrap() - 0.5).abs() < 1e-9);
+    }
+
+    /// Movement outside the deadzone keeps the existing single alpha-0.35 EMA pass.
+    #[test]
+    fn crop_path_applies_ema_after_movement_exceeds_deadzone() {
+        let (intervals, matches) = tracking_setup();
+        let frames = vec![
+            frame(0.0, vec![face(0.45, 0.45, 0.1, 0.1, 0.9)]),
+            frame(1.0, vec![face(0.52, 0.45, 0.1, 0.1, 0.9)]),
+        ];
+        let path = track_crop_path(&frames, &intervals, Some(&matches), true, "src");
+        let moved = path[1]["centerX"].as_f64().unwrap();
+        assert!(
+            (moved - 0.5245).abs() < 1e-9,
+            "expected alpha-0.35 EMA, got {moved}"
         );
     }
 
@@ -1256,5 +1490,130 @@ mod tests {
         let frames: Vec<Option<[f64; 4]>> = vec![Some([0.4, 0.6, 0.1, 0.3]), None, None, None];
         assert_eq!(aggregate_person_box(&frames), None);
         assert_eq!(aggregate_person_box(&[]), None);
+    }
+
+    /// The remote path is YouTube-only: the upper-level HTTPS/HOST validator is
+    /// tested in main, while this boundary refuses every non-YouTube value before
+    /// a selected section is even attempted. The examples below also exercise the
+    /// unsafe URL shapes `public_video_url`/`youtube_video_url` already reject.
+    #[test]
+    fn remote_section_url_policy_accepts_only_https_youtube_inputs() {
+        assert!(remote_section_allowed(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            10.0,
+            15.0,
+            0,
+        ));
+        for value in [
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLtest",
+            "https://user:pass@www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com:8443/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ#t=10",
+            "https://evil-youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.tiktok.com/@creator/video/7123456789012345678",
+            "https://www.facebook.com/watch/?v=123",
+            "file:///tmp/video.mp4",
+        ] {
+            assert!(!remote_section_allowed(value, 10.0, 5.0, 0), "{value}");
+        }
+    }
+
+    #[test]
+    fn remote_section_bounds_accept_the_exact_limits_and_reject_overshoot() {
+        let url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+        assert!(remote_section_allowed(url, 0.0, REMOTE_CROP_MAX_SECONDS, 0));
+        assert!(remote_section_allowed(
+            url,
+            5.0,
+            REMOTE_CROP_MAX_SECONDS + 5.0,
+            0
+        ));
+        assert!(!remote_section_allowed(
+            url,
+            0.0,
+            REMOTE_CROP_MAX_SECONDS + 0.001,
+            0
+        ));
+        assert!(!remote_section_allowed(url, 10.0, 10.0, 0));
+        assert!(!remote_section_allowed(url, 10.0, 9.0, 0));
+        assert!(!remote_section_allowed(url, -1.0, 2.0, 0));
+        assert!(!remote_section_allowed(url, f64::NAN, 2.0, 0));
+        assert!(!remote_section_allowed(url, 0.0, f64::INFINITY, 0));
+        assert!(!remote_section_allowed(
+            url,
+            0.0,
+            1.0,
+            REMOTE_CROP_MAX_BYTES
+        ));
+        assert!(!remote_section_allowed(
+            url,
+            0.0,
+            1.0,
+            REMOTE_CROP_MAX_BYTES + 1
+        ));
+        assert!(remote_section_allowed(
+            url,
+            0.0,
+            1.0,
+            REMOTE_CROP_MAX_BYTES - 1
+        ));
+    }
+
+    #[test]
+    fn remote_section_download_args_extract_only_the_selected_interval() {
+        let args =
+            remote_section_download_args("https://www.youtube.com/watch?v=dQw4w9WgXcQ", 12.5, 18.0);
+        assert_eq!(
+            args,
+            vec![
+                "--download-sections",
+                "*12.500-18.000",
+                "--force-keyframes-at-cuts",
+            ]
+        );
+        assert!(args
+            .iter()
+            .all(|arg| !arg.contains("-o") && !arg.contains("bestformat")));
+    }
+
+    #[test]
+    fn remote_section_crop_times_are_shifted_relative_to_the_selected_start() {
+        let path = vec![
+            serde_json::json!({"time": 15.5, "centerX": 0.5}),
+            serde_json::json!({"time": 17.0, "centerX": 0.75}),
+        ];
+        let remapped = remap_crop_path_time(&path, 12.5).unwrap();
+        assert_eq!(remapped[0]["time"], serde_json::json!(3.0));
+        assert_eq!(remapped[1]["time"], serde_json::json!(4.5));
+        assert_eq!(remapped[0]["centerX"], serde_json::json!(0.5));
+        assert_eq!(
+            remap_crop_path_time(&[serde_json::json!({"time": 11.0})], 12.5).unwrap_err(),
+            "REMOTE_SECTION_TIME_INVALID"
+        );
+    }
+
+    #[test]
+    fn remote_section_temp_dir_is_owned_and_removed_after_use() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "lfai-remote-crop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let dir = super::create_temporary_render_dir(&temp_root).unwrap();
+        assert!(dir.0.starts_with(&temp_root));
+        assert!(dir.0.is_dir());
+        let marker = dir.0.join("section.mp4");
+        std::fs::write(&marker, b"section").unwrap();
+        assert!(marker.is_file());
+        assert!(dir.0.parent() == Some(temp_root.as_path()));
+        drop(dir);
+        assert!(!temp_root.join("section.mp4").exists());
+        // After the guard is dropped the owned directory is gone.
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

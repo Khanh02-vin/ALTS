@@ -3,6 +3,7 @@ import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 import type { EditVariant } from "../../packages/contracts/render-plan.ts";
+import { componentScoreMetadata, normalizeHighlightScore, scoreHighlightComponents } from "./highlight-scoring.ts";
 export { GeminiTranscriptVariantProvider, LlamaCppTranscriptVariantProvider } from "./variants.ts";
 
 export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript>; }
@@ -44,9 +45,18 @@ export const HIGHLIGHT_OUTPUT_SCHEMA = {
           to: { type: "integer" },
           title: { type: "string" },
           score: { type: "number" },
+          scores: {
+            type: "object",
+            properties: {
+              hook: { type: "number" },
+              summary: { type: "number" },
+              impact: { type: "number" },
+            },
+            required: ["hook", "summary", "impact"],
+          },
           reason: { type: "string" },
         },
-        required: ["from", "to", "title", "score"],
+        required: ["from", "to", "title", "score", "scores"],
       },
     },
   },
@@ -66,9 +76,18 @@ const GEMINI_HIGHLIGHT_SCHEMA = {
           to: { type: "INTEGER" },
           title: { type: "STRING" },
           score: { type: "NUMBER" },
+          scores: {
+            type: "OBJECT",
+            properties: {
+              hook: { type: "NUMBER" },
+              summary: { type: "NUMBER" },
+              impact: { type: "NUMBER" },
+            },
+            required: ["hook", "summary", "impact"],
+          },
           reason: { type: "STRING" },
         },
-        required: ["from", "to", "title", "score"],
+        required: ["from", "to", "title", "score", "scores"],
       },
     },
   },
@@ -87,7 +106,7 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
 /** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
  *  every cache key, so editing the prompt or schema below only requires a bump
  *  here — stored LLM results from the old prompt stop being served. */
-export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v1";
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v2-component-scores";
 
 /** Compact transcript rendering: one "wordIndex [start-end] text" line per word.
  *  A full word-object JSON prompt costs ~4k tokens for a 96s clip; these lines
@@ -95,7 +114,7 @@ export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v1";
  *  llama-server context) handle a 180s window at all. */
 export function highlightPrompt(transcript: Transcript): string {
   const lines = transcript.words.map((word, index) => `${index} [${word.start.toFixed(1)}-${word.end.toFixed(1)}] ${word.text}`);
-  return `Choose up to 5 complete short-video highlights from this transcript. Lines are "wordIndex [starts-end] text". Reply with JSON {"highlights":[{"from":int,"to":int,"title":string,"score":0-100,"reason":string}]} where from/to are inclusive word indices spanning each highlight. Pick self-contained, interesting moments — not greetings or filler. Transcript:\n${lines.join("\n")}`;
+  return `Choose up to 5 complete short-video highlights from this transcript. Lines are "wordIndex [starts-end] text". Reply with JSON {"highlights":[{"from":int,"to":int,"title":string,"score":0-100,"scores":{"hook":0-100,"summary":0-100,"impact":0-100},"reason":string}]} where from/to are inclusive word indices spanning each highlight. The aggregate score ranks highlights; component scores separately assess hook strength, how well the moment summarizes the source, and its likely impact. Keep all scores on a 0–100 scale. Pick self-contained, interesting moments — not greetings or filler. Transcript:\n${lines.join("\n")}`;
 }
 
 /** Maps word-index proposals back to contract highlights: times and wordIds are
@@ -108,13 +127,21 @@ export function mapWordRangeProposals(transcript: Transcript, parsed: Array<Reco
     const to = Math.trunc(Number(item.to));
     if (!Number.isFinite(from) || !Number.isFinite(to) || from < 0 || to < from || to >= transcript.words.length) continue;
     const slice = transcript.words.slice(from, to + 1);
-    const rawScore = Number(item.score);
-    const score = Number.isFinite(rawScore) ? (rawScore <= 1 ? Math.round(rawScore * 100) : Math.round(rawScore)) : 0;
+    const scores = componentScoreMetadata(item.scores, scoreHighlightComponents({
+      start: slice[0].start,
+      end: slice.at(-1)!.end,
+      text: slice.map((word) => word.text).join(" "),
+      transcript,
+      hookCue: /\b(how|why|secret|mistake|important|best|never|first|problem|solution|learn|key)\b/i.test(slice.map((word) => word.text).join(" ")),
+      complete: /[.!?]$/.test(slice.at(-1)!.text.trim()),
+      pauseBoundary: transcript.words.some((word, index, words) => index > 0 && word.start - words[index - 1].end >= 0.7 && (Math.abs(word.start - slice[0].start) < 0.75 || Math.abs(words[index - 1].end - slice.at(-1)!.end) < 0.75)),
+    }));
     out.push({
       version: 1, id: `h-${out.length}`, sourceArtifactId: transcript.sourceArtifactId,
       start: slice[0].start, end: slice.at(-1)!.end, wordIds: slice.map((word) => word.id),
       title: (typeof item.title === "string" ? item.title : "").trim().slice(0, 120) || "Highlight",
-      score: Math.max(0, Math.min(100, score)),
+      score: normalizeHighlightScore(item.score),
+      ...scores,
       reason: typeof item.reason === "string" ? item.reason.trim().slice(0, 500) : undefined,
     });
   }

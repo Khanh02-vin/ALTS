@@ -9,6 +9,9 @@ import { fileURLToPath } from "node:url";
 const here = dirname(fileURLToPath(import.meta.url));
 const studio = readFileSync(join(here, "..", "..", "apps", "web", "src", "lib", "pages", "Studio.svelte"), "utf8");
 const editor = readFileSync(join(here, "..", "..", "apps", "web", "src", "lib", "pages", "Editor.svelte"), "utf8");
+const studioState = readFileSync(join(here, "..", "..", "apps", "web", "src", "lib", "studio-state.svelte.ts"), "utf8");
+
+assert.match(studioState, /projectId:\s*""\s*,\s*projectRevision:/, "Studio must not try to open a placeholder project on startup");
 
 assert.ok(/studioState\.transcript\s*=\s*project\.transcript/.test(studio), "hydrateProject must restore transcript");
 assert.ok(/studioState\.plans\s*=\s*project\.plans/.test(studio), "hydrateProject must restore plan map");
@@ -38,6 +41,6 @@ assert.ok(/const probe = await invoke<ProbeMetadata>\("probe_video"/.test(studio
 assert.ok(/item\.codec_type === "video"/.test(studio), "probe stream lookup must read ffprobe's snake_case codec_type");
 assert.ok(/if \(!stream \|\| !Number\.isFinite\(duration\) \|\| duration <= 0\)/.test(studio), "local media requires video stream and valid duration");
 assert.match(studio, /disabled=\{busy \|\| !sourceVerified\} onclick=\{\(\) => renderVariant\(variant\.id\)\}/, "variant export must be disabled while the source is unverified or work is busy");
-assert.match(studio, /disabled=\{busy \|\| !sourceVerified \|\| !selectedIds\.length\}/, "selected export must be disabled while the source is unverified");
+assert.match(studio, /disabled=\{busy \|\| !sourceVerified \|\| !(?:selectedIds|activeSelectedIds)\.length\}/, "selected export must be disabled while the source is unverified");
 
 console.log("project hydration persistence tests: ok");

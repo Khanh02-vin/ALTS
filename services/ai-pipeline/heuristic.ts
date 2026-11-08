@@ -1,6 +1,7 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
+import { componentScoreMetadata, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 
 const HOOK_WORDS = /\b(how|why|secret|mistake|important|best|never|first|problem|solution|learn|key)\b/i;
 const PAUSE_SECONDS = 0.7;
@@ -24,7 +25,7 @@ const NMS_IOU_THRESHOLD = 0.0;
  *  2) Segment-anchored fallback: when there are no words at all (e.g. manual
  *     transcript), use each segment as one candidate window.
  * The result is a set of non-overlapping candidates selected by score via NMS. */
-function buildWindows(transcript: Transcript): Array<{
+function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Array<{
   start: number;
   end: number;
   wordIds: string[];
@@ -33,7 +34,9 @@ function buildWindows(transcript: Transcript): Array<{
   complete: boolean;
   pauseBoundary: boolean;
   score: number;
+  scores: { hook: number; summary: number; impact: number };
 }> {
+
   const words = transcript.words;
   const windows: Array<{
     start: number;
@@ -44,6 +47,7 @@ function buildWindows(transcript: Transcript): Array<{
     complete: boolean;
     pauseBoundary: boolean;
     score: number;
+    scores: { hook: number; summary: number; impact: number };
   }> = [];
 
   const addWindow = (
@@ -61,7 +65,17 @@ function buildWindows(transcript: Transcript): Array<{
       wordCount * 5 + (hook ? 25 : 0) + (complete ? 10 : 0) +
         (pauseBoundary ? 8 : 0),
     );
-    windows.push({ start, end, wordIds, text, hook, complete, pauseBoundary, score });
+    const scores = scoreHighlightComponents({
+      start,
+      end,
+      text,
+      transcript,
+      hookCue: hook,
+      complete,
+      pauseBoundary,
+      audioRms,
+    });
+    windows.push({ start, end, wordIds, text, hook, complete, pauseBoundary, score, scores });
   };
 
   if (words.length > 0) {
@@ -157,8 +171,8 @@ function nonMaximumSuppression(
   return chosen.sort((a, b) => a.start - b.start);
 }
 
-export function chooseHeuristicHighlights(transcript: Transcript, limit = 5): Highlight[] {
-  const windows = buildWindows(transcript);
+export function chooseHeuristicHighlights(transcript: Transcript, limit = 5, audioRms?: AudioRmsFeatures): Highlight[] {
+  const windows = buildWindows(transcript, audioRms);
   const chosen = nonMaximumSuppression(windows, limit);
   const highlights = chosen.map((w, index) => ({
     version: 1 as const,
@@ -170,6 +184,7 @@ export function chooseHeuristicHighlights(transcript: Transcript, limit = 5): Hi
     title: w.text.slice(0, 80),
     hook: w.hook ? w.text.slice(0, 100) : undefined,
     score: w.score,
+    ...componentScoreMetadata(w.scores),
     reason: [
       ...(w.hook ? ["hook keyword"] : []),
       ...(w.complete ? ["complete sentence"] : []),

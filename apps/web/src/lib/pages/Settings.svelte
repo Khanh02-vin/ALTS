@@ -35,9 +35,8 @@ let smallBusy = $state(false);
 let smallProgress = $state<Progress | null>(null);
 let smallPresent = $state(false);
 let ggmlBusy = $state("");
-let hfToken = $state("");
-let diarizationInstalled = $state(false);
-let hfTokenPresent = $state(false);
+let diarizationReady = $state(false);
+let faceModelReady = $state(false);
 let diarizationBusy = $state(false);
 
 // System Doctor state
@@ -150,22 +149,9 @@ async function pollLocalLlm() {
 async function refreshDiarization() {
   if (!isTauri()) return;
   try {
-    const status = await invoke<{ installed: boolean; hasToken: boolean }>("diarization_setup_status");
-    diarizationInstalled = status.installed; hfTokenPresent = status.hasToken;
-  } catch { diarizationInstalled = false; hfTokenPresent = false; }
-}
-async function saveHfToken() {
-  if (!isTauri() || hfToken.trim().length < 10) return;
-  try { await invoke("save_diarization_token", { token: hfToken }); hfToken = ""; await refreshDiarization(); message = "Hugging Face token saved locally."; }
-  catch (error) { message = `Token save failed: ${String(error)}`; }
-}
-async function setupDiarization() {
-  if (!isTauri() || diarizationBusy) return;
-  if (!confirm("Install optional pyannote.audio and OpenCV into the app's local Python environment? This downloads packages from the internet and may use several GB of disk space.")) return;
-  diarizationBusy = true;
-  try { await invoke("install_diarization_runtime"); await refreshDiarization(); message = "Local diarization runtime installed."; }
-  catch (error) { message = `Diarization setup failed: ${String(error)}`; }
-  finally { diarizationBusy = false; }
+    const status = await invoke<{ ortAvailable: boolean; faceModelReady: boolean; vadModelReady: boolean; ready: boolean }>("diarization_setup_status");
+    diarizationReady = status.ready; faceModelReady = status.faceModelReady;
+  } catch { diarizationReady = false; faceModelReady = false; }
 }
 async function reloadSetupState() {
   try {
@@ -319,12 +305,8 @@ $effect(() => {
         </div>
 
         <div class="panel">
-          <div class="panel-title"><span class="eyebrow">Local diarization &amp; face matching</span><span class="badge" class:ok={diarizationInstalled && hfTokenPresent}>{diarizationInstalled && hfTokenPresent ? "ready" : "optional"}</span></div>
-          <p class="note">Speaker diarization runs locally with pyannote.audio. Face samples use local OpenCV detection only; no identity recognition or face embeddings are created.</p>
-          <label class="field"><span class="field-label">Hugging Face read token {hfTokenPresent ? "(saved locally)" : ""}</span><input type="password" autocomplete="new-password" bind:value={hfToken} placeholder={hfTokenPresent ? "Token saved — enter a new one to replace" : "hf_…"} /></label>
-          <button class="btn btn-sm" disabled={hfToken.trim().length < 10} onclick={saveHfToken}>Save token locally</button>
-          <p class="hint">Before use, visit the <a href="https://huggingface.co/pyannote/speaker-diarization-3.1" target="_blank" rel="noreferrer">pyannote/speaker-diarization-3.1 model page</a> and accept its access conditions. The token is kept in this app's local runtime settings and passed only to the local diarization process.</p>
-          <div class="spread"><span class="note">Runtime: {diarizationInstalled ? "installed" : "not installed"} · Token: {hfTokenPresent ? "saved" : "not saved"}</span><button class="btn btn-sm" disabled={diarizationBusy || diarizationInstalled} onclick={setupDiarization}>{diarizationInstalled ? "Installed ✓" : diarizationBusy ? "Installing…" : "Install optional runtime"}</button></div>
+          <div class="panel-title"><span class="eyebrow">Local diarization &amp; face matching</span><span class="badge" class:ok={diarizationReady}>{diarizationReady ? "ready" : "optional"}</span></div>
+          <p class="note">Speaker diarization runs locally with the bundled ONNX runtime and silero_vad model. Face samples use local ONNX face detection only; no identity recognition or face embeddings are created. Face model: {faceModelReady ? "ready" : "optional"}.</p>
           {#if !runtimeStore.components.whisper}<p class="hint">Set up the app's Python/Whisper environment first.</p>{/if}
         </div>
 

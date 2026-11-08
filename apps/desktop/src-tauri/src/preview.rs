@@ -26,7 +26,11 @@ pub(crate) fn enforce_preview_cache_quota_at(cache_dir: &Path, cap_bytes: u64) {
         .filter(|path| path.extension().is_some_and(|ext| ext == "mp4"))
         .filter_map(|path| {
             let metadata = std::fs::metadata(&path).ok()?;
-            Some((path.clone(), metadata.len(), metadata.modified().unwrap_or(UNIX_EPOCH)))
+            Some((
+                path.clone(),
+                metadata.len(),
+                metadata.modified().unwrap_or(UNIX_EPOCH),
+            ))
         })
         .collect();
     let total: u64 = files.iter().map(|(_, size, _)| size).sum();
@@ -45,10 +49,16 @@ pub(crate) fn enforce_preview_cache_quota_at(cache_dir: &Path, cap_bytes: u64) {
     }
 }
 
-use crate::paths::{ffmpeg_bin, ffprobe_bin, local_preview_source, preview_proxy_cache_key, cache_dir, transcode_preview_proxy};
+use crate::paths::{
+    cache_dir, ffmpeg_bin, ffprobe_bin, local_preview_source, preview_proxy_cache_key,
+    transcode_preview_proxy,
+};
 
 #[tauri::command]
-pub(crate) async fn prepare_video_preview(app: tauri::AppHandle, path: String) -> Result<String, String> {
+pub(crate) async fn prepare_video_preview(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let source = local_preview_source(&path)?;
         let metadata = std::fs::metadata(&source).map_err(|e| format!("INPUT_PATH:{e}"))?;
@@ -77,4 +87,3 @@ pub(crate) async fn prepare_video_preview(app: tauri::AppHandle, path: String) -
     .await
     .map_err(|error| format!("PREVIEW_WORKER:{error}"))?
 }
-

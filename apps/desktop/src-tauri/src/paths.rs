@@ -9,9 +9,7 @@ use std::thread;
 
 use tauri::Manager;
 
-
 use crate::contracts::AnalysisStatus;
-
 
 /// Builds a helper command. The Windows release build is a `windows_subsystem`
 /// GUI process with no console of its own, so every spawned console tool (node,
@@ -39,7 +37,11 @@ pub(crate) fn data_dir() -> PathBuf {
     if let Some(dir) = env_lookup("LOCAL_FIRST_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    platform_dir(std::env::consts::OS, &|name| env_lookup(name), DirKind::Data)
+    platform_dir(
+        std::env::consts::OS,
+        &|name| env_lookup(name),
+        DirKind::Data,
+    )
 }
 
 /// Regenerable caches: preview proxies, the LLM cache, analysis chunk caches, the
@@ -49,7 +51,11 @@ pub(crate) fn cache_dir() -> PathBuf {
     if let Some(dir) = env_lookup("LOCAL_FIRST_STATE_DIR") {
         return PathBuf::from(dir);
     }
-    platform_dir(std::env::consts::OS, &|name| env_lookup(name), DirKind::Cache)
+    platform_dir(
+        std::env::consts::OS,
+        &|name| env_lookup(name),
+        DirKind::Cache,
+    )
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -59,7 +65,9 @@ enum DirKind {
 }
 
 fn env_lookup(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.trim().is_empty())
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
 }
 
 /// Resolves one standard OS location. Dispatch happens at runtime (not `cfg!`) so all
@@ -78,7 +86,11 @@ fn platform_dir(os: &str, get: &dyn Fn(&str) -> Option<String>, kind: DirKind) -
             .map(|root| Path::new(&root).join(app_name).join("cache"))
             .unwrap_or_else(std::env::temp_dir),
         ("macos", DirKind::Data) => home(get)
-            .map(|h| Path::new(&h).join("Library/Application Support").join(app_name))
+            .map(|h| {
+                Path::new(&h)
+                    .join("Library/Application Support")
+                    .join(app_name)
+            })
             .unwrap_or_else(std::env::temp_dir),
         ("macos", DirKind::Cache) => home(get)
             .map(|h| Path::new(&h).join("Library/Caches").join(app_name))
@@ -126,7 +138,11 @@ pub(crate) fn migrate_legacy_state() {
     if env_lookup("LOCAL_FIRST_STATE_DIR").is_some() {
         return; // single-root mode: the user (or the E2E) manages the layout
     }
-    let legacy = platform_dir(std::env::consts::OS, &|name| env_lookup(name), DirKind::Cache);
+    let legacy = platform_dir(
+        std::env::consts::OS,
+        &|name| env_lookup(name),
+        DirKind::Cache,
+    );
     migrate_legacy_state_into(&legacy, &data_dir(), &cache_dir());
 }
 
@@ -258,7 +274,11 @@ pub(crate) fn render_progress_log(app: &tauri::AppHandle) -> Result<PathBuf, Str
 /// Prefer a bundled binary in the app resources, then fall back to PATH.
 /// Windows ships `node.exe`/`ffmpeg.exe`; Unix packages use the extensionless
 /// name. Probe the platform-native name first so one config serves both.
-pub(crate) fn bundled_bin<R: tauri::Runtime>(app: &tauri::AppHandle<R>, rel: &str, fallback: &str) -> PathBuf {
+pub(crate) fn bundled_bin<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    rel: &str,
+    fallback: &str,
+) -> PathBuf {
     if let Ok(dir) = app.path().resource_dir() {
         let candidates: Vec<PathBuf> = if cfg!(windows) {
             vec![dir.join(format!("{rel}.exe")), dir.join(rel)]
@@ -314,12 +334,29 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String
     use std::io::Write;
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
     let parent = path.parent().ok_or("INVALID_SECRET_PATH")?;
-    std::fs::DirBuilder::new().mode(0o700).recursive(true).create(parent)
-        .or_else(|error| if error.kind() == std::io::ErrorKind::AlreadyExists { Ok(()) } else { Err(error) })
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .recursive(true)
+        .create(parent)
+        .or_else(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
         .map_err(|e| format!("STATE_DIR:{e}"))?;
-    let mut file = std::fs::OpenOptions::new().create(true).truncate(true).write(true).mode(0o600).open(path).map_err(|e| format!("SECRET_WRITE:{e}"))?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|e| format!("SECRET_WRITE:{e}"))?;
-    file.write_all(bytes).map_err(|e| format!("SECRET_WRITE:{e}"))?;
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| format!("SECRET_WRITE:{e}"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| format!("SECRET_WRITE:{e}"))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("SECRET_WRITE:{e}"))?;
     file.sync_all().map_err(|e| format!("SECRET_WRITE:{e}"))
 }
 
@@ -329,7 +366,8 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String
     let parent = path.parent().ok_or("INVALID_SECRET_PATH")?;
     std::fs::create_dir_all(parent).map_err(|e| format!("STATE_DIR:{e}"))?;
     let mut file = std::fs::File::create(path).map_err(|e| format!("SECRET_WRITE:{e}"))?;
-    file.write_all(bytes).map_err(|e| format!("SECRET_WRITE:{e}"))?;
+    file.write_all(bytes)
+        .map_err(|e| format!("SECRET_WRITE:{e}"))?;
     file.sync_all().map_err(|e| format!("SECRET_WRITE:{e}"))
 }
 
@@ -341,12 +379,22 @@ pub(crate) fn helper_env(app: &tauri::AppHandle, extra: &[(&str, &str)]) -> Vec<
         .filter(|(key, _)| key.as_str() != "HF_TOKEN")
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let cpp_default = file.get("WHISPER_ENGINE").map(String::as_str).unwrap_or("cpp") != "python";
+    let cpp_default = file
+        .get("WHISPER_ENGINE")
+        .map(String::as_str)
+        .unwrap_or("cpp")
+        != "python";
     if cpp_default {
         env.retain(|(key, _)| key != "WHISPER_COMMAND" && key != "WHISPER_MODEL_PATH");
         env.push(("WHISPER_ENGINE".into(), "cpp".into()));
-        env.push(("WHISPER_COMMAND".into(), whisper_cpp_bin(app).to_string_lossy().into_owned()));
-        env.push(("WHISPER_MODEL_PATH".into(), whisper_cpp_model(app).to_string_lossy().into_owned()));
+        env.push((
+            "WHISPER_COMMAND".into(),
+            whisper_cpp_bin(app).to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "WHISPER_MODEL_PATH".into(),
+            whisper_cpp_model(app).to_string_lossy().into_owned(),
+        ));
     }
     env.push((
         "LOCAL_FIRST_STATE_DIR".into(),
@@ -461,7 +509,9 @@ pub(crate) fn transcode_preview_proxy(
 
 /// Parse and constrain the local model endpoint to loopback before persisting it.
 pub(crate) fn valid_local_llm_url(value: &str) -> bool {
-    let Ok(url) = url::Url::parse(value.trim()) else { return false; };
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
     matches!(url.scheme(), "http" | "https")
         && url.username().is_empty()
         && url.password().is_none()
@@ -478,7 +528,9 @@ pub(crate) fn valid_provider_url(value: &str) -> Option<String> {
         || url.password().is_some()
         || url.query().is_some()
         || url.fragment().is_some()
-    { return None; }
+    {
+        return None;
+    }
     let mut normalized = url;
     let path = normalized.path().trim_end_matches('/').to_string();
     normalized.set_path(&path);
@@ -582,7 +634,10 @@ pub(crate) fn helper_script(app: &tauri::AppHandle, name: &str) -> Result<PathBu
 
 pub(crate) fn status_from_json(job: &serde_json::Value) -> Result<AnalysisStatus, String> {
     let result = match job.get("result") {
-        Some(serde_json::Value::String(encoded)) => Some(serde_json::from_str(encoded).map_err(|error| format!("ANALYSIS_RESULT_JSON:{error}"))?),
+        Some(serde_json::Value::String(encoded)) => Some(
+            serde_json::from_str(encoded)
+                .map_err(|error| format!("ANALYSIS_RESULT_JSON:{error}"))?,
+        ),
         Some(serde_json::Value::Null) | None => None,
         Some(value) => Some(value.clone()),
     };
@@ -643,7 +698,10 @@ pub(crate) fn command_ready(command: &str) -> bool {
 /// loads for the seconds a 75–147 MB copy takes on first run. Returns true when
 /// the model is ready on disk; a missing source (dev/LIGHTWEIGHT builds) counts
 /// as ready so status checks never block on a copy that cannot happen.
-pub(crate) fn ensure_bundled_whisper_model<R: tauri::Runtime>(app: &tauri::AppHandle<R>, model: &str) -> bool {
+pub(crate) fn ensure_bundled_whisper_model<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    model: &str,
+) -> bool {
     let dest = match std::env::var("HOME") {
         Ok(home) => PathBuf::from(home)
             .join(".cache/whisper")
@@ -734,7 +792,12 @@ pub(crate) fn whisper_cpp_ready<R: tauri::Runtime>(app: &tauri::AppHandle<R>) ->
     if let Some(parent) = bin.parent() {
         command.env("LD_LIBRARY_PATH", parent);
     }
-    bin.is_file() && model.is_file() && command.arg("--help").output().is_ok_and(|o| o.status.success())
+    bin.is_file()
+        && model.is_file()
+        && command
+            .arg("--help")
+            .output()
+            .is_ok_and(|o| o.status.success())
 }
 
 /// Python interpreter inside the app venv (yt-dlp + youtube-transcript-api live there).
@@ -884,7 +947,6 @@ pub(crate) fn io_error(code: &str, message: impl std::fmt::Display) -> String {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{migrate_legacy_state_into, platform_dir, DirKind};
@@ -907,11 +969,25 @@ mod tests {
     /// cleanup deletes them.
     #[test]
     fn windows_data_dir_uses_appdata_not_temp() {
-        let dir = platform_dir("windows", &get(&[("APPDATA", r"C:\Users\u\AppData\Roaming")]), DirKind::Data);
-        assert_eq!(dir, Path::new(r"C:\Users\u\AppData\Roaming").join("local-first-ai-video-studio"));
+        let dir = platform_dir(
+            "windows",
+            &get(&[("APPDATA", r"C:\Users\u\AppData\Roaming")]),
+            DirKind::Data,
+        );
+        assert_eq!(
+            dir,
+            Path::new(r"C:\Users\u\AppData\Roaming").join("local-first-ai-video-studio")
+        );
         // APPDATA missing → LOCALAPPDATA is the fallback.
-        let dir = platform_dir("windows", &get(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]), DirKind::Data);
-        assert_eq!(dir, Path::new(r"C:\Users\u\AppData\Local").join("local-first-ai-video-studio"));
+        let dir = platform_dir(
+            "windows",
+            &get(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]),
+            DirKind::Data,
+        );
+        assert_eq!(
+            dir,
+            Path::new(r"C:\Users\u\AppData\Local").join("local-first-ai-video-studio")
+        );
         // Both missing → the last resort is temp, but that is a broken machine.
         let dir = platform_dir("windows", &get(&[]), DirKind::Data);
         assert_eq!(dir, std::env::temp_dir());
@@ -919,28 +995,66 @@ mod tests {
 
     #[test]
     fn windows_cache_dir_lives_under_localappdata() {
-        let dir = platform_dir("windows", &get(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]), DirKind::Cache);
-        assert_eq!(dir, Path::new(r"C:\Users\u\AppData\Local").join("local-first-ai-video-studio").join("cache"));
+        let dir = platform_dir(
+            "windows",
+            &get(&[("LOCALAPPDATA", r"C:\Users\u\AppData\Local")]),
+            DirKind::Cache,
+        );
+        assert_eq!(
+            dir,
+            Path::new(r"C:\Users\u\AppData\Local")
+                .join("local-first-ai-video-studio")
+                .join("cache")
+        );
     }
 
     #[test]
     fn macos_dirs_follow_library_conventions() {
         let home = [("HOME", "/Users/u")];
         let data = platform_dir("macos", &get(&home), DirKind::Data);
-        assert_eq!(data, Path::new("/Users/u").join("Library/Application Support").join("local-first-ai-video-studio"));
+        assert_eq!(
+            data,
+            Path::new("/Users/u")
+                .join("Library/Application Support")
+                .join("local-first-ai-video-studio")
+        );
         let cache = platform_dir("macos", &get(&home), DirKind::Cache);
-        assert_eq!(cache, Path::new("/Users/u").join("Library/Caches").join("local-first-ai-video-studio"));
+        assert_eq!(
+            cache,
+            Path::new("/Users/u")
+                .join("Library/Caches")
+                .join("local-first-ai-video-studio")
+        );
     }
 
     #[test]
     fn linux_dirs_follow_xdg() {
-        let explicit = get(&[("XDG_DATA_HOME", "/xdg-data"), ("XDG_CACHE_HOME", "/xdg-cache")]);
-        assert_eq!(platform_dir("linux", &explicit, DirKind::Data), Path::new("/xdg-data").join("local-first-ai-video-studio"));
-        assert_eq!(platform_dir("linux", &explicit, DirKind::Cache), Path::new("/xdg-cache").join("local-first-ai-video-studio"));
+        let explicit = get(&[
+            ("XDG_DATA_HOME", "/xdg-data"),
+            ("XDG_CACHE_HOME", "/xdg-cache"),
+        ]);
+        assert_eq!(
+            platform_dir("linux", &explicit, DirKind::Data),
+            Path::new("/xdg-data").join("local-first-ai-video-studio")
+        );
+        assert_eq!(
+            platform_dir("linux", &explicit, DirKind::Cache),
+            Path::new("/xdg-cache").join("local-first-ai-video-studio")
+        );
         // Without XDG variables the HOME fallbacks apply; USERPROFILE backs HOME up.
         let bare = get(&[("USERPROFILE", "/home/u")]);
-        assert_eq!(platform_dir("linux", &bare, DirKind::Data), Path::new("/home/u").join(".local/share").join("local-first-ai-video-studio"));
-        assert_eq!(platform_dir("linux", &bare, DirKind::Cache), Path::new("/home/u").join(".cache").join("local-first-ai-video-studio"));
+        assert_eq!(
+            platform_dir("linux", &bare, DirKind::Data),
+            Path::new("/home/u")
+                .join(".local/share")
+                .join("local-first-ai-video-studio")
+        );
+        assert_eq!(
+            platform_dir("linux", &bare, DirKind::Cache),
+            Path::new("/home/u")
+                .join(".cache")
+                .join("local-first-ai-video-studio")
+        );
     }
 
     /// The migration copies durable files out of the legacy cache root without
@@ -964,8 +1078,14 @@ mod tests {
 
         migrate_legacy_state_into(&legacy, &data, &cache);
 
-        assert_eq!(std::fs::read(data.join("projects.sqlite")).unwrap(), b"project db");
-        assert_eq!(std::fs::read(data.join("runtime.env")).unwrap(), b"WHISPER_MODEL=tiny");
+        assert_eq!(
+            std::fs::read(data.join("projects.sqlite")).unwrap(),
+            b"project db"
+        );
+        assert_eq!(
+            std::fs::read(data.join("runtime.env")).unwrap(),
+            b"WHISPER_MODEL=tiny"
+        );
         assert!(data.join("youtube/playlist.json").is_file());
         assert!(cache.join("llm-cache/abc.json").is_file());
         assert!(cache.join("llama/runtime/llama-server").is_file());
@@ -975,13 +1095,19 @@ mod tests {
 
         // Idempotent: a second run must not fail or duplicate anything.
         migrate_legacy_state_into(&legacy, &data, &cache);
-        assert_eq!(std::fs::read(data.join("projects.sqlite")).unwrap(), b"project db");
+        assert_eq!(
+            std::fs::read(data.join("projects.sqlite")).unwrap(),
+            b"project db"
+        );
 
         // An existing target file is never overwritten by a stale legacy copy.
         std::fs::write(data.join("runtime.env"), b"WHISPER_MODEL=base").unwrap();
         std::fs::write(legacy.join("runtime.env"), b"WHISPER_MODEL=tiny").unwrap();
         migrate_legacy_state_into(&legacy, &data, &cache);
-        assert_eq!(std::fs::read(data.join("runtime.env")).unwrap(), b"WHISPER_MODEL=base");
+        assert_eq!(
+            std::fs::read(data.join("runtime.env")).unwrap(),
+            b"WHISPER_MODEL=base"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

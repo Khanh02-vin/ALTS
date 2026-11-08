@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import { generateSemanticHighlights, createMockSemanticProvider, NotImplementedSemanticProvider } from "../../services/ai-pipeline/semantic.ts";
+import { generateSemanticHighlights, createMockSemanticProvider, NotImplementedSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
 
 const makeTranscript = (duration = 60): Transcript => ({
   version: 1,
@@ -40,6 +40,21 @@ assert.equal(semanticHighlights[0].start, 1);
 assert.equal(semanticHighlights[1].start, 10);
 assert.ok(semanticHighlights[0].id.startsWith("semantic-"));
 assert.ok(semanticHighlights.every((h) => h.sourceArtifactId === "src"));
+assert.ok(semanticHighlights.every((h) => h.scores && Object.keys(h.scores).length === 3), "legacy mock proposals receive local component scores");
+assert.ok(semanticHighlights.every((h) => h.dominantAxis === undefined || ["hook", "summary", "impact"].includes(h.dominantAxis)));
+
+const partiallyScoredProvider = {
+  async generate() {
+    return { provider: "legacy", highlights: [{
+      version: 1 as const, id: "legacy", sourceArtifactId: "src", start: 1, end: 3,
+      wordIds: ["w1"], title: "Why?", score: 80, scores: { hook: 90 } as never,
+    }] };
+  },
+};
+const partiallyScored = await generateSemanticHighlights(transcript, partiallyScoredProvider);
+assert.equal(partiallyScored[0].score, 80, "semantic aggregate scores are unchanged during metadata normalization");
+assert.deepEqual(partiallyScored[0].scores, { hook: 90, summary: 63, impact: 25 });
+assert.equal(partiallyScored[0].dominantAxis, "hook");
 
 // NotImplemented provider throws
 const notImplemented = new NotImplementedSemanticProvider();
@@ -127,6 +142,17 @@ assert.deepEqual(received, { windowSeconds: 120, overlapSeconds: 15 });
 received = null;
 await adapter.generate({ transcript });
 assert.deepEqual(received, { windowSeconds: undefined, overlapSeconds: undefined });
+const legacyAdapter = new Adapter({
+  async choose() {
+    return [{
+      version: 1 as const, id: "legacy-adapter", sourceArtifactId: "src", start: 1, end: 3,
+      wordIds: ["w1"], title: "Why?", score: 75,
+    }];
+  },
+});
+const adapterResult = await legacyAdapter.generate({ transcript });
+assert.ok(adapterResult.highlights[0].scores, "adapter adds fallback component metadata");
+assert.equal(adapterResult.highlights[0].dominantAxis, undefined, "adapter derives axis using the same 70-point threshold");
 
 // Provider-side defaults: highlightWindows slices a long transcript at 180s/30s.
 import { highlightWindows } from "../../services/ai-pipeline/providers.ts";

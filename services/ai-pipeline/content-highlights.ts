@@ -1,5 +1,6 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript, TranscriptSegment } from "../../packages/contracts/transcript.ts";
+import { componentScoreMetadata, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 
 const HOOK = /\b(how|why|problem|mistake|secret|important|key|solution|example|first|never|best)\b/i;
 const VALUE = /\b(problem|solution|step|example|result|learn|fix|use|because|therefore)\b/i;
@@ -7,12 +8,12 @@ const OPEN = /^(and|but|so|because|then|this|it)\b/i;
 const WEAK_END = /\b(and|but|because|if|to|is|are)$/i;
 export type CandidateQuality = { completeness: number; coherence: number; hook: number; value: number; ending: number; abruptCutPenalty: number; confidence: number };
 
-export function chooseContentHighlights(transcript: Transcript, limit = 5): Highlight[] {
+export function chooseContentHighlights(transcript: Transcript, limit = 5, audioRms?: AudioRmsFeatures): Highlight[] {
   const segments = transcript.segments.filter((segment) => segment.end > segment.start && segment.text.trim()); const candidates: Highlight[] = [];
   for (let i = 0; i < segments.length; i++) for (let j = i; j < segments.length && segments[j].end - segments[i].start <= 60; j++) {
     const window = segments.slice(i, j + 1); const duration = window.at(-1)!.end - window[0].start; if (duration < 15) continue;
     const text = window.map((segment) => segment.text).join(" ").trim(); const quality = score(window, text); if (quality.completeness < 45 || quality.abruptCutPenalty > 55) continue;
-    candidates.push({ version: 1, id: `content-${i}-${j}`, sourceArtifactId: transcript.sourceArtifactId, start: window[0].start, end: window.at(-1)!.end, wordIds: window.flatMap((segment) => segment.wordIds), title: text.slice(0, 80), hook: HOOK.test(window.slice(0, 1)[0].text) ? window[0].text.slice(0, 100) : undefined, score: Math.max(0, Math.min(100, Math.round(quality.completeness * .25 + quality.coherence * .2 + quality.hook * .2 + quality.value * .2 + quality.ending * .15 - quality.abruptCutPenalty * .25))), reason: "content window with hook, context, value and complete ending", quality });
+    candidates.push({ version: 1, id: `content-${i}-${j}`, sourceArtifactId: transcript.sourceArtifactId, start: window[0].start, end: window.at(-1)!.end, wordIds: window.flatMap((segment) => segment.wordIds), title: text.slice(0, 80), hook: HOOK.test(window.slice(0, 1)[0].text) ? window[0].text.slice(0, 100) : undefined, score: Math.max(0, Math.min(100, Math.round(quality.completeness * .25 + quality.coherence * .2 + quality.hook * .2 + quality.value * .2 + quality.ending * .15 - quality.abruptCutPenalty * .25))), ...componentScoreMetadata(scoreHighlightComponents({ start: window[0].start, end: window.at(-1)!.end, text, transcript, hookCue: quality.hook >= 70, complete: quality.ending >= 70, pauseBoundary: window.slice(1).some((segment, index) => segment.start - window[index]!.end >= 0.7), audioRms })), reason: "content window with hook, context, value and complete ending", quality });
   }
   const ranked = candidates.sort((a, b) => b.score - a.score || a.start - b.start);
   const chosen: Highlight[] = [];

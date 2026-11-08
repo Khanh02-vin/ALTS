@@ -1,7 +1,7 @@
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 
-export type SpeakerInterval = { start: number; end: number; speaker: string };
+export type SpeakerInterval = { start: number; end: number; speakerId: string };
 
 export function applySpeakerIntervals(transcript: Transcript, intervals: unknown): Transcript {
   validateTranscript(transcript);
@@ -9,11 +9,11 @@ export function applySpeakerIntervals(transcript: Transcript, intervals: unknown
   const valid: SpeakerInterval[] = intervals.map((value) => {
     if (!value || typeof value !== "object") throw new Error("DIARIZATION_INTERVALS_INVALID");
     const interval = value as Record<string, unknown>;
-    if (typeof interval.start !== "number" || typeof interval.end !== "number" || !Number.isFinite(interval.start) || !Number.isFinite(interval.end) || interval.start < 0 || interval.end <= interval.start || interval.end > transcript.duration || typeof interval.speaker !== "string" || !interval.speaker.trim()) throw new Error("DIARIZATION_INTERVALS_INVALID");
-    return { start: interval.start, end: interval.end, speaker: interval.speaker };
+    if (typeof interval.start !== "number" || typeof interval.end !== "number" || !Number.isFinite(interval.start) || !Number.isFinite(interval.end) || interval.start < 0 || interval.end <= interval.start || interval.end > transcript.duration || typeof interval.speakerId !== "string" || !interval.speakerId.trim()) throw new Error("DIARIZATION_INTERVALS_INVALID");
+    return { start: interval.start, end: interval.end, speakerId: interval.speakerId };
   });
   const order = new Map<string, number>();
-  for (const interval of valid) order.set(interval.speaker, Math.min(order.get(interval.speaker) ?? Infinity, interval.start));
+  for (const interval of valid) order.set(interval.speakerId, Math.min(order.get(interval.speakerId) ?? Infinity, interval.start));
   const speakerNames = new Map([...order].sort((a, b) => a[1] - b[1] || a[0].localeCompare(b[0])).map(([speaker], index) => [speaker, `Speaker ${index + 1}`]));
   const words = transcript.words.map((word) => {
     let best: SpeakerInterval | undefined;
@@ -22,9 +22,9 @@ export function applySpeakerIntervals(transcript: Transcript, intervals: unknown
     for (const interval of valid) {
       const overlap = Math.max(0, Math.min(word.end, interval.end) - Math.max(word.start, interval.start));
       if (overlap > bestOverlap + 1e-9) { best = interval; bestOverlap = overlap; tied = false; }
-      else if (overlap > 0 && Math.abs(overlap - bestOverlap) <= 1e-9 && best?.speaker !== interval.speaker) tied = true;
+      else if (overlap > 0 && Math.abs(overlap - bestOverlap) <= 1e-9 && best?.speakerId !== interval.speakerId) tied = true;
     }
-    const speakerId = best && !tied ? speakerNames.get(best.speaker) : undefined;
+    const speakerId = best && !tied ? speakerNames.get(best.speakerId) : undefined;
     const { speakerId: _old, ...original } = word;
     return speakerId ? { ...original, speakerId } : original;
   });

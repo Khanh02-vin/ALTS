@@ -18,10 +18,10 @@ const transcript: Transcript = {
   ],
 };
 const intervals = [
-  { start: 3, end: 5, speaker: "SPEAKER_B" },
-  { start: 0, end: 2, speaker: "SPEAKER_A" },
-  { start: 6, end: 6.5, speaker: "SPEAKER_B" },
-  { start: 6.5, end: 7, speaker: "SPEAKER_C" },
+  { start: 3, end: 5, speakerId: "SPEAKER_B" },
+  { start: 0, end: 2, speakerId: "SPEAKER_A" },
+  { start: 6, end: 6.5, speakerId: "SPEAKER_B" },
+  { start: 6.5, end: 7, speakerId: "SPEAKER_C" },
 ];
 const result = applySpeakerIntervals(transcript, intervals);
 assert.deepEqual(transcriptSpeakerIds(result), ["Speaker 1", "Speaker 2"]);
@@ -29,6 +29,6 @@ assert.deepEqual(result.words.map((word) => word.speakerId ?? null), ["Speaker 1
 assert.deepEqual(result.segments.map((segment) => segment.speakerId ?? null), ["Speaker 1", "Speaker 2", null]);
 assert.deepEqual(result.words.map(({ id, text, start, end }) => ({ id, text, start, end })), transcript.words.map(({ id, text, start, end }) => ({ id, text, start, end })));
 assert.deepEqual(speakerExamples(result).map((entry) => entry.speakerId), ["Speaker 1", "Speaker 2"]);
-assert.throws(() => applySpeakerIntervals(transcript, [{ start: -1, end: 2, speaker: "x" }]), /DIARIZATION_INTERVALS_INVALID/);
-assert.throws(() => applySpeakerIntervals(transcript, [{ start: 1, end: 9, speaker: "x" }]), /DIARIZATION_INTERVALS_INVALID/);
+assert.throws(() => applySpeakerIntervals(transcript, [{ start: -1, end: 2, speakerId: "x" }]), /DIARIZATION_INTERVALS_INVALID/);
+assert.throws(() => applySpeakerIntervals(transcript, [{ start: 1, end: 9, speakerId: "x" }]), /DIARIZATION_INTERVALS_INVALID/);
 console.log("speaker diarization mapping tests: ok");

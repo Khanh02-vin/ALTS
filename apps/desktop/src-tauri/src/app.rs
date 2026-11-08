@@ -4,24 +4,36 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::contracts::ProbeMetadata;
-use crate::paths::{ffprobe_bin, license_tier, data_dir, tool, write_private_file, LICENSE_PUBLIC_KEY_B64};
+use crate::paths::{
+    data_dir, ffprobe_bin, license_tier, tool, write_private_file, LICENSE_PUBLIC_KEY_B64,
+};
 use crate::project_store;
 
-const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "mkv", "webm", "avi", "m4v", "mts", "m2ts", "3gp"];
+const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "mov", "mkv", "webm", "avi", "m4v", "mts", "m2ts", "3gp",
+];
 
 fn is_video_path(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .map(|extension| VIDEO_EXTENSIONS.iter().any(|allowed| extension.eq_ignore_ascii_case(allowed)))
+        .map(|extension| {
+            VIDEO_EXTENSIONS
+                .iter()
+                .any(|allowed| extension.eq_ignore_ascii_case(allowed))
+        })
         .unwrap_or(false)
 }
 
 fn collect_video_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     if root.is_file() {
-        if is_video_path(root) { files.push(root.to_path_buf()); }
+        if is_video_path(root) {
+            files.push(root.to_path_buf());
+        }
         return Ok(());
     }
-    if !root.is_dir() { return Err("INPUT_NOT_FILE_OR_DIRECTORY".into()); }
+    if !root.is_dir() {
+        return Err("INPUT_NOT_FILE_OR_DIRECTORY".into());
+    }
     for entry in std::fs::read_dir(root).map_err(|error| format!("INPUT_READ_DIRECTORY:{error}"))? {
         let entry = entry.map_err(|error| format!("INPUT_READ_DIRECTORY_ENTRY:{error}"))?;
         let path = entry.path();
@@ -56,14 +68,25 @@ pub(crate) async fn list_video_files(path: String) -> Result<Vec<String>, String
 #[tauri::command]
 pub(crate) async fn save_recording(data: Vec<u8>) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        if data.is_empty() { return Err("RECORDING_EMPTY".into()); }
+        if data.is_empty() {
+            return Err("RECORDING_EMPTY".into());
+        }
         let directory = data_dir().join("recordings");
-        std::fs::create_dir_all(&directory).map_err(|error| format!("RECORDING_DIRECTORY:{error}"))?;
-        let filename = format!("recording-{}.webm", SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| format!("CLOCK:{error}"))?.as_millis());
+        std::fs::create_dir_all(&directory)
+            .map_err(|error| format!("RECORDING_DIRECTORY:{error}"))?;
+        let filename = format!(
+            "recording-{}.webm",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|error| format!("CLOCK:{error}"))?
+                .as_millis()
+        );
         let path = directory.join(filename);
         write_private_file(&path, &data).map_err(|error| format!("RECORDING_WRITE:{error}"))?;
         Ok(path.to_string_lossy().into_owned())
-    }).await.map_err(|error| format!("RECORDING_WORKER:{error}"))?
+    })
+    .await
+    .map_err(|error| format!("RECORDING_WORKER:{error}"))?
 }
 
 #[tauri::command]
@@ -94,14 +117,26 @@ pub(crate) fn last_panic() -> Option<String> {
 }
 
 #[tauri::command]
-pub(crate) async fn probe_video(app: tauri::AppHandle, path: String) -> Result<ProbeMetadata, String> {
+pub(crate) async fn probe_video(
+    app: tauri::AppHandle,
+    path: String,
+) -> Result<ProbeMetadata, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let input = Path::new(&path).canonicalize().map_err(|e| format!("INPUT_PATH:{e}"))?;
+        let input = Path::new(&path)
+            .canonicalize()
+            .map_err(|e| format!("INPUT_PATH:{e}"))?;
         if !input.is_file() {
             return Err("INPUT_NOT_FILE".into());
         }
         let output = tool(ffprobe_bin(&app))
-            .args(["-v", "error", "-show_entries", "format=duration,format_name:stream=codec_name,codec_type,width,height", "-of", "json"])
+            .args([
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration,format_name:stream=codec_name,codec_type,width,height",
+                "-of",
+                "json",
+            ])
             .arg(&input)
             .output()
             .map_err(|e| format!("FFPROBE_SPAWN:{e}"))?;
@@ -109,25 +144,32 @@ pub(crate) async fn probe_video(app: tauri::AppHandle, path: String) -> Result<P
             return Err(String::from_utf8_lossy(&output.stderr).to_string());
         }
         serde_json::from_slice(&output.stdout).map_err(|e| format!("FFPROBE_JSON:{e}"))
-    }).await.map_err(|error| format!("PROBE_WORKER:{error}"))?
+    })
+    .await
+    .map_err(|error| format!("PROBE_WORKER:{error}"))?
 }
 
 #[tauri::command]
 pub(crate) async fn project_list() -> Result<Vec<project_store::Project>, String> {
     tauri::async_runtime::spawn_blocking(|| project_store::list(&data_dir()))
-        .await.map_err(|error| format!("PROJECT_LIST_WORKER:{error}"))?
+        .await
+        .map_err(|error| format!("PROJECT_LIST_WORKER:{error}"))?
 }
 
 #[tauri::command]
 pub(crate) async fn project_get(id: String) -> Result<project_store::Project, String> {
     tauri::async_runtime::spawn_blocking(move || project_store::get(&data_dir(), &id))
-        .await.map_err(|error| format!("PROJECT_GET_WORKER:{error}"))?
+        .await
+        .map_err(|error| format!("PROJECT_GET_WORKER:{error}"))?
 }
 
 #[tauri::command]
-pub(crate) async fn project_save(project: project_store::Project) -> Result<project_store::Project, String> {
+pub(crate) async fn project_save(
+    project: project_store::Project,
+) -> Result<project_store::Project, String> {
     tauri::async_runtime::spawn_blocking(move || project_store::save(&data_dir(), project))
-        .await.map_err(|error| format!("PROJECT_SAVE_WORKER:{error}"))?
+        .await
+        .map_err(|error| format!("PROJECT_SAVE_WORKER:{error}"))?
 }
 
 #[tauri::command]
@@ -137,7 +179,8 @@ pub(crate) async fn project_delete(id: String) -> Result<project_store::Project,
         // The analysis DB is Node-owned, but deletion is coordinated here so a
         // removed project cannot leave its job/result rows behind.
         if let Some(job_id) = project.analysis_job_id.as_deref() {
-            let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/analysis-status.ts");
+            let script =
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("../../scripts/analysis-status.ts");
             let _ = script;
             let db_path = crate::paths::jobs_path();
             if let Ok(connection) = rusqlite::Connection::open(&db_path) {
@@ -146,7 +189,9 @@ pub(crate) async fn project_delete(id: String) -> Result<project_store::Project,
             }
         }
         Ok(project)
-    }).await.map_err(|error| format!("PROJECT_DELETE_WORKER:{error}"))?
+    })
+    .await
+    .map_err(|error| format!("PROJECT_DELETE_WORKER:{error}"))?
 }
 
 #[tauri::command]
@@ -161,28 +206,37 @@ pub(crate) async fn project_create(
     tauri::async_runtime::spawn_blocking(move || {
         let id = format!(
             "project-{}",
-            SystemTime::now().duration_since(UNIX_EPOCH).map_err(|e| format!("CLOCK:{e}"))?.as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|e| format!("CLOCK:{e}"))?
+                .as_nanos()
         );
-        project_store::save(&data_dir(), project_store::Project {
-            id,
-            title: source_name.clone(),
-            source_path,
-            source_name,
-            source_duration,
-            analysis_job_id: None,
-            analysis_result_id: None,
-            transcript: None,
-            highlights: Vec::new(),
-            selected_id: None,
-            selected_ids: Vec::new(),
-            plans: serde_json::json!({}),
-            variants: Vec::new(),
-            selected_variant_id: None,
-            speaker_face_matches: None,
-            renders: Vec::new(),
-            updated_at: String::new(),
-            revision: 0,
-        })
-    }).await.map_err(|error| format!("PROJECT_CREATE_WORKER:{error}"))?
+        project_store::save(
+            &data_dir(),
+            project_store::Project {
+                id,
+                title: source_name.clone(),
+                source_path,
+                source_name,
+                source_duration,
+                analysis_job_id: None,
+                analysis_result_id: None,
+                transcript: None,
+                highlights: Vec::new(),
+                selected_id: None,
+                selected_ids: Vec::new(),
+                plans: serde_json::json!({}),
+                variants: Vec::new(),
+                summary_variants: Vec::new(),
+                script_outline: Vec::new(),
+                selected_variant_id: None,
+                speaker_face_matches: None,
+                renders: Vec::new(),
+                updated_at: String::new(),
+                revision: 0,
+            },
+        )
+    })
+    .await
+    .map_err(|error| format!("PROJECT_CREATE_WORKER:{error}"))?
 }
-

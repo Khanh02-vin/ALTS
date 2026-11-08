@@ -5,11 +5,15 @@ export type AspectRatio = (typeof ASPECT_RATIOS)[number];
 export type CropMode = "track" | "general" | "split" | "screencast" | "none";
 export type Layout = "solo" | "picture-in-picture" | "side-by-side";
 
+export type CaptionWord = { text: string; start: Timestamp; end: Timestamp };
+
 export type Caption = {
   id: string;
   text: string;
   start: Timestamp;
   end: Timestamp;
+  /** Optional word timing used by the render engine'skaraoke-style ASS timing. */
+  words?: CaptionWord[];
 };
 
 export type RenderRange = { start: Timestamp; end: Timestamp };
@@ -54,6 +58,10 @@ export type EditVariant = {
   sourceArtifactId: string;
   title: string;
   reason?: string;
+  /** Optional scoring metadata for deterministic Summary variants. */
+  axis?: "hook" | "summary" | "impact";
+  scores?: Record<"hook" | "summary" | "impact", number>;
+  dominantAxis?: "hook" | "summary" | "impact";
   ranges: Array<RenderRange & { wordIds: string[] }>;
   plan?: RenderPlan;
 };
@@ -124,6 +132,13 @@ export function validateRenderPlan(plan: RenderPlan, duration: number): void {
   for (const caption of plan.captions) {
     if (!caption.id || !caption.text) throw new Error("Invalid caption");
     assertRange(caption.start, caption.end, duration);
+    let previousWordEnd = caption.start;
+    for (const word of caption.words ?? []) {
+      if (!word.text || !Number.isFinite(word.start) || !Number.isFinite(word.end) || word.start >= word.end || word.start < caption.start || word.end > caption.end || word.start < previousWordEnd) {
+        throw new Error("Invalid caption word timing");
+      }
+      previousWordEnd = word.end;
+    }
   }
   if (plan.hook) assertRange(plan.hook.start, plan.hook.end, duration);
 }

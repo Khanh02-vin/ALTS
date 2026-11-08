@@ -3,7 +3,7 @@
   import { invoke, isTauri, Channel } from "@tauri-apps/api/core";
   import { open, save } from "@tauri-apps/plugin-dialog";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
+  import { isActiveHighlight, type Highlight, type HighlightStatus } from "../../../../../packages/contracts/highlight.ts";
   import type { Collection } from "../../../../../packages/contracts/collection.ts";
   import type { Transcript } from "../../../../../packages/contracts/transcript.ts";
   import { applySpeakerIntervals, transcriptSpeakerIds, speakerExamples } from "../../../../../services/ai-pipeline/diarization.ts";
@@ -25,7 +25,7 @@
   // visible one, so background polls only run while the user can see them.
   let { active = true }: { active?: boolean } = $props();
 
-  type AnalysisResult = { transcript?: Transcript; highlights?: Highlight[]; collections?: Collection[]; videoId?: string; title?: string; topic?: string };
+  type AnalysisResult = { transcript?: Transcript; highlights?: Highlight[]; scriptOutline?: { id: string; start: number; end: number; text: string }[]; summaryVariants?: EditVariant[]; collections?: Collection[]; videoId?: string; title?: string; topic?: string };
   type AnalysisJob = { status: string; phase: string; progress: number; chunkCompleted: number; chunkTotal: number; currentChunk?: number; result?: AnalysisResult; error?: string };
   type RenderRequest = { input: string; output: string; plan: RenderPlan };
   type Meta = { name: string; duration: number; width: number; height: number; sourceArtifactId?: string };
@@ -33,7 +33,7 @@
   const e2eOutput = import.meta.env.MODE === "desktop-e2e" && import.meta.env.VITE_DESKTOP_E2E === "1" ? import.meta.env.VITE_DESKTOP_E2E_OUTPUT : "";
   type JobRow = { id: string; input?: string; status: string; phase: string; progress: number; rangeStart?: number; rangeEnd?: number; chunkCompleted?: number; chunkTotal?: number; error?: string };
   type RenderRecord = { id?: string; output: string; status: "running" | "completed" | "failed" | "interrupted" | "cancelled"; highlightId: string; error?: string };
-  type Project = { id: string; revision: number; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, RenderPlan>; variants?: EditVariant[]; selectedVariantId?: string | null; speakerFaceMatches?: { version: 1; sourceArtifactId: string; confirmed: boolean; matches: Record<string, string> } | null; renders: RenderRecord[]; updatedAt: string };
+  type Project = { id: string; revision: number; title: string; sourcePath: string; sourceName: string; sourceDuration: number; analysisJobId: string | null; analysisResultId?: string | null; transcript: unknown | null; highlights: Highlight[]; selectedId: string | null; selectedIds?: string[]; plans: Record<string, RenderPlan>; variants?: EditVariant[]; summaryVariants?: EditVariant[]; scriptOutline?: Array<{ id: string; start: number; end: number; text: string }>; selectedVariantId?: string | null; speakerFaceMatches?: { version: 1; sourceArtifactId: string; confirmed: boolean; matches: Record<string, string> } | null; renders: RenderRecord[]; updatedAt: string };
 
   let projects = $state<Project[]>([]);
   let projectId = $state("");
@@ -62,6 +62,8 @@
   let selectedId = $state("");
   let selectedIds = $state<string[]>([]);
   let variants = $state<EditVariant[]>([]);
+  let summaryVariants = $state<EditVariant[]>([]);
+  let scriptOutline = $state<Array<{ id: string; start: number; end: number; text: string }>>([]);
   let selectedVariantId = $state("");
   let variantsBusy = $state(false);
   let diarizationBusy = $state(false);
@@ -70,10 +72,8 @@
   let faceSamples = $state<Array<{ id: string; speakerId: string; time: number; thumbnail: string }>>([]);
   let diarizedSourceId = $state("");
   let speakerMatchesConfirmed = $state(false);
-  let hfToken = $state("");
-  let hfTokenPresent = $state(false);
-  let diarizationInstalled = $state(false);
-  let diarizationInstallBusy = $state(false);
+  let diarizationReady = $state(false);
+  let faceModelReady = $state(false);
   let youtubeUrl = $state("");
   let youtubeVideoId = $state("");
   let relatedQuery = $state("");
@@ -83,6 +83,15 @@
   // where the plain embed already works.
   let previewBase = $state("");
   let selectedCandidate = $derived(highlights.find((item) => item.id === selectedId) ?? null);
+  let activeHighlights = $derived(highlights.filter(isActiveHighlight));
+  let activeSelectedIds = $derived(selectedIds.filter((id) => activeHighlights.some((item) => item.id === id)));
+  function dominantAxisLabel(candidate: Highlight): string | undefined {
+    if (!candidate.dominantAxis) return;
+    const labels = studioState.transcript?.language.toLowerCase().startsWith("vi")
+      ? { hook: "Mở đầu", summary: "Tóm tắt", impact: "Tác động" }
+      : { hook: "Hook", summary: "Summary", impact: "Impact" };
+    return labels[candidate.dominantAxis];
+  }
   // Highlight ids belonging to the selected collection, so the candidate list
   // can mark which clips the grouping picked. Empty when nothing is selected.
   let collectionMembers = $derived(new Set(
@@ -185,15 +194,15 @@
   async function refreshDiarizationStatus() {
     if (!isTauri()) return;
     try {
-      const status = await invoke<{ installed: boolean; hasToken: boolean }>("diarization_setup_status");
-      diarizationInstalled = status.installed; hfTokenPresent = status.hasToken;
-    } catch { diarizationInstalled = false; hfTokenPresent = false; }
+      const status = await invoke<{ ortAvailable: boolean; faceModelReady: boolean; vadModelReady: boolean; ready: boolean }>("diarization_setup_status");
+      diarizationReady = status.ready; faceModelReady = status.faceModelReady;
+    } catch { diarizationReady = false; faceModelReady = false; }
   }
 
   async function runDiarization() {
     const transcript = studioState.transcript;
     if (!isTauri() || !transcript || diarizationBusy || !inputPath || inputPath.startsWith("http")) return;
-    if (!hfTokenPresent || !diarizationInstalled) { message = "Save your Hugging Face token and install the optional diarization runtime in Settings first."; return; }
+    if (!diarizationReady) { message = "Local diarization needs the bundled ONNX runtime and silero_vad model. Check Settings for runtime readiness."; return; }
     diarizationBusy = true; message = "Running local speaker diarization…";
     try {
       const intervals = await invoke<unknown>("diarize_video", { path: inputPath, duration: Math.min(meta?.duration ?? transcript.duration, 1800) });
@@ -256,23 +265,6 @@
     message = "Speaker labels and face matches confirmed and saved with this project.";
   }
 
-  async function saveHfToken() {
-    if (!isTauri() || hfToken.trim().length < 10) return;
-    try {
-      await invoke("save_diarization_token", { token: hfToken });
-      await refreshDiarizationStatus(); message = "Hugging Face token saved locally.";
-    } catch (error) { message = `Token save failed: ${String(error)}`; }
-  }
-
-  async function installDiarizationRuntime() {
-    if (!isTauri() || diarizationInstallBusy) return;
-    if (!confirm("Install optional pyannote.audio and OpenCV into the app's local Python environment? This downloads packages from the internet and may use several GB of disk space.")) return;
-    diarizationInstallBusy = true; message = "Installing optional local diarization packages…";
-    try { await invoke("install_diarization_runtime"); await refreshDiarizationStatus(); message = "Local diarization runtime installed."; }
-    catch (error) { message = `Diarization setup failed: ${String(error)}`; }
-    finally { diarizationInstallBusy = false; }
-  }
-
   function speakerFaceDataUrl(thumbnail: string): string {
     if (thumbnail.startsWith("data:image/jpeg;base64,")) return thumbnail;
     if (!/^(?:[0-9a-f]{2})+$/i.test(thumbnail)) return "";
@@ -296,7 +288,7 @@
     return enqueueProjectSave(saveProjectId, async () => {
       const existing = projects.find((item) => item.id === saveProjectId);
       if (!existing) return false;
-      const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, variants, selectedVariantId: selectedVariantId || null, speakerFaceMatches: speakerMatchesConfirmed && diarizedSourceId === (studioState.transcript?.sourceArtifactId ?? "") ? { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: speakerMatches } : null, ...patch };
+      const next = { ...existing, sourcePath: inputPath || existing.sourcePath, sourceName: meta?.name ?? existing.sourceName, sourceDuration: meta?.duration ?? existing.sourceDuration, highlights, selectedId: selectedId || existing.selectedId, selectedIds, plans: studioState.plans, variants, summaryVariants, scriptOutline, selectedVariantId: selectedVariantId || null, speakerFaceMatches: speakerMatchesConfirmed && diarizedSourceId === (studioState.transcript?.sourceArtifactId ?? "") ? { version: 1, sourceArtifactId: diarizedSourceId, confirmed: true, matches: speakerMatches } : null, ...patch };
 
       try {
         const saved = await invoke<Project>("project_save", { project: { ...next, revision: existing.revision } });
@@ -341,11 +333,19 @@
     applyDefaultRange(Number(project.sourceDuration ?? 0));
     await refreshDiarizationStatus();
     faceSamples = []; diarizationBusy = false; faceSamplesBusy = false;
-    highlights = project.highlights ?? []; selectedId = project.selectedId ?? highlights[0]?.id ?? ""; selectedIds = project.selectedIds?.length ? project.selectedIds : (selectedId ? [selectedId] : []);
+    highlights = project.highlights ?? [];
+    // Discarded highlights must not drive the active selection on reopen.
+    const activeIds = new Set(highlights.filter(isActiveHighlight).map((item) => item.id));
+    selectedId = activeIds.has(project.selectedId ?? "")
+      ? project.selectedId as string
+      : highlights.find((item) => isActiveHighlight(item))?.id ?? "";
+    selectedIds = project.selectedIds?.length
+      ? project.selectedIds.filter((id) => activeIds.has(id))
+      : (selectedId ? [selectedId] : []);
     studioState.selectedIds = selectedIds;
     studioState.projectId = project.id; studioState.sourcePath = project.sourcePath; studioState.sourceName = project.sourceName; studioState.sourceDuration = project.sourceDuration;
     studioState.highlights = highlights; studioState.transcript = project.transcript as typeof studioState.transcript; studioState.selectedId = selectedId;
-    studioState.plans = project.plans ?? {}; studioState.variants = project.variants ?? []; studioState.selectedVariantId = project.selectedVariantId ?? ""; variants = studioState.variants; selectedVariantId = studioState.selectedVariantId;
+    studioState.plans = project.plans ?? {}; studioState.variants = project.variants ?? []; studioState.selectedVariantId = project.selectedVariantId ?? ""; variants = studioState.variants; summaryVariants = project.summaryVariants ?? []; scriptOutline = project.scriptOutline ?? []; studioState.summaryVariants = summaryVariants; studioState.scriptOutline = scriptOutline; selectedVariantId = studioState.selectedVariantId;
     const mapping = project.speakerFaceMatches;
     const mappingMatchesTranscript = mapping?.sourceArtifactId === studioState.transcript?.sourceArtifactId;
     speakerMatches = mappingMatchesTranscript ? mapping?.matches ?? {} : {};
@@ -372,8 +372,10 @@
         if (job.status === "completed" && job.result) {
           const result = job.result;
           highlights = result.highlights ?? []; collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? ""; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : []; studioState.selectedIds = selectedIds;
+          variants = project.variants ?? []; studioState.variants = variants; studioState.selectedVariantId = project.selectedVariantId ?? ""; selectedVariantId = studioState.selectedVariantId;
+          summaryVariants = result.summaryVariants ?? project.summaryVariants ?? []; scriptOutline = result.scriptOutline ?? project.scriptOutline ?? []; studioState.summaryVariants = summaryVariants; studioState.scriptOutline = scriptOutline;
           studioState.highlights = highlights; studioState.selectedId = selectedId; studioState.transcript = result.transcript ?? null;
-          await persistProject({ analysisJobId: project.analysisJobId, transcript: result.transcript ?? null, highlights, selectedId });
+          await persistProject({ analysisJobId: project.analysisJobId, transcript: result.transcript ?? null, highlights, selectedId, summaryVariants, scriptOutline });
           message = highlights.length ? `${highlights.length} highlight candidates restored from analysis.` : "Analysis restored; no highlights found.";
         } else if (job.status === "queued" || job.status === "running") void watch(project.analysisJobId, true);
       } catch (error) { message = `Could not restore analysis job: ${String(error)}`; }
@@ -407,7 +409,7 @@
 
   async function loadVideo(path: string) {
     inputPath = path;
-    projectId = ""; sourceVerified = false; probeError = ""; studioState.projectId = ""; studioState.projectRevision = 0; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
+    projectId = ""; sourceVerified = false; probeError = ""; studioState.projectId = ""; studioState.projectRevision = 0; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; summaryVariants = []; scriptOutline = []; studioState.summaryVariants = []; studioState.scriptOutline = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
       jobId = ""; projectLinkWarning = false; busy = false; pollRun += 1; watchStarted = false; watcherId = ""; highlights = []; meta = null; youtubeVideoId = "";
 
     studioState.highlights = []; studioState.selectedId = "";
@@ -502,14 +504,16 @@
         if (job.status === "completed") {
           const result = job.result ?? { highlights: [] };
           highlights = result.highlights ?? []; selectedId = highlights[0]?.id ?? ""; selectedIds = selectedId ? [selectedId] : []; studioState.selectedIds = selectedIds;
-          collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? ""; variants = []; selectedVariantId = "";
+          variants = []; studioState.variants = []; studioState.selectedVariantId = "";
+          summaryVariants = result.summaryVariants ?? []; selectedVariantId = ""; scriptOutline = result.scriptOutline ?? []; studioState.summaryVariants = summaryVariants; studioState.scriptOutline = scriptOutline;
+          collections = result.collections ?? []; selectedCollection = collections[0]?.id ?? "";
           if (result.videoId) youtubeVideoId = result.videoId;
-          studioState.highlights = highlights; studioState.selectedId = selectedId; clearSpeakerState(); studioState.transcript = result.transcript ?? null; studioState.variants = []; studioState.selectedVariantId = ""; studioState.editingVariantId = "";
+          studioState.highlights = highlights; studioState.selectedId = selectedId; clearSpeakerState(); studioState.transcript = result.transcript ?? null; studioState.variants = variants; studioState.selectedVariantId = ""; studioState.editingVariantId = "";
           if (projectId) {
             const segments = (result.transcript as { segments?: { text?: string }[] } | null)?.segments ?? [];
             relatedSourceText = (segments.map((segment) => segment.text ?? "").join(" ") || result.title || highlights[0]?.title || "").slice(0, 4000);
             relatedQuery = [result.title, highlights[0]?.title, result.topic, ...segments.slice(0, 12).map((segment) => segment.text)].filter(Boolean).join(" ").slice(0, 200);
-            await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId, variants: [], selectedVariantId: null });
+            await persistProject({ analysisJobId: id, transcript: result.transcript ?? null, highlights, selectedId, summaryVariants, scriptOutline, selectedVariantId: null });
           }
 
           message = projectLinkWarning ? `Analysis finished, but project recovery link is missing (${id}).` : highlights.length ? `${highlights.length} highlight candidates ready.` : "No highlights found.";
@@ -547,7 +551,7 @@
     const existing = resumableJobs.find((job) => job.input === inputPath && (job.status === "queued" || job.status === "running") && Math.abs((job.rangeStart ?? 0) - analyzeStart) < 0.01 && Math.abs((job.rangeEnd ?? analyzeEnd) - analyzeEnd) < 0.01);
     if (existing && confirm("Continue existing analysis? Cancel = clear this setup and start fresh.")) { await watch(existing.id, true); return; }
     if (existing) await clearCache(existing.id);
-    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; clearSpeakerState(); variants = []; studioState.variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; message = "Analyzing…";
+    highlights = []; collections = []; selectedCollection = ""; selectedId = ""; clearSpeakerState(); variants = []; studioState.variants = []; summaryVariants = []; scriptOutline = []; studioState.summaryVariants = []; studioState.scriptOutline = []; selectedVariantId = ""; studioState.selectedVariantId = ""; message = "Analyzing…";
     try {
       projectLinkWarning = false;
       const id = await invoke<string>("start_analysis", { path: inputPath, start: analyzeStart, end: analyzeEnd });
@@ -613,7 +617,7 @@
     highlights = []; collections = []; selectedCollection = ""; selectedId = ""; selectedIds = []; jobId = ""; youtubeVideoId = ""; meta = null;
     busy = true; message = "Fetching YouTube transcript…"; resetTimer(); timerStartedAt = Date.now();
     try {
-      projectId = ""; studioState.projectId = ""; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
+      projectId = ""; studioState.projectId = ""; clearSpeakerState(); studioState.plans = {}; studioState.variants = []; variants = []; summaryVariants = []; scriptOutline = []; studioState.summaryVariants = []; studioState.scriptOutline = []; selectedVariantId = ""; studioState.selectedVariantId = ""; studioState.editingVariantId = ""; studioState.plan = null; studioState.transcript = null;
       const info = await invoke<{ id: string; duration: number; title: string }>("start_youtube_analysis", { url });
       inputPath = url;
       meta = { name: info.title, duration: info.duration, width: 0, height: 0 };
@@ -643,7 +647,7 @@
         return { ...variant, ...(plan ? { plan } : {}) };
       });
       studioState.variants = variants; selectedVariantId = variants[0]?.id ?? ""; studioState.selectedVariantId = selectedVariantId;
-      await persistProject({ variants, selectedVariantId });
+      await persistProject({ variants, summaryVariants, scriptOutline, selectedVariantId });
       message = `${variants.length} transcript variants ready to compare.`;
     } catch (error) { message = `Variant generation failed: ${String(error)}`; }
     finally { variantsBusy = false; }
@@ -655,7 +659,7 @@
   }
 
   function editVariant(id: string) {
-    const variant = variants.find((item) => item.id === id);
+    const variant = [...variants, ...summaryVariants].find((item) => item.id === id);
     if (!variant) return;
     selectedVariantId = id; studioState.selectedVariantId = id; studioState.editingVariantId = id;
     void persistProject({ selectedVariantId: id });
@@ -664,7 +668,7 @@
 
   async function renderVariant(id: string) {
     if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
-    const variant = variants.find((item) => item.id === id);
+    const variant = [...variants, ...summaryVariants].find((item) => item.id === id);
     const transcript = studioState.transcript;
     if (!variant || !transcript || !inputPath || !sourceVerified) return;
     busy = true;
@@ -701,21 +705,45 @@
   }
 
   function chooseCandidate(id: string) {
+    const candidate = highlights.find((item) => item.id === id);
+    if (!candidate || !isActiveHighlight(candidate)) return;
     selectedId = id; studioState.selectedId = id;
     selectedIds = selectedIds.includes(id) ? selectedIds : [...selectedIds, id]; studioState.selectedIds = selectedIds;
     void persistProject({ selectedId: id, selectedIds });
   }
 
   function toggleCandidate(id: string) {
+    const candidate = highlights.find((item) => item.id === id);
+    if (!candidate || !isActiveHighlight(candidate)) return;
     selectedIds = selectedIds.includes(id) ? selectedIds.filter((selected) => selected !== id) : [...selectedIds, id];
     studioState.selectedIds = selectedIds;
     selectedId = id; studioState.selectedId = id;
     void persistProject({ selectedId: id, selectedIds });
   }
 
+  function setHighlightStatus(id: string, status: HighlightStatus | undefined) {
+    highlights = highlights.map((item) => item.id === id
+      ? (status === undefined ? { ...item, status: undefined } : { ...item, status })
+      : item);
+    studioState.highlights = highlights;
+    const activeIds = new Set(highlights.filter(isActiveHighlight).map((item) => item.id));
+    const nextSelectedIds = selectedIds.filter((selected) => activeIds.has(selected));
+    const nextSelectedId = activeIds.has(selectedId)
+      ? selectedId
+      : highlights.find((item) => isActiveHighlight(item))?.id ?? "";
+    selectedIds = nextSelectedIds; studioState.selectedIds = nextSelectedIds;
+    selectedId = nextSelectedId; studioState.selectedId = nextSelectedId;
+    studioState.plan = studioState.plans[nextSelectedId] ?? null;
+    void persistProject({ highlights, selectedId: nextSelectedId, selectedIds: nextSelectedIds });
+  }
+
+  function saveHighlight(id: string) { setHighlightStatus(id, "saved"); }
+  function discardHighlight(id: string) { setHighlightStatus(id, "discarded"); }
+  function restoreHighlight(id: string) { setHighlightStatus(id, undefined); }
+
   async function renderSelected() {
     if (!isTauri()) { message = "Rendering runs in the desktop app only."; return; }
-    const ids = selectedIds.filter((id) => highlights.some((item) => item.id === id));
+    const ids = activeSelectedIds.filter((id) => highlights.some((item) => item.id === id && isActiveHighlight(item)));
     if (!inputPath || !sourceVerified || !ids.length) return;
     // Mark the render before busy flips: busy=true is what re-arms the analysis watcher
     // effect, and it must see a render in flight instead of resuming the finished job.
@@ -967,7 +995,7 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
         {#if inputPath.startsWith("http")}
           <p class="hint">Speaker diarization and local face sampling are available for local video sources only.</p>
         {:else if !studioState.transcript?.words.some((word) => word.speakerId)}
-          <div class="stack"><div class="field-row"><button class="btn btn-sm btn-primary" disabled={diarizationBusy || !hfTokenPresent || !diarizationInstalled} onclick={runDiarization}>{diarizationBusy ? "Analyzing speakers…" : "Run local diarization"}</button><span class="note">Requires the optional local runtime and a Hugging Face token for the gated pyannote model.</span></div><p class="hint">Setup: <a href="/settings">Settings</a> → Local diarization. The model's access terms must be accepted on Hugging Face.</p></div>
+          <div class="stack"><div class="field-row"><button class="btn btn-sm btn-primary" disabled={diarizationBusy || !diarizationReady} onclick={runDiarization}>{diarizationBusy ? "Analyzing speakers…" : "Run local diarization"}</button><span class="note">Runs locally with the bundled ONNX runtime and silero_vad model. No Hugging Face token or Python runtime is required.</span></div></div>
         {:else}
           <div class="field-row"><button class="btn btn-sm" disabled={faceSamplesBusy} onclick={sampleFaces}>{faceSamplesBusy ? "Sampling frames…" : "Sample faces from video"}</button><button class="btn btn-sm btn-quiet" onclick={cancelSpeakerMatches}>Cancel changes</button></div>
           <div class="speaker-grid">
@@ -979,11 +1007,30 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
           {#if faceSamples.length}<div class="face-samples">{#each faceSamples as sample}<figure><img src={speakerFaceDataUrl(sample.thumbnail)} alt={`Detected face sample near ${clock(sample.time)}`} /><figcaption>{sample.speakerId} · {clock(sample.time)}</figcaption></figure>{/each}</div>{/if}
           <button class="btn btn-primary" disabled={!transcriptSpeakerIds(studioState.transcript).length} onclick={confirmSpeakerMatches}>Confirm speaker matches</button>
         {/if}
-        {#if !hfTokenPresent}<p class="hint">Add a Hugging Face read token in Settings and accept access to pyannote/speaker-diarization-3.1 before running diarization.</p>{/if}
       </div>
       {#if studioState.transcript}
         <div class="card">
-          <div class="spread"><div><div class="section-title">Experimental · Transcript edit variants</div><p class="hint">AI suggests ordered source ranges from the transcript. Compare a version, edit it, then export that version only.</p></div><button class="btn btn-primary btn-sm" disabled={variantsBusy || busy} onclick={generateVariants}>{#if variantsBusy}<span class="spinner"></span>{/if}{variantsBusy ? "Generating…" : variants.length ? "Generate again" : "Generate variants"}</button></div>
+          <div class="section-title">Transcript outline</div>
+          {#if scriptOutline.length}
+            <ol class="outline-list">{#each scriptOutline as item}<li><span>{clock(item.start)}–{clock(item.end)}</span><p>{item.text}</p></li>{/each}</ol>
+          {:else}<p class="hint">No sentence outline was available for this transcript.</p>{/if}
+        </div>
+        {#if summaryVariants.length}
+          <div class="card">
+            <div class="section-title">Summary versions</div>
+            <div class="variant-grid">
+              {#each summaryVariants as variant}
+                <article class="variant-card">
+                  <strong>{variant.title}</strong><span class="cand-sub">Summary score {variant.scores?.summary ?? "—"} · {variant.ranges.length} ranges</span>
+                  <ol>{#each variant.ranges as range}<li>{clock(range.start)}–{clock(range.end)}</li>{/each}</ol>
+                  <div class="field-row"><button class="btn btn-sm" onclick={() => editVariant(variant.id)}>Edit</button><button class="btn btn-sm btn-primary" disabled={busy || !sourceVerified} onclick={() => renderVariant(variant.id)}>Export</button></div>
+                </article>
+              {/each}
+            </div>
+          </div>
+        {/if}
+        <div class="card">
+          <div class="spread"><div><div class="section-title">Experimental · Transcript edit variants</div><p class="hint">AI suggests ordered source ranges from the transcript. Compare a version, edit it, then export that version only.</p></div><button class="btn btn-primary btn-sm" disabled={variantsBusy || busy} onclick={generateVariants}>{#if variantsBusy}<span class="spinner"></span>{/if}{variantsBusy ? "Generating…" : "Generate transcript edits"}</button></div>
           {#if variants.length}
             <div class="variant-grid">
               {#each variants as variant}
@@ -1018,24 +1065,33 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
         {/if}
         <div class="cand-list">
           {#each highlights as candidate}
-            <div class="cand-item">
-              <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => chooseCandidate(candidate.id)}>
+            {@const discarded = candidate.status === "discarded"}
+            <div class="cand-item" class:discarded>
+              <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} disabled={discarded} onclick={() => chooseCandidate(candidate.id)}>
                 <span class="cand-rank">{highlights.findIndex((item) => item.id === candidate.id) + 1}</span>
                 <span>
                   <span class="cand-title">{candidate.title}</span>
-                  <span class="cand-sub">{clock(candidate.start)}–{clock(candidate.end)} · rank {highlights.findIndex((item) => item.id === candidate.id) + 1} · score {candidate.score}{#if collectionMembers.has(candidate.id)} · in collection{/if}</span>
+                  <span class="cand-sub">{clock(candidate.start)}–{clock(candidate.end)} · rank {highlights.findIndex((item) => item.id === candidate.id) + 1} · score {candidate.score}{#if candidate.scores} · Hook {candidate.scores.hook} / Summary {candidate.scores.summary} / Impact {candidate.scores.impact}{/if}{#if collectionMembers.has(candidate.id)} · in collection{/if}{#if dominantAxisLabel(candidate)} · {dominantAxisLabel(candidate)}{/if}{#if discarded} · Discarded{/if}{#if candidate.status === "saved"} · Saved{/if}</span>
                   {#if candidate.hook}<span class="cand-hook">{candidate.hook}</span>{/if}
                 </span>
                 <span class="cand-score">{candidate.score}</span>
               </button>
-              <label class="chip"><input type="checkbox" checked={selectedIds.includes(candidate.id)} onchange={() => toggleCandidate(candidate.id)} /> Keep clip</label>
+              <label class="chip"><input type="checkbox" checked={selectedIds.includes(candidate.id)} disabled={discarded} onchange={() => toggleCandidate(candidate.id)} /> Keep clip</label>
+              <div class="field-row">
+                {#if discarded}
+                  <button class="btn btn-sm" onclick={() => restoreHighlight(candidate.id)}>Restore</button>
+                {:else}
+                  <button class="btn btn-sm" aria-pressed={candidate.status === "saved"} onclick={() => saveHighlight(candidate.id)}>Save</button>
+                  <button class="btn btn-sm" onclick={() => discardHighlight(candidate.id)}>Discard</button>
+                {/if}
+              </div>
             </div>
           {/each}
         </div>
-        <div class="spec-line"><span>Export {aspectRatio}</span><span>{highlights.length} candidates{collections.length ? ` · ${collections.length} collections` : ""}</span></div>
-        <button class="btn btn-primary btn-wide" disabled={busy || !sourceVerified || !selectedIds.length} onclick={renderSelected}>
+        <div class="spec-line"><span>Export {aspectRatio}</span><span>{activeHighlights.length} active candidates · {highlights.length - activeHighlights.length} discarded{collections.length ? ` · ${collections.length} collections` : ""}</span></div>
+        <button class="btn btn-primary btn-wide" disabled={busy || !sourceVerified || !activeSelectedIds.length} onclick={renderSelected}>
           {#if busy}<span class="spinner"></span>{/if}
-          {busy ? "Rendering…" : `Render ${selectedIds.length} selected clip${selectedIds.length === 1 ? "" : "s"} (${aspectRatio})`}
+          {busy ? "Rendering…" : `Render ${activeSelectedIds.length} selected clip${activeSelectedIds.length === 1 ? "" : "s"} (${aspectRatio})`}
         </button>
       {#if busy && rendering}<div class="run-track"><div class="run-fill" style:width="{Math.round(renderProgress)}%"></div></div><p class="hint">Render progress · {Math.floor(renderProgress)}%</p><button class="btn btn-quiet btn-wide" onclick={cancelRender}>Cancel render</button>{/if}
       </div>

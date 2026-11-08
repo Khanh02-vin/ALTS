@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { transcriptFromCaptions } from "../../services/ai-pipeline/youtube-transcript.ts";
+import { transcriptFromCaptions, isTranscriptUnavailable, YOUTUBE_AUDIO_FALLBACK_REQUIRED } from "../../services/ai-pipeline/youtube-transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 
 // Realistic auto-caption shape: short lines, occasional overlap, blanks, tail past duration.
@@ -17,6 +17,11 @@ const payload = {
 };
 
 const transcript = transcriptFromCaptions(payload);
+assert.equal(isTranscriptUnavailable("no transcript for video"), true);
+assert.equal(isTranscriptUnavailable("transcript blocked for video"), true);
+assert.equal(isTranscriptUnavailable("yt-dlp network timeout"), false);
+assert.equal(isTranscriptUnavailable("video unavailable"), false);
+assert.equal(YOUTUBE_AUDIO_FALLBACK_REQUIRED, "YOUTUBE_AUDIO_FALLBACK_REQUIRED");
 validateTranscript(transcript); // must not throw
 
 assert.equal(transcript.provider, "youtube-captions");

@@ -7,6 +7,13 @@ export type CaptionPayload = {
   segments: Array<{ start: number; end: number; text: string }>;
 };
 
+export const YOUTUBE_AUDIO_FALLBACK_REQUIRED = "YOUTUBE_AUDIO_FALLBACK_REQUIRED";
+
+export function isTranscriptUnavailable(stderr: string): boolean {
+  const message = stderr.toLowerCase();
+  return message.includes("no transcript") || message.includes("transcript blocked") || message.includes("transcript unavailable");
+}
+
 /**
  * Builds a contract-valid Transcript from YouTube caption segments, which only
  * carry segment-level timestamps. Each segment's time is split across its

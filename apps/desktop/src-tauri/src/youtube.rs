@@ -7,15 +7,13 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::paths::NODE_ARGS;
 use crate::paths::{
-    analysis_range_allowed, helper_env, helper_script, jobs_path, node_bin, python_binary,
-    runtime_env, data_dir, tool, venv_python, whisper_venv_bin, write_private_file,
+    analysis_range_allowed, data_dir, helper_env, helper_script, jobs_path, node_bin,
+    python_binary, runtime_env, tool, venv_python, whisper_venv_bin, write_private_file,
 };
 use crate::runtime::{ensure_rag_server, RagState};
-use crate::paths::NODE_ARGS;
-use crate::{
-    spawn_analysis_worker, Jobs,
-};
+use crate::{spawn_analysis_worker, Jobs};
 
 /// Creates the app venv with only the YouTube crawler deps (yt-dlp +
 /// youtube-transcript-api). Returns false when the venv is unusable — local
@@ -559,10 +557,47 @@ pub(crate) fn public_video_url(value: &str) -> bool {
         || host == "m.youtube.com"
         || host == "youtu.be"
     {
-        if url.query_pairs().any(|(key, _)| key == "list" || key == "playlist") {
+        if url
+            .query_pairs()
+            .any(|(key, _)| key == "list" || key == "playlist")
+        {
             return false;
         }
         return youtube_video_id(value).is_some();
+    }
+    if matches!(
+        host.as_str(),
+        "facebook.com" | "www.facebook.com" | "m.facebook.com" | "web.facebook.com"
+    ) {
+        let segments: Vec<_> = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if url
+            .query_pairs()
+            .any(|(key, _)| matches!(key.as_ref(), "list" | "playlist"))
+        {
+            return false;
+        }
+        return match segments.as_slice() {
+            ["watch"] => url
+                .query_pairs()
+                .any(|(key, value)| key == "v" && !value.is_empty()),
+            ["videos", id] | ["reel", id] => !id.is_empty(),
+            ["share", kind, id] => matches!(*kind, "v" | "r") && !id.is_empty(),
+            _ => false,
+        };
+    }
+    if host == "fb.watch" {
+        let segments: Vec<_> = url
+            .path_segments()
+            .into_iter()
+            .flatten()
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        return segments.len() == 1 && !segments[0].is_empty();
     }
     if !matches!(
         host.as_str(),
@@ -592,6 +627,10 @@ pub(crate) fn public_video_url(value: &str) -> bool {
     }
 }
 
+pub(crate) fn youtube_video_url(value: &str) -> bool {
+    public_video_url(value) && youtube_video_id(value).is_some()
+}
+
 /// Extracts a video id from a youtube.com/youtu.be link for validation only —
 /// the original (case-preserved) URL is what reaches yt-dlp afterwards.
 pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
@@ -599,7 +638,10 @@ pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
     if !matches!(url.scheme(), "https" | "http")
         || !url.username().is_empty()
         || url.password().is_some()
-        || !matches!(url.host_str(), Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be"))
+        || !matches!(
+            url.host_str(),
+            Some("youtube.com" | "www.youtube.com" | "m.youtube.com" | "youtu.be")
+        )
         || url.port().is_some()
     {
         return None;
@@ -607,19 +649,28 @@ pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
     let id = if url.host_str() == Some("youtu.be") {
         url.path_segments()?.next()?.to_string()
     } else if url.path() == "/watch" {
-        url.query_pairs().find_map(|(key, value)| (key == "v").then(|| value.into_owned()))?
+        url.query_pairs()
+            .find_map(|(key, value)| (key == "v").then(|| value.into_owned()))?
     } else {
         let mut parts = url.path_segments()?;
         let kind = parts.next()?;
-        if !matches!(kind, "embed" | "shorts") { return None; }
+        if !matches!(kind, "embed" | "shorts") {
+            return None;
+        }
         parts.next()?.to_string()
     };
-    (id.len() == 11 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-        .then_some(id)
+    (id.len() == 11
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+    .then_some(id)
 }
 
 /// Fetches (title, duration) for a YouTube URL — one metadata-only yt-dlp call (~1s).
 pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String, f64), String> {
+    if !youtube_video_url(url) {
+        return Err("INVALID_PUBLIC_VIDEO_URL".into());
+    }
     let python = venv_python();
     if !python.is_file() {
         return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into());
@@ -661,6 +712,9 @@ pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String
 /// they must never be cached between analysis and render. YouTube is DASH-only
 /// nowadays, so this usually returns [videoUrl, audioUrl] for ffmpeg's two inputs.
 pub(crate) fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Vec<String>, String> {
+    if !youtube_video_url(url) {
+        return Err("INVALID_PUBLIC_VIDEO_URL".into());
+    }
     let python = venv_python();
     if !python.is_file() {
         return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into());
@@ -738,7 +792,13 @@ pub(crate) fn start_youtube_analysis(
         return Err(String::from_utf8_lossy(&init.stderr).trim().to_owned());
     }
     if !spawn_analysis_worker(
-        app.clone(), jobs.inner().clone(), id.clone(), PathBuf::from(&url), duration, 0.0, duration,
+        app.clone(),
+        jobs.inner().clone(),
+        id.clone(),
+        PathBuf::from(&url),
+        duration,
+        0.0,
+        duration,
     ) {
         let _ = crate::analysis_store::AnalysisStore::open(&jobs_path())
             .and_then(|store| store.fail(&id, "ANALYSIS_BUSY"));
@@ -761,7 +821,9 @@ pub(crate) const YT_PREVIEW_PORT: u16 = 14872;
 static PREVIEW_TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn preview_session_token() -> String {
-    PREVIEW_TOKEN.get_or_init(crate::paths::session_token).clone()
+    PREVIEW_TOKEN
+        .get_or_init(crate::paths::session_token)
+        .clone()
 }
 
 /// Parses the shim's query into (videoId, start, end); anything else is rejected
@@ -827,14 +889,19 @@ pub(crate) fn preview_serve(listener: std::net::TcpListener, token: String) {
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
             // Every /preview request must carry this session's token; /health stays
             // open because it answers a constant string and nothing else.
-            let authorized = query.split('&').any(|pair| pair == format!("token={token}").as_str());
+            let authorized = query
+                .split('&')
+                .any(|pair| pair == format!("token={token}").as_str());
             let (status, body) = match path {
                 "/health" => ("200 OK", "yt-preview".to_string()),
                 "/preview" if authorized => match preview_query(query) {
                     Some((id, start, end)) => ("200 OK", preview_page(&id, start, end)),
                     None => ("400 Bad Request", "bad preview request".to_string()),
                 },
-                "/preview" => ("403 Forbidden", "missing or wrong preview token".to_string()),
+                "/preview" => (
+                    "403 Forbidden",
+                    "missing or wrong preview token".to_string(),
+                ),
                 _ => ("404 Not Found", "not found".to_string()),
             };
             let _ = write!(stream, "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nCache-Control: no-store\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len());
@@ -871,16 +938,28 @@ pub(crate) fn preview_origin() -> Result<String, String> {
 }
 
 pub(crate) fn valid_playlist_url(value: &str) -> bool {
-    let Ok(url) = url::Url::parse(value.trim()) else { return false; };
+    let Ok(url) = url::Url::parse(value.trim()) else {
+        return false;
+    };
     matches!(url.scheme(), "https" | "http")
         && url.username().is_empty()
         && url.password().is_none()
         && url.port().is_none()
-        && matches!(url.host_str(), Some("youtube.com" | "www.youtube.com" | "m.youtube.com"))
+        && matches!(
+            url.host_str(),
+            Some("youtube.com" | "www.youtube.com" | "m.youtube.com")
+        )
         && url.path() == "/playlist"
         && {
-            let ids: Vec<_> = url.query_pairs().filter_map(|(key, value)| (key == "list").then(|| value.into_owned())).collect();
-            ids.len() == 1 && ids[0].len() >= 10 && ids[0].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            let ids: Vec<_> = url
+                .query_pairs()
+                .filter_map(|(key, value)| (key == "list").then(|| value.into_owned()))
+                .collect();
+            ids.len() == 1
+                && ids[0].len() >= 10
+                && ids[0]
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
         }
 }
 
@@ -966,4 +1045,3 @@ pub(crate) fn crawl_playlist(
     }
     run_yt_crawler(&app, &playlist_url, limit)
 }
-

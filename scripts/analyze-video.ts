@@ -7,6 +7,7 @@ import { validateTranscript, type Transcript } from "../packages/contracts/trans
 import { dirname, join } from "node:path";
 import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
+import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
 
 const [mediaPath, sourceArtifactId, durationText, rangeStartText, rangeEndText, jobId, statePath] = process.argv.slice(2);
 const duration = Number(durationText);
@@ -81,6 +82,11 @@ try {
   const llamaBaseUrl = process.env.LOCAL_LLM_BASE_URL ?? "http://127.0.0.1:8080";
   const llamaModel = process.env.LOCAL_LLM_MODEL ?? "qwen2.5-3b-instruct";
 
+  const preextractedAudio = process.env.ANALYSIS_PREEXTRACTED_AUDIO?.trim();
+  const audioRms = preextractedAudio
+    ? parsePcm16WavRms(await readFile(preextractedAudio))
+    : undefined;
+
   const analyzeOptions = {
     command: process.env.WHISPER_COMMAND,
     engine: process.env.WHISPER_ENGINE === "python" ? "python" as const : "cpp" as const,
@@ -91,6 +97,7 @@ try {
     fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true",
     offsetSeconds: rangeStart,
     sourceDuration: duration,
+    audioRms,
     transcript: await loadTranscriptFixture(sourceArtifactId),
     onChunkStart: (index: number, total: number) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
     onChunkComplete: (index: number, total: number, cacheHit: boolean) => {

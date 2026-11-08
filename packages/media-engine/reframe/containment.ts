@@ -38,25 +38,16 @@ export function contains(outer: SpanBox, inner: SpanBox): boolean {
 export function resolveFrameByContainment(person: SpanBox, text?: SpanBox | null): ContainmentResolution {
   const normalizedPerson = normalizeSpanBox(person);
   const normalizedText = text ? normalizeSpanBox(text) : null;
+  // The person is the anchor. Text (OCR of burned-in titles, corner tags, subtitles) is
+  // secondary composition information: it widens the frame only when it genuinely
+  // contains the subject — a wide title the presenter stands in front of. A tag beside
+  // the person never widens it, so the subject keeps the middle of the plate.
   let dominant = normalizedPerson;
   let anchorType: ContainmentAnchor = "person";
 
-  if (normalizedText) {
-    if (contains(normalizedPerson, normalizedText)) {
-      dominant = normalizedPerson;
-      anchorType = "person";
-    } else if (contains(normalizedText, normalizedPerson)) {
-      dominant = normalizedText;
-      anchorType = "text";
-    } else {
-      dominant = {
-        left: Math.min(normalizedPerson.left, normalizedText.left),
-        right: Math.max(normalizedPerson.right, normalizedText.right),
-        top: Math.min(normalizedPerson.top, normalizedText.top),
-        bottom: Math.max(normalizedPerson.bottom, normalizedText.bottom),
-      };
-      anchorType = "union";
-    }
+  if (normalizedText && contains(normalizedText, normalizedPerson)) {
+    dominant = normalizedText;
+    anchorType = "text";
   }
 
   const frameWidth = Math.min(1, Math.max(

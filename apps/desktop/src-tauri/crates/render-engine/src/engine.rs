@@ -495,10 +495,48 @@ fn valid_span_box(candidate: &serde_json::Value) -> bool {
         && top <= bottom
 }
 
+/// Decodes whether a single plan crop keyframe is usable by the renderer: approved,
+/// from the same source artifact, confident, sampled at a finite time, carrying a
+/// normalized centre, and still linked to the face it was mapped from.
+///
+/// The same rule gates the Editor's "manual crop" state, so a keyframe the renderer
+/// refuses is also one that must not suppress the automatic composition.
+pub fn admits_crop_keyframe(key: &serde_json::Value, plan: Option<&serde_json::Value>) -> bool {
+    key["confirmed"].as_bool() == Some(true)
+        && key["sourceArtifactId"].as_str()
+            == plan.and_then(|value| value["sourceArtifactId"].as_str())
+        && key["confidence"]
+            .as_f64()
+            .is_some_and(|confidence| confidence >= 0.5)
+        && key["centerX"]
+            .as_f64()
+            .is_some_and(|center| (0.0..=1.0).contains(&center))
+        && key["time"].as_f64().is_some_and(|time| time.is_finite())
+        && key["speakerId"].as_str().is_some_and(|speaker| {
+            plan.and_then(|value| value["speakerMap"][speaker].as_str())
+                .is_some_and(|face| key["sourceFaceId"].as_str() == Some(face))
+        })
+}
+
+/// True when the plan carries at least one crop keyframe the renderer will actually
+/// use — i.e. the user configured a crop path in the Editor. Automatic composition
+/// layouts must never override that path (manual crop takes precedence).
+pub fn has_confirmed_crop_keyframes(plan: &serde_json::Value) -> bool {
+    plan.get("cropKeyframes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            !items.is_empty()
+                && items.len() <= 600
+                && items
+                    .iter()
+                    .any(|key| admits_crop_keyframe(key, Some(plan)))
+        })
+}
+
 /// Builds the filter graph for a piece covered by a composition layout, mirroring the
-/// TypeScript containment solver (packages/media-engine/reframe/containment.ts): the box
-/// that contains the other horizontally owns the frame; when neither does, their union
-/// does. The crop is constant for the whole piece — layouts resolve per segment, never
+/// TypeScript containment solver (packages/media-engine/reframe/containment.ts): the
+/// person owns the frame, and a text box widens it only when it contains the subject.
+/// The crop is constant for the whole piece — layouts resolve per segment, never
 /// per caption cue, so the frame does not shake when subtitles change length.
 ///
 /// Creates a source-space delogo filter for a normalized text box.
@@ -526,10 +564,37 @@ fn text_box_delogo_filter(layout: &serde_json::Value, source_size: (u32, u32)) -
     {
         return None;
     }
-    let x = (left * f64::from(width)).floor() as u32;
-    let y = (top * f64::from(height)).floor() as u32;
-    let x2 = (right * f64::from(width)).ceil() as u32;
-    let y2 = (bottom * f64::from(height)).ceil() as u32;
+    // The subject wins over the burn-in: a text box that contains the person would
+    // erase the human the render exists to show, so it is left in place. A band that
+    // merely overlaps them (a lower third, a title above the head) is still masked.
+    let person = &layout["personBox"];
+    let contains_person = ["left", "right", "top", "bottom"]
+        .iter()
+        .all(|field| person[field].is_number())
+        && left <= person["left"].as_f64().unwrap_or(0.0)
+        && right >= person["right"].as_f64().unwrap_or(0.0)
+        && top <= person["top"].as_f64().unwrap_or(0.0)
+        && bottom >= person["bottom"].as_f64().unwrap_or(0.0);
+    if contains_person {
+        return None;
+    }
+    // `delogo` rejects a box touching the frame border, so the mask is inset by at least
+    // one pixel on every side; a box that collapses once inset is dropped instead of
+    // emitting a filter that would abort the whole render.
+    const DELOGO_INSET: f64 = 1.0;
+    let x = (left * f64::from(width)).floor().max(DELOGO_INSET);
+    let y = (top * f64::from(height)).floor().max(DELOGO_INSET);
+    let x2 = (right * f64::from(width))
+        .ceil()
+        .min(f64::from(width) - DELOGO_INSET);
+    let y2 = (bottom * f64::from(height))
+        .ceil()
+        .min(f64::from(height) - DELOGO_INSET);
+    let (x, x2) = (x as u32, x2 as u32);
+    let (y, y2) = (y as u32, y2 as u32);
+    if x2 <= x || y2 <= y {
+        return None;
+    }
     Some(format!(
         "delogo=x={x}:y={y}:w={}:h={}:show=0",
         x2 - x,
@@ -545,6 +610,12 @@ fn text_box_delogo_filter(layout: &serde_json::Value, source_size: (u32, u32)) -
 /// present; otherwise they are recomputed from the boxes, so a plan without the resolved
 /// fields still renders a safe frame.
 ///
+/// The person is the anchor. A `textBox` (OCR of burned-in titles, corner tags) is
+/// secondary composition information: it widens the window only when it genuinely
+/// contains the subject — a wide title the presenter stands in front of. A tag sitting
+/// beside the person never widens the frame, so the subject keeps the middle of the
+/// plate instead of being shoved to the edge by a union of both boxes.
+///
 /// `tail` filters (hook drawtext, subtitles, setsar) run on the composed frame; the
 /// graph always ends at `[vout]`.
 pub fn composition_graph_filter(
@@ -557,19 +628,28 @@ pub fn composition_graph_filter(
         return None;
     }
     let calc_dominant = || -> Option<(f64, f64)> {
-        let span = |candidate: &serde_json::Value| {
-            Some((candidate["left"].as_f64()?, candidate["right"].as_f64()?))
+        let span_box = |candidate: &serde_json::Value| {
+            Some((
+                candidate["left"].as_f64()?,
+                candidate["right"].as_f64()?,
+                candidate["top"].as_f64()?,
+                candidate["bottom"].as_f64()?,
+            ))
         };
-        let person = span(&layout["personBox"])?;
-        let text = span(&layout["textBox"]);
-        let contains =
-            |outer: (f64, f64), inner: (f64, f64)| outer.0 <= inner.0 && outer.1 >= inner.1;
-        Some(match text {
-            Some(text) if contains(person, text) => person,
-            Some(text) if contains(text, person) => text,
-            Some(text) => (person.0.min(text.0), person.1.max(text.1)),
-            None => person,
-        })
+        let person = span_box(&layout["personBox"])?;
+        // Containment is the full box, not just the horizontal span: a title band
+        // that only shares the person's width across the top of the frame is OCR
+        // noise beside the subject, not a frame that owns them.
+        let contains = |outer: (f64, f64, f64, f64), inner: (f64, f64, f64, f64)| {
+            outer.0 <= inner.0 && outer.1 >= inner.1 && outer.2 <= inner.2 && outer.3 >= inner.3
+        };
+        let text = layout["textBox"]
+            .as_object()
+            .and_then(|candidate| span_box(&serde_json::Value::Object(candidate.clone())));
+        match text {
+            Some(text) if contains(text, person) => Some((text.0, text.1)),
+            _ => Some((person.0, person.1)),
+        }
     };
     let center_x = layout["centerX"]
         .as_f64()
@@ -581,8 +661,10 @@ pub fn composition_graph_filter(
         .or_else(|| calc_dominant().map(|(left, right)| (right - left + 0.04).min(1.0)))?;
     // Round the window up to an even pixel count: rounding down could dip below the
     // standard full-bleed width, and after scale=1080:-2 the frame would then be
-    // taller than the 1920 output, which overlay would reject.
-    let window = format!("2*ceil(max(ih*9/16\\,{frame_width:.4}*iw)/2)");
+    // taller than the 1920 output, which overlay would reject. Clamp to the source
+    // width as well — on a source taller than 9:16 the full-bleed width alone can be
+    // wider than `iw`, and crop rejects a window it cannot fit.
+    let window = format!("2*ceil(min(iw\\,max(ih*9/16\\,{frame_width:.4}*iw))/2)");
     let crop =
         format!("crop={window}:ih:max(0\\,min(iw-({window})\\,({center_x:.4}*iw-({window})/2))):0");
     let source_cover = source_size.and_then(|size| text_box_delogo_filter(layout, size));
@@ -601,6 +683,40 @@ pub fn composition_graph_filter(
         graph.push_str(&format!(";[pad{index}]{filter}[{output}]"));
     }
     Some(graph)
+}
+
+/// Builds the portrait background/foreground treatment for an explicitly marked
+/// zero-face scene. Unlike person composition, this keeps the complete landscape
+/// source visible and centered over its blurred, fill-sized copy.
+fn zero_face_scene_graph_filter(tail: &[String]) -> String {
+    let composed = if tail.is_empty() { "vout" } else { "pad0" };
+    let mut graph = format!(
+        "[0:v]split=2[fit][wide];[wide]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=24[bg];[fit]scale=1080:1920:force_original_aspect_ratio=decrease[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2[{composed}]"
+    );
+    for (index, filter) in tail.iter().enumerate() {
+        let output = if index + 1 == tail.len() {
+            "vout".to_string()
+        } else {
+            format!("pad{}", index + 1)
+        };
+        graph.push_str(&format!(";[pad{index}]{filter}[{output}]"));
+    }
+    graph
+}
+
+/// The zero-face path is enabled only by a confirmed solo scene with an explicit
+/// faceCount of zero. Missing counts and unconfirmed layouts retain the normal render.
+fn is_confirmed_zero_face_scene(
+    scene: &serde_json::Value,
+    plan: Option<&serde_json::Value>,
+) -> bool {
+    scene["layout"] == "solo"
+        && scene["faceCount"].as_u64() == Some(0)
+        && scene["confirmed"].as_bool() == Some(true)
+        && scene["sourceArtifactId"]
+            .as_str()
+            .zip(plan.and_then(|value| value["sourceArtifactId"].as_str()))
+            .is_some_and(|(scene_source, plan_source)| scene_source == plan_source)
 }
 
 /// Selects the H.264 encoder and preset based on platform + hardware preference.
@@ -718,22 +834,7 @@ pub fn render_segments(
         .unwrap_or_default();
     let keyframes: Vec<_> = keyframes
         .into_iter()
-        .filter(|key| {
-            key["confirmed"].as_bool() == Some(true)
-                && key["sourceArtifactId"].as_str()
-                    == plan.and_then(|value| value["sourceArtifactId"].as_str())
-                && key["confidence"]
-                    .as_f64()
-                    .is_some_and(|confidence| confidence >= 0.5)
-                && key["centerX"]
-                    .as_f64()
-                    .is_some_and(|center| (0.0..=1.0).contains(&center))
-                && key["time"].as_f64().is_some_and(|time| time.is_finite())
-                && key["speakerId"].as_str().is_some_and(|speaker| {
-                    plan.and_then(|value| value["speakerMap"][speaker].as_str())
-                        .is_some_and(|face| key["sourceFaceId"].as_str() == Some(face))
-                })
-        })
+        .filter(|key| admits_crop_keyframe(key, plan))
         .collect();
     let scene_layouts: Vec<_> = plan
         .and_then(|value| value["sceneLayouts"].as_array())
@@ -977,6 +1078,9 @@ pub fn render_segments(
                         .as_f64()
                         .is_some_and(|value| piece_start < value)
             });
+            let zero_face_scene = active_scene.filter(|scene| {
+                ratio == "9:16" && keyframes.is_empty() && is_confirmed_zero_face_scene(scene, plan)
+            });
             let side_by_side = active_scene
                 .filter(|scene| scene["layout"] == "side-by-side")
                 .and_then(|scene| scene["subjectBoxes"].as_array())
@@ -1011,9 +1115,13 @@ pub fn render_segments(
             let active_mask = active_composition_mask
                 .as_ref()
                 .or(active_ocr_mask.as_ref());
-            let use_composition = active_composition
-                .is_some_and(|layout| valid_span_box(&layout["personBox"]))
-                && ratio == "9:16";
+            // A confirmed crop path is the user's own composition; the automatic layout
+            // must never override it, so the piece keeps the plain crop graph (which
+            // carries the keyframes) instead of the composition graph.
+            let use_composition = zero_face_scene.is_none()
+                && active_composition.is_some_and(|layout| valid_span_box(&layout["personBox"]))
+                && ratio == "9:16"
+                && keyframes.is_empty();
             let mut filters = if side_by_side.is_some() || use_composition {
                 Vec::new()
             } else {
@@ -1092,25 +1200,33 @@ pub fn render_segments(
             }
             filters.push("setsar=1".to_string());
             composition_tail.push("setsar=1".to_string());
-            let complex_graph = side_by_side
-                .as_ref()
-                .and_then(|_| {
-                    let mut graph = side_by_side_graph(
-                        active_scene?.get("subjectBoxes")?.as_array()?,
-                        &complex_graph_filters,
-                        &ratio,
-                    )?;
-                    if let Some(cover) =
-                        active_mask.and_then(|layout| text_box_delogo_filter(layout, source_size?))
-                    {
-                        graph = graph.replacen("[0:v]split=2", &format!("[0:v]{cover},split=2"), 1);
-                    }
-                    Some(graph)
+            let complex_graph = zero_face_scene
+                .map(|_| zero_face_scene_graph_filter(&composition_tail))
+                .or_else(|| {
+                    side_by_side.as_ref().and_then(|_| {
+                        let mut graph = side_by_side_graph(
+                            active_scene?.get("subjectBoxes")?.as_array()?,
+                            &complex_graph_filters,
+                            &ratio,
+                        )?;
+                        if let Some(cover) = active_mask
+                            .and_then(|layout| text_box_delogo_filter(layout, source_size?))
+                        {
+                            graph =
+                                graph.replacen("[0:v]split=2", &format!("[0:v]{cover},split=2"), 1);
+                        }
+                        Some(graph)
+                    })
                 })
                 .or_else(|| {
+                    // The composition graph also decides the crop, so it must not run
+                    // while the user's own keyframe crop is in play — that path keeps
+                    // the plain filters (which carry the keyframes) instead.
                     active_composition_mask
                         .as_ref()
-                        .filter(|_| ratio == "9:16")
+                        .filter(|_| {
+                            zero_face_scene.is_none() && ratio == "9:16" && keyframes.is_empty()
+                        })
                         .and_then(|layout| {
                             composition_graph_filter(layout, &ratio, &composition_tail, source_size)
                         })
@@ -1124,6 +1240,20 @@ pub fn render_segments(
                     .arg(format!("{duration:.3}"))
                     .args(["-i"])
                     .arg(source);
+            }
+            if !has_audio {
+                // A source without an audio track still gets a silent track, so the
+                // output is a normal playable MP4. The fake input has to be declared
+                // with the real inputs: past the first output option FFmpeg reads
+                // `-f lavfi` as an output format and refuses to open the input.
+                cmd.args([
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "anullsrc=channel_layout=stereo:sample_rate=44100",
+                    "-t",
+                ])
+                .arg(format!("{duration:.3}"));
             }
             if let Some(graph) = complex_graph.as_ref() {
                 cmd.args(["-filter_complex", graph, "-map", "[vout]"]);
@@ -1143,17 +1273,9 @@ pub fn render_segments(
                     .args(["-c:a", "aac", "-b:a", "128k"]);
             } else {
                 let audio_input_index = media.len();
-                cmd.args([
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "anullsrc=channel_layout=stereo:sample_rate=44100",
-                    "-t",
-                ])
-                .arg(format!("{duration:.3}"))
-                .args(["-map", "0:v:0", "-map"])
-                .arg(format!("{audio_input_index}:a:0"))
-                .args(["-c:a", "aac", "-b:a", "128k"]);
+                cmd.args(["-map", "0:v:0", "-map"])
+                    .arg(format!("{audio_input_index}:a:0"))
+                    .args(["-c:a", "aac", "-b:a", "128k"]);
             }
             let window_start =
                 ((index as f64 + piece_index as f64 / windows_count) / ranges.len() as f64) * 90.0;
@@ -1493,6 +1615,84 @@ pub fn escape_ass_text(text: &str) -> String {
         .replace(['\r', '\n'], " ")
 }
 
+/// Builds ASS text with optional word-level karaoke (`\k`) timing clipped to
+/// the rendered window `[from, to)`. Falls back to the escaped caption text
+/// when word timing is absent, empty, out of order, or contains newlines.
+fn ass_caption_text(
+    caption: &serde_json::Value,
+    text: &str,
+    cue_start: f64,
+    cue_end: f64,
+    from: f64,
+    to: f64,
+) -> String {
+    if text.contains(['\n', '\r']) {
+        return escape_ass_text(text);
+    }
+    let Some(words) = caption.get("words").and_then(|v| v.as_array()) else {
+        return escape_ass_text(text);
+    };
+    if words.is_empty() {
+        return escape_ass_text(text);
+    }
+    // Parse word timing; bail to plain text on any malformed entry.
+    let mut parsed: Vec<(String, f64, f64)> = Vec::with_capacity(words.len());
+    for word in words {
+        let Some(wtext) = word["text"].as_str() else {
+            return escape_ass_text(text);
+        };
+        if wtext.is_empty() || wtext.contains(['\n', '\r']) {
+            return escape_ass_text(text);
+        }
+        let (Some(ws), Some(we)) = (word["start"].as_f64(), word["end"].as_f64()) else {
+            return escape_ass_text(text);
+        };
+        if !ws.is_finite() || !we.is_finite() || we <= ws {
+            return escape_ass_text(text);
+        }
+        if ws < cue_start || we > cue_end {
+            return escape_ass_text(text);
+        }
+        parsed.push((wtext.to_string(), ws, we));
+    }
+    // Require strictly increasing (non-overlapping) word timings.
+    for i in 1..parsed.len() {
+        if parsed[i].1 < parsed[i - 1].2 {
+            return escape_ass_text(text);
+        }
+    }
+    // Clip to the rendered window; keep only words overlapping [from, to).
+    let mut visible: Vec<(String, f64, f64)> = Vec::new();
+    for (wtext, ws, we) in parsed {
+        let cstart = ws.max(from);
+        let cend = we.min(to);
+        if cend > cstart {
+            visible.push((wtext, cstart, cend));
+        }
+    }
+    if visible.is_empty() {
+        return escape_ass_text(text);
+    }
+    // Emit `\k<centiseconds>` before each word except the first. Centiseconds
+    // are relative to the clipped caption's start (ASS timing is dialogue
+    // local). For the first visible word, emit `\k0` so FFmpeg anchors the
+    // highlight sweep to the visible window rather than the full cue.
+    let mut out = String::new();
+    for (i, (wtext, cstart, _cend)) in visible.iter().enumerate() {
+        if i == 0 {
+            out.push_str("\\k0");
+        } else {
+            let delta_cs = ((cstart - from) * 100.0).floor() as i64;
+            out.push_str(&format!("\\k{}", delta_cs.max(0)));
+        }
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(&escape_ass_text(wtext));
+    }
+    out
+}
+
 pub fn ass_dialogue(
     captions: &[serde_json::Value],
     start: f64,
@@ -1514,11 +1714,12 @@ pub fn ass_dialogue(
         let from = cue_start.max(start);
         let to = cue_end.min(end);
         if to > from {
+            let display = ass_caption_text(caption, text, cue_start, cue_end, from, to);
             events.push(format!(
                 "Dialogue: 0,{},{},Shorts,,0,0,0,,{}",
                 ass_timestamp(from - start),
                 ass_timestamp(to - start),
-                escape_ass_text(text)
+                display
             ));
         }
     }
@@ -1589,7 +1790,10 @@ impl Drop for TemporarySubtitle {
 
 #[cfg(test)]
 mod tests {
-    use super::{composition_graph_filter, text_box_delogo_filter};
+    use super::{
+        ass_dialogue, composition_graph_filter, has_confirmed_crop_keyframes, is_confirmed_zero_face_scene,
+        text_box_delogo_filter, zero_face_scene_graph_filter,
+    };
     use serde_json::json;
 
     fn layout(person_left: f64, person_right: f64, text: Option<(f64, f64)>) -> serde_json::Value {
@@ -1611,7 +1815,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            graph.contains("2*ceil(max(ih*9/16\\,0.2600*iw)/2)"),
+            graph.contains("2*ceil(min(iw\\,max(ih*9/16\\,0.2600*iw))/2)"),
             "{graph}"
         );
         assert!(graph.contains("0.4100*iw"), "{graph}");
@@ -1623,10 +1827,70 @@ mod tests {
     }
 
     #[test]
-    fn zooms_out_when_the_text_owns_the_frame() {
-        // The title spans 0.02..0.66 and contains the person, so it sets the width.
+    fn centres_the_frame_on_the_person_when_the_text_sits_off_to_one_side() {
+        // Person on the left, a corner tag on the right: the person is the anchor, so
+        // the frame width stays the person's own span and the subject keeps the middle
+        // of the plate. The union would drag the subject to ~20% of the output frame.
         let graph = composition_graph_filter(
-            &layout(0.30, 0.52, Some((0.02, 0.66))),
+            &layout(0.05, 0.30, Some((0.60, 0.95))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.2900*iw)"), "{graph}");
+        assert!(graph.contains("0.1750*iw"), "{graph}");
+    }
+
+    #[test]
+    fn keeps_a_centred_person_centred_when_text_owns_the_far_right() {
+        let graph = composition_graph_filter(
+            &layout(0.40, 0.60, Some((0.65, 0.95))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.2400*iw)"), "{graph}");
+        assert!(graph.contains("0.5000*iw"), "{graph}");
+    }
+
+    #[test]
+    fn keeps_the_person_centred_when_the_person_is_on_the_right() {
+        let graph = composition_graph_filter(
+            &layout(0.70, 0.92, Some((0.02, 0.35))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.2600*iw)"), "{graph}");
+        assert!(graph.contains("0.8100*iw"), "{graph}");
+    }
+
+    #[test]
+    fn keeps_the_person_centred_when_the_boxes_overlap_without_containing() {
+        // Overlapping but neither contains: still person-first, no union widening.
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.60, Some((0.50, 0.80))),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        assert!(graph.contains("max(ih*9/16\\,0.3400*iw)"), "{graph}");
+        assert!(graph.contains("0.4500*iw"), "{graph}");
+    }
+
+    #[test]
+    fn keeps_the_text_when_it_contains_the_person() {
+        // A wide title that still carries the person: the text legitimately owns the
+        // frame, so it is not displaced by the person-first rule.
+        let graph = composition_graph_filter(
+            &json!({
+                "personBox": { "left": 0.30, "right": 0.52, "top": 0.1, "bottom": 0.9 },
+                "textBox": { "left": 0.02, "right": 0.66, "top": 0.05, "bottom": 0.95 },
+            }),
             "9:16",
             &[],
             Some((1920, 1080)),
@@ -1634,20 +1898,189 @@ mod tests {
         .unwrap();
         assert!(graph.contains("max(ih*9/16\\,0.6800*iw)"), "{graph}");
         assert!(graph.contains("0.3400*iw"), "{graph}");
-        assert!(graph.ends_with("[vout]"), "{graph}");
     }
 
     #[test]
-    fn unions_boxes_that_do_not_contain_each_other() {
+    fn ignores_a_title_band_that_only_spans_the_persons_width() {
+        // A burned-in title across the top of the frame shares the person's width but
+        // not their height: it is secondary information, so the subject keeps the
+        // anchor instead of the frame widening and then being masked over the head.
         let graph = composition_graph_filter(
-            &layout(0.30, 0.52, Some((0.70, 0.98))),
+            &layout(0.30, 0.52, Some((0.02, 0.66))),
             "9:16",
             &[],
             Some((1920, 1080)),
         )
         .unwrap();
-        assert!(graph.contains("max(ih*9/16\\,0.7200*iw)"), "{graph}");
-        assert!(graph.contains("0.6400*iw"), "{graph}");
+        assert!(graph.contains("max(ih*9/16\\,0.2600*iw)"), "{graph}");
+        assert!(graph.contains("0.4100*iw"), "{graph}");
+    }
+
+    #[test]
+    fn zero_face_scene_requires_explicit_confirmed_marker_and_matching_source() {
+        let plan = json!({ "sourceArtifactId": "source" });
+        let scene = json!({
+            "layout": "solo",
+            "faceCount": 0,
+            "confirmed": true,
+            "sourceArtifactId": "source"
+        });
+        assert!(is_confirmed_zero_face_scene(&scene, Some(&plan)));
+
+        let mut unconfirmed = scene.clone();
+        unconfirmed["confirmed"] = json!(false);
+        assert!(!is_confirmed_zero_face_scene(&unconfirmed, Some(&plan)));
+
+        let mut missing_count = scene.clone();
+        missing_count.as_object_mut().unwrap().remove("faceCount");
+        assert!(!is_confirmed_zero_face_scene(&missing_count, Some(&plan)));
+
+        let mut unknown_count = scene.clone();
+        unknown_count["faceCount"] = json!(1);
+        assert!(!is_confirmed_zero_face_scene(&unknown_count, Some(&plan)));
+
+        let mut other_layout = scene.clone();
+        other_layout["layout"] = json!("side-by-side");
+        assert!(!is_confirmed_zero_face_scene(&other_layout, Some(&plan)));
+
+        let mut wrong_source = scene.clone();
+        wrong_source["sourceArtifactId"] = json!("other");
+        assert!(!is_confirmed_zero_face_scene(&wrong_source, Some(&plan)));
+        assert!(!is_confirmed_zero_face_scene(&scene, None));
+    }
+
+    #[test]
+    fn zero_face_scene_fits_landscape_foreground_over_blurred_background() {
+        let graph = zero_face_scene_graph_filter(&["setsar=1".to_string()]);
+        assert!(graph.contains("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,gblur=sigma=24[bg]"), "{graph}");
+        assert!(
+            graph.contains("scale=1080:1920:force_original_aspect_ratio=decrease[fg]"),
+            "{graph}"
+        );
+        assert!(graph.contains("overlay=(W-w)/2:(H-h)/2"), "{graph}");
+        assert!(graph.ends_with(";[pad0]setsar=1[vout]"), "{graph}");
+    }
+
+    #[test]
+    fn falls_back_to_the_centre_crop_when_no_person_is_detected() {
+        // No person box at all: the composition path refuses, so the caller keeps its
+        // plain centre crop (the safe fallback when detection is unavailable).
+        assert!(composition_graph_filter(
+            &json!({ "textBox": { "left": 0.1, "right": 0.9, "top": 0.5, "bottom": 0.6 } }),
+            "9:16",
+            &[],
+            Some((1920, 1080)),
+        )
+        .is_none());
+        assert!(composition_graph_filter(&json!({}), "9:16", &[], Some((1920, 1080))).is_none());
+    }
+
+    #[test]
+    fn ignores_out_of_range_resolved_geometry_and_keeps_the_crop_in_bounds() {
+        // A layout that carries a broken centerX/frameWidth falls back to the person's
+        // own geometry instead of pushing the crop outside the source frame.
+        let mut broken = layout(0.30, 0.52, Some((0.70, 0.98)));
+        broken["centerX"] = json!(1.4);
+        broken["frameWidth"] = json!(1.5);
+        let graph = composition_graph_filter(&broken, "9:16", &[], Some((1920, 1080))).unwrap();
+        assert!(graph.contains("0.4100*iw"), "{graph}");
+        assert!(graph.contains("max(ih*9/16\\,0.2600*iw)"), "{graph}");
+        assert!(
+            graph.contains("crop=") && graph.contains("max(0\\,min(iw-("),
+            "the crop must be clamped into the source: {graph}"
+        );
+
+        // A zero or negative frame width is invalid too, and out-of-range person
+        // coordinates cannot escape 0..1 through the resolved geometry.
+        for width in [json!(0.0), json!(-1.0), json!(f64::NAN)] {
+            let mut value = layout(0.30, 0.52, None);
+            value["frameWidth"] = width;
+            let graph = composition_graph_filter(&value, "9:16", &[], None).unwrap();
+            assert!(graph.contains("0.2600*iw"), "{graph}");
+        }
+        let shifted = layout(-0.30, 0.52, Some((0.70, 0.98)));
+        let graph = composition_graph_filter(&shifted, "9:16", &[], Some((1920, 1080))).unwrap();
+        assert!(graph.contains("max(0\\,min(iw-("), "{graph}");
+    }
+
+    #[test]
+    fn never_builds_a_window_wider_than_the_source() {
+        // A source taller than 9:16 would make ih*9/16 exceed iw; the window clamps to
+        // the source width so crop cannot fail with a too-big geometry.
+        let graph = composition_graph_filter(
+            &json!({ "centerX": 0.5, "frameWidth": 1.0 }),
+            "9:16",
+            &[],
+            Some((1080, 2400)),
+        )
+        .unwrap();
+        assert!(
+            graph.contains("2*ceil(min(iw\\,max(ih*9/16\\,1.0000*iw))/2)"),
+            "{graph}"
+        );
+    }
+
+    #[test]
+    fn holds_one_constant_window_per_piece_for_temporal_stability() {
+        // The composition crop is a constant offset, never a function of t, so
+        // consecutive frames cannot jitter; scene changes come from piece boundaries.
+        let graph = composition_graph_filter(
+            &layout(0.30, 0.52, Some((0.70, 0.98))),
+            "9:16",
+            &["setsar=1".to_string()],
+            Some((1920, 1080)),
+        )
+        .unwrap();
+        let crop = graph
+            .split_once("crop=")
+            .and_then(|(_, rest)| rest.split_once(",split=2"))
+            .map(|(crop, _)| crop)
+            .expect("composition graph must carry a crop filter");
+        assert!(
+            !crop.contains('t'),
+            "the crop must not animate per frame: {crop}"
+        );
+    }
+
+    #[test]
+    fn resolves_the_crop_from_the_plan_keyframes_before_any_composition() {
+        // A plan that carries BOTH a confirmed manual crop path and an automatic
+        // composition layout must follow the keyframes: the auto layout never
+        // overrides what the user configured in the Editor.
+        let plan = json!({
+            "sourceArtifactId": "src",
+            "speakerMap": { "A": "face-1" },
+            "cropKeyframes": [
+                { "time": 0.0, "centerX": 0.2, "centerY": 0.5, "speakerId": "A", "sourceFaceId": "face-1", "confidence": 0.9, "confirmed": true, "sourceArtifactId": "src" },
+                { "time": 6.0, "centerX": 0.8, "centerY": 0.5, "speakerId": "A", "sourceFaceId": "face-1", "confidence": 0.9, "confirmed": true, "sourceArtifactId": "src" }
+            ],
+            "compositionLayouts": [
+                {
+                    "start": 0.0, "end": 6.0, "confidence": 0.9, "confirmed": true, "sourceArtifactId": "src",
+                    "personBox": { "left": 0.4, "right": 0.6, "top": 0.1, "bottom": 0.9 },
+                    "centerX": 0.5, "frameWidth": 0.4
+                }
+            ]
+        });
+        assert!(has_confirmed_crop_keyframes(&plan));
+
+        // An unapproved tracking run, an unconfirmed mapping (confidence below the
+        // renderer's 0.5 gate), a foreign artifact, a lost face mapping and a keyframe
+        // with no speaker link must not count as a manual path, so the automatic
+        // composition still applies for them.
+        for keyframes in [
+            json!([{ "time": 0.0, "centerX": 0.2, "speakerId": "A", "sourceFaceId": "face-1", "confidence": 0.9, "confirmed": false, "sourceArtifactId": "src" }]),
+            json!([{ "time": 0.0, "centerX": 0.2, "speakerId": "A", "sourceFaceId": "face-1", "confidence": 0.4, "confirmed": true, "sourceArtifactId": "src" }]),
+            json!([{ "time": 0.0, "centerX": 0.2, "speakerId": "A", "sourceFaceId": "face-1", "confidence": 0.9, "confirmed": true, "sourceArtifactId": "other" }]),
+            json!([{ "time": 0.0, "centerX": 0.2, "speakerId": "A", "sourceFaceId": "face-2", "confidence": 0.9, "confirmed": true, "sourceArtifactId": "src" }]),
+            json!([{ "time": 0.0, "centerX": 0.2, "confidence": 0.9, "confirmed": true, "sourceArtifactId": "src" }]),
+            json!([]),
+        ] {
+            let mut candidate = plan.clone();
+            candidate["cropKeyframes"] = keyframes;
+            assert!(!has_confirmed_crop_keyframes(&candidate), "{candidate}");
+        }
+        assert!(!has_confirmed_crop_keyframes(&json!({})));
     }
 
     #[test]
@@ -1678,6 +2111,53 @@ mod tests {
         let invalid =
             json!({ "textBox": { "left": -0.1, "right": 0.4, "top": 0.7, "bottom": 0.8 } });
         assert!(text_box_delogo_filter(&invalid, (1920, 1080)).is_none());
+    }
+
+    #[test]
+    fn delogo_insets_boxes_that_touch_the_frame_border() {
+        // A full-frame title band is legitimate composition data, but `delogo`
+        // rejects a box touching the border — the mask has to shrink inside it
+        // instead of failing the whole render.
+        let full = json!({ "textBox": { "left": 0.0, "right": 1.0, "top": 0.0, "bottom": 1.0 } });
+        assert_eq!(
+            text_box_delogo_filter(&full, (1280, 720)).as_deref(),
+            Some("delogo=x=1:y=1:w=1278:h=718:show=0")
+        );
+        let band = json!({ "textBox": { "left": 0.0, "right": 1.0, "top": 0.02, "bottom": 0.35 } });
+        assert_eq!(
+            text_box_delogo_filter(&band, (1280, 720)).as_deref(),
+            Some("delogo=x=1:y=14:w=1278:h=238:show=0")
+        );
+        // A box that collapses once inset is dropped rather than emitted invalid.
+        let hairline =
+            json!({ "textBox": { "left": 0.0, "right": 0.0005, "top": 0.5, "bottom": 0.6 } });
+        assert!(text_box_delogo_filter(&hairline, (1280, 720)).is_none());
+    }
+
+    #[test]
+    fn delogo_never_masks_the_primary_subject() {
+        let person = json!({
+            "left": 0.2984, "right": 0.4672, "top": 0.16, "bottom": 0.90
+        });
+        // A caption band sitting over the subject: masking it would erase the
+        // person, so the burn-in stays and the subject survives.
+        let over = json!({
+            "personBox": person,
+            "textBox": { "left": 0.0, "right": 1.0, "top": 0.0, "bottom": 1.0 }
+        });
+        assert!(text_box_delogo_filter(&over, (1280, 720)).is_none());
+        // A lower third below the subject is safe to mask.
+        let below = json!({
+            "personBox": person,
+            "textBox": { "left": 0.05, "right": 0.95, "top": 0.78, "bottom": 0.98 }
+        });
+        assert!(text_box_delogo_filter(&below, (1280, 720)).is_some());
+        // So is a title band above the subject.
+        let above = json!({
+            "personBox": person,
+            "textBox": { "left": 0.0, "right": 1.0, "top": 0.02, "bottom": 0.14 }
+        });
+        assert!(text_box_delogo_filter(&above, (1280, 720)).is_some());
     }
 
     #[test]
@@ -1716,6 +2196,70 @@ mod tests {
             graph.contains(";[pad0]drawtext=x[pad1];[pad1]ass=y.ass[pad2];[pad2]setsar=1[vout]"),
             "{graph}"
         );
+    }
+
+    #[test]
+    fn optional_word_timing_emits_karaoke_tags_and_keeps_safe_area_margins() {
+        let captions = vec![
+            serde_json::json!({
+                "text": "hello world",
+                "start": 1.0,
+                "end": 3.0,
+                "words": [
+                    {"text": "hello", "start": 1.0, "end": 2.0},
+                    {"text": "world", "start": 2.0, "end": 3.0},
+                ],
+            }),
+            serde_json::json!({"text": "plain caption", "start": 4.0, "end": 5.0}),
+        ];
+        let ass = ass_dialogue(&captions, 0.5, 5.0, 650)
+            .unwrap()
+            .unwrap();
+        assert!(ass.contains("hello\\k100 world"), "{ass}");
+        assert!(ass.contains("plain caption") && !ass.contains("plain\\k"), "{ass}");
+        assert!(ass.contains("MarginV, Encoding") || ass.contains("40,40,650"), "{ass}");
+        assert!(ass.contains("40,40,650"), "{ass}");
+    }
+
+    #[test]
+    fn partial_word_timing_clips_to_caption_and_single_range() {
+        let captions = vec![
+            serde_json::json!({
+                "text": "hello world",
+                "start": 1.0,
+                "end": 3.0,
+                "words": [
+                    {"text": "hello", "start": 1.0, "end": 2.0},
+                    {"text": "world", "start": 2.0, "end": 3.0},
+                ],
+            }),
+        ];
+        let first = ass_dialogue(&captions, 6.0, 2.0, 650).unwrap();
+        assert_eq!(first, None, "the caption is outside this range");
+        let second = ass_dialogue(&captions, 2.0, 1.0, 650)
+            .unwrap()
+            .unwrap();
+        assert!(second.contains("world"), "{second}");
+        assert!(!second.contains("hello"), "{second}");
+    }
+
+    #[test]
+    fn multiline_word_timing_falls_back_to_source_caption_text() {
+        let captions = vec![
+            serde_json::json!({
+                "text": "hello\nworld",
+                "start": 1.0,
+                "end": 3.0,
+                "words": [
+                    {"text": "hello", "start": 1.0, "end": 2.0},
+                    {"text": "world", "start": 2.0, "end": 3.0},
+                ],
+            }),
+        ];
+        let ass = ass_dialogue(&captions, 0.0, 4.0, 650)
+            .unwrap()
+            .unwrap();
+        assert!(!ass.contains("hello\\k"), "{ass}");
     }
 
     #[test]

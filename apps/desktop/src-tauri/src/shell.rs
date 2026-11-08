@@ -52,4 +52,3 @@ pub(crate) fn install_panic_hook() {
         }
     }));
 }
-

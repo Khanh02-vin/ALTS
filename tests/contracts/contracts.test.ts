@@ -16,8 +16,16 @@ validateTranscript(transcript);
 assert.throws(() => validateTranscript({ ...transcript, words: [{ ...transcript.words[0], end: 0 }] }));
 
 const highlight = { version: 1 as const, id: "h1", sourceArtifactId: "src", start: 1, end: 10, wordIds: ["w1"], title: "Hook", score: 80 };
-validateHighlights([highlight], 60);
+validateHighlights([highlight], 60); // persisted v1 highlights without axes remain readable
+validateHighlights([{ ...highlight, scores: { hook: 70, summary: 40, impact: 20 }, dominantAxis: "hook" }], 60);
+assert.throws(() => validateHighlights([{ ...highlight, scores: { hook: 101, summary: 40, impact: 20 } }], 60), /score/i);
+assert.throws(() => validateHighlights([{ ...highlight, scores: { hook: 70, summary: Number.NaN, impact: 20 } }], 60), /score/i);
+assert.throws(() => validateHighlights([{ ...highlight, dominantAxis: "viral" } as never], 60), /axis/i);
 assert.throws(() => validateHighlights([highlight, { ...highlight, id: "h2", start: 9, end: 12 }], 60));
+validateHighlights([{ ...highlight, status: "discarded" }], 60);
+validateHighlights([{ ...highlight, status: "saved" }], 60);
+validateHighlights([{ ...highlight, status: "active" }], 60);
+assert.throws(() => validateHighlights([{ ...highlight, status: "archived" } as never], 60), /status/i);
 
 const collection = {
   version: 1 as const,
@@ -64,6 +72,12 @@ validateRenderPlan(plan, 60);
 assert.throws(() => validateRenderPlan({ ...plan, version: 0 }, 60));
 assert.throws(() => validateRenderPlan({ ...plan, aspectRatio: "4:3" as never }, 60));
 assert.throws(() => validateRenderPlan({ ...plan, ranges: [] }, 60), /at least one range/);
+validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello world", start: 1, end: 3, words: [{ text: "hello", start: 1, end: 2 }, { text: "world", start: 2, end: 3 }] }] }, 60);
+assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "", start: 1, end: 2 }] }] }, 60), /caption word/i);
+assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "hello", start: 2, end: 1 }] }] }, 60), /caption word/i);
+assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "late", start: 1, end: 3 }] }] }, 60), /caption word/i);
+assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "nan", start: Number.NaN, end: 2 }] }] }, 60), /caption word/i);
+assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "reversed", start: 2, end: 2 }] }] }, 60), /caption word/i);
 validateRenderPlan({ ...plan, ranges: [{ start: 10, end: 12 }, { start: 1, end: 3 }, { start: 3, end: 4 }] }, 60);
 validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, speakerId: "Speaker 1", sourceArtifactId: "src", confidence: 0.9, confirmed: true }] }, 60);
 assert.throws(() => validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, sourceArtifactId: "other", confidence: 0.9, confirmed: true }] }, 60), /source mismatch/);

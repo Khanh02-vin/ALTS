@@ -5,7 +5,7 @@
   import { studioState } from "../studio-state.svelte.ts";
   import Icon from "../icons.svelte";
   import { addRange, captionsFromTranscript, createEditorState, createEditorStateFromVariant, loadTranscriptCaptions, moveRange, removeCaption, removeRange, setCropKeyframes, setSceneLayouts, setSpeakerMap, updateAspectRatio, updateHook, updateRange, upsertCaption, type EditorState } from "../../../../../packages/editor-core/index.ts";
-  import type { Highlight } from "../../../../../packages/contracts/highlight.ts";
+  import { isActiveHighlight, type Highlight, type HighlightStatus } from "../../../../../packages/contracts/highlight.ts";
   import type { Caption, CropKeyframe, SceneLayout } from "../../../../../packages/contracts/render-plan.ts";
   import { cropCenterAt } from "../../../../../packages/media-engine/reframe/index.ts";
   import { cropKeyframesFromPath } from "../../../../../packages/media-engine/reframe/crop-keyframes.ts";
@@ -49,6 +49,14 @@
   $: activeCaption = state.plan.captions.find((caption) => caption.id === activeCaptionId) ?? state.plan.captions[0];
   $: range = state.plan.ranges[activeRangeIndex] ?? state.plan.ranges[0];
 
+  function dominantAxisLabel(axis: Highlight["dominantAxis"]): string | undefined {
+    if (!axis) return;
+    const labels = studioState.transcript?.language.toLowerCase().startsWith("vi")
+      ? { hook: "Mở đầu", summary: "Tóm tắt", impact: "Tác động" }
+      : { hook: "Hook", summary: "Summary", impact: "Impact" };
+    return labels[axis];
+  }
+
   function clientXToTime(event: MouseEvent): number {
     const rect = timeline.getBoundingClientRect();
     return Math.max(0, Math.min(sourceDuration, ((event.clientX - rect.left) / rect.width) * sourceDuration));
@@ -58,7 +66,8 @@
     studioState.plan = state.plan;
     if (editingVariantId) {
       const variants = studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant);
-      studioState.variants = variants; studioState.plans = { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan };
+      const summaryVariants = studioState.summaryVariants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant);
+      studioState.variants = variants; studioState.summaryVariants = summaryVariants; studioState.plans = { ...studioState.plans, [`variant:${editingVariantId}`]: state.plan };
       if (isTauri() && studioState.projectId) void save();
     } else studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
   }
@@ -88,8 +97,8 @@
     const step = event.shiftKey ? 1 : 0.25;
     let handled = true;
     try {
-      if (event.key === "ArrowLeft" || event.key === "ArrowDown") { state = updateRange(state, { start: Math.max(0, range.start - step), end: range.end }, activeRangeIndex); }
-      else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }, activeRangeIndex); }
+      if (event.key === "ArrowLeft" || event.key === "ArrowDown") { state = updateRange(state, { start: Math.max(0, range.start - step), end: range.end }, activeRangeIndex, studioState.transcript); }
+      else if (event.key === "ArrowRight" || event.key === "ArrowUp") { state = updateRange(state, { start: range.start, end: Math.min(sourceDuration, range.end + step) }, activeRangeIndex, studioState.transcript); }
       else handled = false;
     } catch { handled = false; }
     if (handled) { savePlan(); event.preventDefault(); }
@@ -132,10 +141,10 @@
       const t = ((moveEvent.clientX - rect.left) / rect.width) * sourceDuration;
       if (dragging === "in") {
         const nextStart = Math.max(0, Math.min(t, dragStartRange.end - 0.2));
-        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }, activeRangeIndex); savePlan(); seek(nextStart); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: nextStart, end: dragStartRange.end }, activeRangeIndex, studioState.transcript); savePlan(); seek(nextStart); } catch { /* keep last valid range */ }
       } else {
         const nextEnd = Math.min(sourceDuration, Math.max(t, dragStartRange.start + 0.2));
-        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }, activeRangeIndex); savePlan(); seek(nextEnd); } catch { /* keep last valid range */ }
+        try { state = updateRange(state, { start: dragStartRange.start, end: nextEnd }, activeRangeIndex, studioState.transcript); savePlan(); seek(nextEnd); } catch { /* keep last valid range */ }
       }
       moveEvent.preventDefault();
     };
@@ -222,6 +231,7 @@
   function isRemoteSource(path: string) { return path.startsWith("http://") || path.startsWith("https://"); }
   function loadFromStudio() {
     candidates = studioState.highlights.length ? studioState.highlights : [fallback];
+    const activeIds = new Set(candidates.filter(isActiveHighlight).map((item) => item.id));
     sourcePath = studioState.sourcePath;
     projectRevision = studioState.projectRevision;
     previewPath = sourcePath;
@@ -232,7 +242,7 @@
     powered = sourcePath !== "";
     editingVariantId = studioState.editingVariantId;
     if (editingVariantId) {
-      const variant = studioState.variants.find((item) => item.id === editingVariantId);
+      const variant = [...studioState.variants, ...studioState.summaryVariants].find((item) => item.id === editingVariantId);
       if (!variant || !studioState.transcript) { editingVariantId = ""; studioState.editingVariantId = ""; return; }
       selectedId = `variant:${variant.id}`;
       const storedPlan = variant.plan ?? studioState.plans[selectedId];
@@ -241,8 +251,10 @@
       activeRangeIndex = 0; studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
       currentTime = range.start; return;
     }
-    const initial = studioState.selectedId || candidates[0]?.id || fallback.id;
-    const picked = candidates.find((candidate) => candidate.id === initial) ?? fallback;
+    const initial = activeIds.has(studioState.selectedId)
+      ? studioState.selectedId
+      : candidates.find(isActiveHighlight)?.id ?? fallback.id;
+    const picked = candidates.find((candidate) => candidate.id === initial && isActiveHighlight(candidate)) ?? fallback;
     selectedId = picked.id;
     activeRangeIndex = 0;
     const plan = studioState.plans[initial] ?? studioState.plan;
@@ -256,12 +268,56 @@
 
   function select(id: string) {
     const candidate = candidates.find((item) => item.id === id) ?? fallback;
+    if (!isActiveHighlight(candidate)) return;
     selectedId = id;
     editingVariantId = ""; studioState.editingVariantId = "";
     state = studioState.plans[id] ? { ...state, selected: candidate, plan: studioState.plans[id] } : createEditorState(candidate.sourceArtifactId || "demo-source", sourceDuration, candidate);
     studioState.selectedId = id;
     studioState.plan = state.plan; studioState.plans = { ...studioState.plans, [selectedId]: state.plan };
     currentTime = state.plan.ranges[0]?.start ?? candidate.start;
+  }
+
+  function setHighlightStatus(id: string, status: HighlightStatus | undefined) {
+    const next = candidates.map((item) => item.id === id
+      ? (status === undefined ? { ...item, status: undefined } : { ...item, status })
+      : item);
+    candidates = next;
+    studioState.highlights = next;
+    studioState.selectedIds = studioState.selectedIds.filter((selected) => next.some((item) => item.id === selected && isActiveHighlight(item)));
+    const nextSelectedId = next.find((item) => item.id === selectedId && isActiveHighlight(item))?.id
+      ?? next.find(isActiveHighlight)?.id ?? "";
+    selectedId = nextSelectedId; studioState.selectedId = nextSelectedId;
+    void saveStatus();
+  }
+  function saveHighlight(id: string) { setHighlightStatus(id, "saved"); }
+  function discardHighlight(id: string) { setHighlightStatus(id, "discarded"); }
+  function restoreHighlight(id: string) { setHighlightStatus(id, undefined); }
+  async function saveStatus() {
+    saved = false; saveError = "";
+    if (!isTauri() || !studioState.projectId) return;
+    try {
+      await enqueueProjectSave(studioState.projectId, async () => {
+        const project = await invoke<Record<string, unknown>>("project_get", { id: studioState.projectId });
+        const savedProject = await invoke<Record<string, unknown>>("project_save", {
+          project: {
+            ...project,
+            highlights: studioState.highlights,
+            selectedId,
+            selectedIds: studioState.selectedIds,
+            revision: Number(project.revision ?? projectRevision),
+          },
+        });
+        projectRevision = Number(savedProject.revision ?? projectRevision);
+        studioState.projectRevision = projectRevision;
+      });
+      saved = true;
+      if (saveTimer) clearTimeout(saveTimer);
+      saveTimer = setTimeout(() => { saved = false; saveTimer = undefined; }, 1600);
+    } catch (error) {
+      saved = false; saveError = String(error).includes("PROJECT_REVISION_CONFLICT")
+        ? "This project changed in another view. Reload the project before saving again."
+        : `Could not save highlight status: ${String(error)}`;
+    }
   }
   function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`; }
   function pct(seconds: number) { return `${Math.max(0, Math.min(100, (seconds / Math.max(sourceDuration, 1)) * 100))}%`; }
@@ -271,7 +327,7 @@
   function seekTimeline(event: MouseEvent) { const rect = (event.currentTarget as HTMLElement).getBoundingClientRect(); seek(((event.clientX - rect.left) / rect.width) * sourceDuration); }
   function setRangeEdge(edge: "start" | "end", value: number) {
     const next = edge === "start" ? Math.min(value, range.end - 0.1) : Math.max(value, range.start + 0.1);
-    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }, activeRangeIndex); savePlan(); } catch { /* keep the last valid range */ }
+    try { state = updateRange(state, { start: edge === "start" ? Math.max(0, next) : range.start, end: edge === "end" ? Math.min(sourceDuration, next) : range.end }, activeRangeIndex, studioState.transcript); savePlan(); } catch { /* keep the last valid range */ }
   }
   function setAspect(value: "9:16" | "1:1" | "16:9") { state = updateAspectRatio(state, value); savePlan(); }
   function setCaptionText(text: string) { if (!activeCaption) return; draftCaption = text; try { state = upsertCaption(state, { ...activeCaption, text }); savePlan(); } catch { /* validation follows the contract */ } }
@@ -289,10 +345,13 @@
         const variants = editingVariantId
           ? studioState.variants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant)
           : studioState.variants;
+        const summaryVariants = editingVariantId
+          ? studioState.summaryVariants.map((variant) => variant.id === editingVariantId ? { ...variant, plan: state.plan } : variant)
+          : studioState.summaryVariants;
         const savedProject = await invoke<Record<string, unknown>>("project_save", {
           project: {
             ...project,
-            ...(editingVariantId ? { variants, selectedVariantId: editingVariantId } : { selectedId }),
+            ...(editingVariantId ? { variants, summaryVariants, selectedVariantId: editingVariantId } : { selectedId }),
             plans,
             revision: Number(project.revision ?? projectRevision),
           },
@@ -300,7 +359,7 @@
         projectRevision = Number(savedProject.revision ?? projectRevision);
         studioState.projectRevision = projectRevision;
         studioState.plans = plans;
-        if (editingVariantId) studioState.variants = variants;
+        if (editingVariantId) { studioState.variants = variants; studioState.summaryVariants = summaryVariants; }
       });
       studioState.plan = state.plan;
       saved = true;
@@ -332,11 +391,22 @@
           </button>
         {/each}
         {#each candidates as candidate, index}
-          <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} onclick={() => select(candidate.id)}>
-            <span class="cand-rank">{String(index + 1).padStart(2, "0")}</span>
-            <span><span class="cand-title">{candidate.title}</span><span class="cand-sub tc">{clock(candidate.start)} — {clock(candidate.end)}</span>{#if candidate.hook}<span class="cand-hook">{candidate.hook}</span>{/if}</span>
-            <span class="cand-score">{candidate.score}</span>
-          </button>
+          {@const discarded = candidate.status === "discarded"}
+          <div class="cand-item" class:discarded>
+            <button class="cand" class:on={candidate.id === selectedId} aria-pressed={candidate.id === selectedId} disabled={discarded} onclick={() => select(candidate.id)}>
+              <span class="cand-rank">{String(index + 1).padStart(2, "0")}</span>
+              <span><span class="cand-title">{candidate.title}</span><span class="cand-sub tc">{clock(candidate.start)} — {clock(candidate.end)}{#if dominantAxisLabel(candidate.dominantAxis)} · {dominantAxisLabel(candidate.dominantAxis)}{/if}{#if discarded} · Discarded{/if}{#if candidate.status === "saved"} · Saved{/if}</span>{#if candidate.hook}<span class="cand-hook">{candidate.hook}</span>{/if}</span>
+              <span class="cand-score">{candidate.score}</span>
+            </button>
+            <div class="field-row">
+              {#if discarded}
+                <button class="btn btn-sm" onclick={() => restoreHighlight(candidate.id)}>Restore</button>
+              {:else}
+                <button class="btn btn-sm" aria-pressed={candidate.status === "saved"} onclick={() => saveHighlight(candidate.id)}>Save</button>
+                <button class="btn btn-sm" onclick={() => discardHighlight(candidate.id)}>Discard</button>
+              {/if}
+            </div>
+          </div>
         {/each}
       </div>
     </div>
@@ -346,7 +416,7 @@
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
       {#if !isTauri()}<p class="note">Save and export are available in the installed desktop app.</p>{/if}
       <button class="btn btn-primary btn-wide" onclick={save}>Save edits</button>
-      <p class="note">Step 1: choose your clip. Step 2: adjust the preview and dates. Step 3: save edits. To create an MP4, return to Studio and choose Render.</p>
+      <p class="note">Step 1: choose an active clip. Step 2: adjust the preview and dates. Step 3: save edits. Discarded clips are excluded from Studio render/export until restored. To create an MP4, return to Studio and choose Render.</p>
       {#if saveError}<div class="message" role="alert">{saveError}</div>{/if}
       {#if saved}<div class="save-toast" role="status" aria-live="polite"><Icon name="check" size={16} />Saved locally</div>{/if}
     </div>

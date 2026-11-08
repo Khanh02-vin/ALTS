@@ -28,9 +28,10 @@ use app::{
     project_delete, project_get, project_list, project_save, save_recording,
 };
 use diarization::{
-    analyze_crop_path, analyze_scene_layouts, auto_person_layouts_last_report,
-    diarization_setup_status, diarize_video, generate_transcript_variants,
-    install_diarization_runtime, sample_speaker_faces, save_diarization_token,
+    analyze_crop_path, analyze_remote_crop_section, analyze_scene_layouts,
+    auto_person_layouts_last_report, diarization_setup_status, diarize_video,
+    generate_transcript_variants, install_diarization_runtime, sample_speaker_faces,
+    save_diarization_token,
 };
 use paths::*;
 use preview::prepare_video_preview;
@@ -179,6 +180,7 @@ fn main() {
             diarize_video,
             sample_speaker_faces,
             analyze_crop_path,
+            analyze_remote_crop_section,
             analyze_scene_layouts,
             auto_person_layouts_last_report,
         ])
@@ -219,6 +221,7 @@ mod tests {
     };
     use crate::youtube::{
         preview_page, preview_query, public_video_url, youtube_search_query, youtube_video_id,
+        youtube_video_url,
     };
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
@@ -980,6 +983,13 @@ mod tests {
 
     #[test]
     fn public_video_url_accepts_supported_hosts_and_rejects_unsafe_inputs() {
+        assert!(youtube_video_url(
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        ));
+        assert!(!youtube_video_url(
+            "https://www.tiktok.com/@creator/video/7123456789012345678"
+        ));
+        assert!(!youtube_video_url("https://www.facebook.com/watch/?v=123"));
         assert!(public_video_url(
             "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
         ));
@@ -989,6 +999,15 @@ mod tests {
         ));
         assert!(public_video_url("https://vm.tiktok.com/ZMrabcd123/"));
         assert!(public_video_url("https://vt.tiktok.com/ZMrabcd123/"));
+        for url in [
+            "https://facebook.com/watch/?v=123",
+            "https://www.facebook.com/videos/123",
+            "https://m.facebook.com/reel/123",
+            "https://web.facebook.com/share/v/abc",
+            "https://fb.watch/abc/",
+        ] {
+            assert!(public_video_url(url), "{url}");
+        }
 
         for value in [
             "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
@@ -1001,6 +1020,10 @@ mod tests {
             "https://www.tiktok.com/@creator/video/12345678901234567890",
             "https://www.tiktok.com/evil",
             "https://tiktok.com",
+            "https://facebook.com/profile.php?id=1",
+            "https://facebook.com/watch?v=1&list=playlist",
+            "https://facebook.com.evil/watch/?v=1",
+            "https://fb.watch.evil/abc",
         ] {
             assert!(!public_video_url(value), "{value}");
         }

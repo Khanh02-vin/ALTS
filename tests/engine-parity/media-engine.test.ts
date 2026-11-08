@@ -108,13 +108,32 @@ assert.ok(Math.abs(textOwns.centerX - 0.34) < 1e-9);
 assert.ok(Math.abs(textOwns.frameWidth - (0.66 - 0.02 + 0.04)) < 1e-9);
 assert.equal(textOwns.needsZoomOut, true);
 
-// Neither contains: the union box becomes the frame standard.
+// Neither contains: the PERSON stays the frame standard. A baked-in tag sitting off
+// to one side is secondary composition information and must never pull the primary
+// subject away from the centre of the 9:16 plate. (Regression: the solver used to
+// union both boxes, which shifted the speaker into the left third of the frame.)
 const offTitle = { left: 0.70, right: 0.98, top: 0.02, bottom: 0.98 };
-const union = resolveFrameByContainment(person, offTitle);
-assert.equal(union.anchorType, "union");
-assert.ok(Math.abs(union.centerX - (0.30 + 0.98) / 2) < 1e-9);
-assert.ok(Math.abs(union.frameWidth - (0.98 - 0.30 + 0.04)) < 1e-9);
-assert.ok(union.frameWidth <= 1);
+const personFirst = resolveFrameByContainment(person, offTitle);
+assert.equal(personFirst.anchorType, "person");
+assert.ok(Math.abs(personFirst.centerX - 0.41) < 1e-9, "the person's own centre, not the union midpoint");
+assert.equal(personFirst.frameWidth, MIN_PORTRAIT_WIDTH);
+assert.equal(personFirst.needsZoomOut, false);
+
+// Same person-first rule on the other side and with the person centred: the resolved
+// centre always lands on the subject, whatever side the OCR text lives on.
+const personRight = resolveFrameByContainment({ left: 0.70, right: 0.92, top: 0.1, bottom: 0.9 }, { left: 0.02, right: 0.35, top: 0.02, bottom: 0.2 });
+assert.equal(personRight.anchorType, "person");
+assert.ok(Math.abs(personRight.centerX - 0.81) < 1e-9);
+const personCentred = resolveFrameByContainment({ left: 0.40, right: 0.60, top: 0.1, bottom: 0.9 }, { left: 0.65, right: 0.95, top: 0.02, bottom: 0.2 });
+assert.equal(personCentred.anchorType, "person");
+assert.ok(Math.abs(personCentred.centerX - 0.5) < 1e-9);
+assert.equal(personCentred.frameWidth, MIN_PORTRAIT_WIDTH);
+
+// Overlapping but neither containing: still person-first, no widening.
+const overlap = resolveFrameByContainment({ left: 0.30, right: 0.60, top: 0.1, bottom: 0.9 }, { left: 0.50, right: 0.80, top: 0.1, bottom: 0.9 });
+assert.equal(overlap.anchorType, "person");
+assert.ok(Math.abs(overlap.centerX - 0.45) < 1e-9);
+assert.ok(Math.abs(overlap.frameWidth - (0.60 - 0.30 + 0.04)) < 1e-9);
 
 // A wide person on its own also zooms out instead of being cropped away.
 const widePerson = resolveFrameByContainment({ left: 0.05, right: 0.60, top: 0.1, bottom: 0.9 });
@@ -122,9 +141,13 @@ assert.equal(widePerson.anchorType, "person");
 assert.equal(widePerson.needsZoomOut, true);
 assert.ok(Math.abs(widePerson.frameWidth - (0.60 - 0.05 + 0.04)) < 1e-9);
 
-// Union wider than the source clamps to 1 rather than overflowing.
-const clipped = resolveFrameByContainment(person, { left: 0.0, right: 0.99, top: 0, bottom: 0.2 });
+// A full-bleed title that contains the subject clamps to 1 rather than overflowing,
+// and a tag that only covers part of the frame leaves the person's own width alone.
+const clipped = resolveFrameByContainment(person, { left: 0.0, right: 0.99, top: 0.02, bottom: 0.98 });
 assert.equal(clipped.frameWidth, 1);
+const tag = resolveFrameByContainment(person, { left: 0.0, right: 0.99, top: 0, bottom: 0.2 });
+assert.equal(tag.anchorType, "person");
+assert.equal(tag.frameWidth, MIN_PORTRAIT_WIDTH);
 
 // Normalisation: non-finite and inverted coordinates cannot escape 0..1 or flip the box.
 assert.deepEqual(normalizeSpanBox({ left: -0.2, right: 1.7, top: 0.3, bottom: 0.3 }), { left: 0, right: 1, top: 0.3, bottom: 0.3 });

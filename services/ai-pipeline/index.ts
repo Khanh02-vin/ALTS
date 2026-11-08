@@ -2,8 +2,11 @@ import type { WhisperOptions } from "../../adapters/local/whisper.ts";
 import { transcribeChunkedWithWhisper, type ChunkedWhisperOptions } from "../../adapters/local/chunked-whisper.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
+import { snapHighlightsToPauses } from "./pause-snap.ts";
+import type { AudioRmsFeatures } from "./highlight-scoring.ts";
 import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
+import { associateHighlightsWithOutline, buildScriptOutline, buildSummaryVariants, type ScriptOutlineItem, type SummaryVariant } from "./script-outline.ts";
 // The values are used below; `export * from "./semantic.ts"` only re-exports them
 // and does not bring them into this module's scope. Without this import the
 // semantic strategies threw ReferenceError and silently fell back to heuristic.
@@ -17,8 +20,14 @@ export * from "./variants.ts";
 export * from "./diarization.ts";
 // ponytail: mockTranscribe/mockHighlights deleted — analyzeVideo now returns deterministic placeholder.
 // Real callers use analyzeLocalVideo/analyzeLocalVideoWithSemantic.
-export type ClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
-export type LocalClipAnalysis = { transcript: Transcript; highlights: Highlight[] };
+export type ClipAnalysis = { transcript: Transcript; highlights: Highlight[]; scriptOutline?: ScriptOutlineItem[]; summaryVariants?: SummaryVariant[] };
+export type LocalClipAnalysis = { transcript: Transcript; highlights: Highlight[]; scriptOutline: ScriptOutlineItem[]; summaryVariants: SummaryVariant[] };
+
+function enrichAnalysis(transcript: Transcript, highlights: Highlight[]): LocalClipAnalysis {
+  const scriptOutline = buildScriptOutline(transcript);
+  const associated = associateHighlightsWithOutline(highlights, scriptOutline);
+  return { transcript, highlights: associated, scriptOutline, summaryVariants: buildSummaryVariants(transcript) };
+}
 
 /**
  * Resolves the highlight strategy the analysis worker should run. An explicit
@@ -48,6 +57,8 @@ export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAn
 export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds"> & {
   /** Pre-built transcript (e.g. from a fixture): skips Whisper entirely and only selects highlights. */
   transcript?: Transcript;
+  /** Optional time-indexed audio energy from the extracted mono PCM WAV. */
+  audioRms?: AudioRmsFeatures;
 };
 
 export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: string, duration: number, options: LocalAnalyzeOptions = {}): Promise<LocalClipAnalysis> {
@@ -57,14 +68,17 @@ export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: str
   const transcript = options.transcript
     ? await Promise.resolve(options.transcript)
     : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
-  const highlights = duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);
+  const selected = duration > 120
+    ? chooseContentHighlights(transcript, 5, options.audioRms)
+    : chooseHeuristicHighlights(transcript, 5, options.audioRms);
+  const highlights = snapHighlightsToPauses(selected, transcript);
   validateTranscript(transcript);
   // Chunked transcription shifts every timestamp by the range offset, so the
   // highlights carry absolute source times — validate them against the source
   // duration, not the range length (a range starting deep in a long video used
   // to fail with "Timestamp exceeds duration").
   validateHighlights(highlights, sourceDuration);
-  return { transcript, highlights };
+  return enrichAnalysis(transcript, highlights);
 }
 
 export type SemanticAnalyzeOptions = LocalAnalyzeOptions & {
@@ -93,17 +107,20 @@ export async function analyzeLocalVideoWithSemantic(
       minDuration: 10,
       maxDuration: 90,
     });
+    highlights = snapHighlightsToPauses(highlights, transcript);
   } catch (error) {
     // Provider (e.g. Gemini) failure or unsupported input: fall back to the
     // deterministic selector so the user still gets candidates instead of a hard error.
-    const fallback = duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);
+    const fallback = duration > 120
+      ? chooseContentHighlights(transcript, 5, options.audioRms)
+      : chooseHeuristicHighlights(transcript, 5, options.audioRms);
     console.warn(`[ai-pipeline] semantic provider failed (${error instanceof Error ? error.message : error}); fell back to ${duration > 120 ? "content" : "heuristic"} selector`);
-    highlights = fallback;
+    highlights = snapHighlightsToPauses(fallback, transcript);
   }
   validateTranscript(transcript);
   // Highlights use absolute source timestamps (see analyzeLocalVideo).
   validateHighlights(highlights, sourceDuration);
-  return { transcript, highlights };
+  return enrichAnalysis(transcript, highlights);
 }
 
 // Re-export all symbols from semantic.ts so they are available at package boundary

@@ -5,9 +5,8 @@
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-
 use crate::paths::{
-    runtime_env, data_dir, cache_dir, valid_local_llm_url, valid_provider_url, whisper_command,
+    cache_dir, data_dir, runtime_env, valid_local_llm_url, valid_provider_url, whisper_command,
     whisper_usable, write_private_file, write_runtime_settings,
 };
 use crate::runtime::{existing_llama, local_llm_model_path, sha256_file, LLM_MODEL_SHA256};
@@ -332,4 +331,3 @@ pub(crate) fn highlight_strategy_status(_app: tauri::AppHandle) -> serde_json::V
         .unwrap_or(false);
     serde_json::json!({ "strategy": strategy, "hasKey": has_key, "hasLocalUrl": has_local_url })
 }
-

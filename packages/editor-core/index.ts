@@ -2,6 +2,7 @@ import type { Highlight } from "../contracts/highlight.ts";
 import type { Transcript } from "../contracts/transcript.ts";
 import type { Caption, EditVariant, RenderPlan, RenderRange } from "../contracts/render-plan.ts";
 import { validateRenderPlan } from "../contracts/render-plan.ts";
+import { snapHighlightsToPauses } from "../../services/ai-pipeline/pause-snap.ts";
 
 export function createEditorStateFromVariant(transcript: Transcript, variant: EditVariant): EditorState {
   if (variant.sourceArtifactId !== transcript.sourceArtifactId) throw new Error("VARIANT_SOURCE_MISMATCH");
@@ -52,9 +53,29 @@ export function updateAspectRatio(state: EditorState, aspectRatio: RenderPlan["a
   return updatePlan(state, (plan) => ({ ...plan, aspectRatio }));
 }
 
-export function updateRange(state: EditorState, range: RenderRange, index = 0): EditorState {
+export function updateRange(
+  state: EditorState,
+  range: RenderRange,
+  index = 0,
+  transcript?: Transcript | null,
+): EditorState {
   if (!Number.isInteger(index) || index < 0 || index >= state.plan.ranges.length) throw new Error("Invalid render range index");
-  return updatePlan(state, (plan) => ({ ...plan, ranges: plan.ranges.map((item, itemIndex) => itemIndex === index ? { ...range } : item) }));
+  const snapped = transcript
+    ? snapHighlightsToPauses(
+        [{
+          version: state.selected?.version ?? 1,
+          id: state.selected?.id ?? "manual-range",
+          sourceArtifactId: state.plan.sourceArtifactId,
+          ...range,
+          wordIds: [],
+          title: state.selected?.title ?? "Manual range",
+          score: state.selected?.score ?? 0,
+        }],
+        transcript,
+      )[0]
+    : undefined;
+  const effective = snapped ? { start: snapped.start, end: snapped.end } : range;
+  return updatePlan(state, (plan) => ({ ...plan, ranges: plan.ranges.map((item, itemIndex) => itemIndex === index ? { ...effective } : item) }));
 }
 
 export function addRange(state: EditorState, range: RenderRange, index = state.plan.ranges.length): EditorState {
@@ -95,9 +116,28 @@ export function removeCaption(state: EditorState, id: string): EditorState {
 
 export function captionsFromTranscript(transcript: Transcript | null, selected: RenderRange): Caption[] {
   if (!transcript) return [];
+  const wordsById = new Map(transcript.words.map((word) => [word.id, word]));
   return transcript.segments
     .filter((segment) => segment.end > selected.start && segment.start < selected.end)
-    .map((segment) => ({ id: `caption-${segment.id}`, text: segment.text, start: Math.max(segment.start, selected.start), end: Math.min(segment.end, selected.end) }));
+    .map((segment) => {
+      const words = segment.wordIds
+        .map((id) => wordsById.get(id))
+        .filter((word): word is NonNullable<typeof word> => Boolean(word))
+        .filter((word) => word.end > selected.start && word.start < selected.end)
+        .map((word) => ({
+          text: word.text,
+          start: Math.max(word.start, selected.start),
+          end: Math.min(word.end, selected.end),
+        }))
+        .filter((word) => word.end > word.start);
+      return {
+        id: `caption-${segment.id}`,
+        text: segment.text,
+        start: Math.max(segment.start, selected.start),
+        end: Math.min(segment.end, selected.end),
+        ...(words.length ? { words } : {}),
+      };
+    });
 }
 
 export function loadTranscriptCaptions(state: EditorState, transcript: Transcript | null): EditorState {

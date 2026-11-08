@@ -14,8 +14,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 
-use crate::paths::status_from_json;
 use crate::contracts::AnalysisStatus;
+use crate::paths::status_from_json;
 
 /// A job that keeps dying on the same chunk must stop being auto-resumed.
 pub(crate) const MAX_JOB_ATTEMPTS: i64 = 3;
@@ -121,20 +121,23 @@ impl AnalysisStore {
     }
 
     fn ids(&self, query: &str, arg: &str) -> Result<Vec<String>, String> {
-        let mut stmt = self.db.prepare(query).map_err(|e| format!("ANALYSIS_DB:{e}"))?;
+        let mut stmt = self
+            .db
+            .prepare(query)
+            .map_err(|e| format!("ANALYSIS_DB:{e}"))?;
         let rows = stmt
             .query_map(params![arg], |row| row.get::<_, String>(0))
             .map_err(|e| format!("ANALYSIS_DB:{e}"))?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| format!("ANALYSIS_DB:{e}"))
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("ANALYSIS_DB:{e}"))
     }
 
     /// Every job, newest-updated first (`--active` in the status script).
     pub(crate) fn all_jobs(&self) -> Result<Vec<Value>, String> {
-        let ids = self.ids(
-            "SELECT id FROM analysis_jobs ORDER BY updated_at DESC",
-            "",
-        )?;
-        ids.iter().filter_map(|id| self.get(id).transpose()).collect()
+        let ids = self.ids("SELECT id FROM analysis_jobs ORDER BY updated_at DESC", "")?;
+        ids.iter()
+            .filter_map(|id| self.get(id).transpose())
+            .collect()
     }
 
     fn now() -> String {
@@ -281,9 +284,15 @@ impl AnalysisStore {
 
     /// The transcript cache files of every chunk of `id` (`--clear`'s cache pass).
     pub(crate) fn clear_chunk_caches(&self, id: &str, cache_root: &Path) -> Result<i64, String> {
-        let Some(job) = self.get(id)? else { return Ok(0) };
-        let Some(input) = job["input"].as_str().map(str::to_string) else { return Ok(0) };
-        let Ok(source) = source_fingerprint(Path::new(&input)) else { return Ok(0) };
+        let Some(job) = self.get(id)? else {
+            return Ok(0);
+        };
+        let Some(input) = job["input"].as_str().map(str::to_string) else {
+            return Ok(0);
+        };
+        let Ok(source) = source_fingerprint(Path::new(&input)) else {
+            return Ok(0);
+        };
         let mut stmt = self
             .db
             .prepare("SELECT cache_key FROM analysis_chunks WHERE job_id=?1")
@@ -346,7 +355,9 @@ fn cache_path(cache_root: &Path, source: &str, key: &str) -> PathBuf {
 /// Reads a job and embeds its persisted result JSON the way the status script's
 /// default branch does, so the UI contract is unchanged.
 pub(crate) fn job_with_result(store: &AnalysisStore, id: &str) -> Result<Option<Value>, String> {
-    let Some(mut job) = store.get(id)? else { return Ok(None) };
+    let Some(mut job) = store.get(id)? else {
+        return Ok(None);
+    };
     if let Some(result_path) = job["resultPath"].as_str() {
         let contents = std::fs::read_to_string(result_path).ok();
         job["result"] = match contents {
@@ -431,7 +442,10 @@ mod tests {
         // A running job is not retryable.
         store
             .db
-            .execute("UPDATE analysis_jobs SET status='running' WHERE id='j1'", [])
+            .execute(
+                "UPDATE analysis_jobs SET status='running' WHERE id='j1'",
+                [],
+            )
             .unwrap();
         assert!(!store.retry("j1").unwrap());
 
@@ -516,7 +530,10 @@ mod tests {
         let attempts = store.bump_attempts("j1").unwrap();
         assert!(attempts >= MAX_JOB_ATTEMPTS);
         store
-            .fail("j1", &format!("worker died {attempts} times without progress; retry manually"))
+            .fail(
+                "j1",
+                &format!("worker died {attempts} times without progress; retry manually"),
+            )
             .unwrap();
         assert_eq!(job_row(&store, "j1")["status"], json!("failed"));
     }

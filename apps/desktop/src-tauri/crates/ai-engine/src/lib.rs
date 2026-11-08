@@ -62,7 +62,9 @@ impl AiEngine {
     }
 
     /// Resolves a bundled model path: resource dir first, then the dev-tree fallback.
-    fn model_path(app: &tauri::AppHandle, name: &str) -> AiResult<PathBuf> {
+    /// Public so the desktop shell can report readiness using the same lookup as
+    /// inference.
+    pub fn model_path<R: tauri::Runtime>(app: &tauri::AppHandle<R>, name: &str) -> AiResult<PathBuf> {
         if let Ok(dir) = app.path().resource_dir() {
             let candidate = dir.join("models").join(name);
             if candidate.is_file() {
@@ -124,7 +126,7 @@ pub struct TextRegionDetector {
 }
 
 impl TextRegionDetector {
-    pub fn load(app: &tauri::AppHandle) -> AiResult<Self> {
+    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AiResult<Self> {
         let engine = AiEngine::new()?;
         let path = AiEngine::model_path(app, "PP-OCRv6_det_small.onnx")?;
         let session = Session::builder(&engine.env)
@@ -228,7 +230,7 @@ pub struct FaceDetector {
 
 impl FaceDetector {
     /// Loads the bundled YuNet model with cls/obj/bbox heads at strides 8/16/32.
-    pub fn load(app: &tauri::AppHandle) -> AiResult<Self> {
+    pub fn load<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> AiResult<Self> {
         let engine = AiEngine::new()?;
         let path = AiEngine::model_path(app, "face-detection.onnx")?;
         let session = Session::builder(&engine.env)
