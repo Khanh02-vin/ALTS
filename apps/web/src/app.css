@@ -152,6 +152,8 @@ button:not(:disabled) { cursor: pointer; }
   grid-template-columns: minmax(230px, 260px) minmax(0, 1fr) minmax(268px, 300px);
   height: 100%;
 }
+.projects-workspace { grid-template-columns: minmax(0, 1fr); height: auto; min-height: 100%; }
+.projects-workspace .stage { min-height: 0; }
 .bench-left, .bench-right { background: var(--bg-2); overflow-y: auto; padding: 0.9rem 0.85rem 1.4rem; display: flex; flex-direction: column; gap: 1.1rem; }
 .bench-left { border-right: 1px solid var(--line-soft); }
 .bench-right { border-left: 1px solid var(--line-soft); }
@@ -305,19 +307,8 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 .run-fill { height: 100%; background: var(--volt); transition: width 0.35s ease; }
 .run-meta { display: flex; justify-content: space-between; gap: 0.6rem; font-size: 0.75rem; color: var(--muted); }
 
-/* pipeline steps */
+/* stepper */
 .steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.15rem; }
-.step { display: flex; align-items: center; gap: 0.55rem; padding: 0.3rem 0; font-size: 0.8rem; color: var(--faint); }
-.step-num {
-  width: 18px; height: 18px; flex: none; border-radius: 4px;
-  display: grid; place-items: center;
-  font: 600 10px/1 var(--mono);
-  border: 1px solid var(--line); color: var(--faint);
-}
-.step.done { color: var(--ink-2); }
-.step.done .step-num { border-color: var(--volt-line); color: var(--volt); background: var(--volt-soft); }
-.step.on { color: var(--ink); }
-.step.on .step-num { background: var(--volt); border-color: var(--volt); color: var(--volt-ink); }
 
 /* ---------- lists / rows ---------- */
 .list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; }
@@ -438,7 +429,7 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
 
-/* ---------- 2-column workbench (YouTube Studio) + shared modal ---------- */
+/* ---------- 2-column workbench (video library) + shared modal ---------- */
 .bench-duo { grid-template-columns: 300px minmax(0, 1fr); }
 .query-row { display: flex; gap: .55rem; align-items: stretch; }
 .query-row textarea { flex: 1; resize: none; min-height: 2.6rem; }
@@ -458,6 +449,7 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 /* ---------- interactive workflow stepper (Studio) ---------- */
 .steps li button { display: flex; align-items: center; gap: 0.55rem; width: 100%; text-align: left; cursor: pointer; background: transparent; border: 0; padding: 0.3rem 0.2rem; font: inherit; color: var(--faint); border-radius: var(--radius-sm); }
 .steps li button:hover { color: var(--ink-2); }
+.steps li button:disabled, .steps li button:disabled:hover { color: var(--faint); cursor: default; }
 .steps li.active button { color: var(--ink); }
 .steps li.done button { color: var(--ink-2); }
 .step-no { width: 20px; height: 20px; flex: none; border-radius: 5px; display: grid; place-items: center; font: 600 10px/1 var(--mono); border: 1px solid var(--line); color: var(--faint); }
@@ -510,6 +502,15 @@ textarea { resize: vertical; min-height: 4.5rem; line-height: 1.5; }
 /* Secondary guidance under a control; quieter than a .note inside a card. */
 .hint { font-size: 0.78rem; line-height: 1.45; color: var(--muted); margin: 0.25rem 0 0; }
 .section-title { font-size: 0.88rem; font-weight: 650; letter-spacing: -0.01em; color: var(--ink); }
+/* Collapsible card title: the native disclosure marker does the toggling. */
+summary { cursor: pointer; }
+summary.section-title { margin: 0 0 0.5rem; }
+/* Secondary controls sit behind one text line so the primary action stays the only button. */
+.disclosure-summary { list-style: none; font-size: 0.82rem; color: var(--ink-2); padding: 0.15rem 0; }
+.disclosure-summary::-webkit-details-marker { display: none; }
+.disclosure-summary:hover { color: var(--volt); }
+details[open] > .disclosure-summary { margin-bottom: 0.45rem; }
+.other-sources { display: flex; flex-direction: column; align-items: center; gap: 0.3rem; }
 .answer p { margin: 0.4rem 0 0; color: var(--ink-2); line-height: 1.55; }
 .spec-line {
   display: flex; align-items: center; justify-content: space-between; gap: 0.6rem;

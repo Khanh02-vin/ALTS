@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { invoke, isTauri } from "@tauri-apps/api/core";
-  import { refreshRuntime, runtimeStore, downloadWhisperCppModel, refreshWhisperCppModels, setupWhisperCpp, smokeWhisperCpp, startWhisperBootstrap, stopBootstrapPoll } from "../runtime-status.svelte.ts";
+  import { refreshRuntime, runtimeStore, downloadWhisperCppModel, refreshWhisperCppModels, setupWhisperCpp, smokeWhisperCpp } from "../runtime-status.svelte.ts";
 
 let { active = true }: { active?: boolean } = $props();
 
@@ -38,6 +38,9 @@ let ggmlBusy = $state("");
 let diarizationReady = $state(false);
 let faceModelReady = $state(false);
 let diarizationBusy = $state(false);
+let cookieBrowser = $state("");
+let cookieBrowsers = $state<string[]>([]);
+let cookieBusy = $state(false);
 
 // System Doctor state
 let doctorBusy = $state(false);
@@ -80,19 +83,6 @@ let doctorMessage = $state("");
     }
   }
 
-  async function installWhisperNow() {
-    if (!isTauri() || doctorBusy) return;
-    doctorBusy = true;
-    doctorMessage = "Starting Whisper bootstrap…";
-    try {
-      await startWhisperBootstrap();
-      doctorMessage = "Whisper bootstrap started. Progress will appear below.";
-    } catch (error) {
-      doctorMessage = `Failed to start Whisper bootstrap: ${String(error)}`;
-      doctorBusy = false;
-    }
-  }
-
   async function smokeWhisperCppNow() {
     if (!isTauri() || doctorBusy || !runtimeStore.whisperCpp) return;
     doctorBusy = true;
@@ -112,12 +102,6 @@ let doctorMessage = $state("");
     } catch (error) {
       doctorMessage = `Whisper.cpp setup failed: ${String(error)}`;
     } finally { doctorBusy = false; }
-  }
-
-  async function stopWhisperBootstrap() {
-    stopBootstrapPoll();
-    doctorBusy = false;
-    doctorMessage = "Whisper bootstrap polling stopped.";
   }
 
 async function setupWhisper() {
@@ -180,6 +164,24 @@ async function pollSmall() {
     await refreshRuntime(true);
   }
 
+  async function loadCookiesBrowser() {
+    if (!isTauri()) return;
+    try {
+      const result = await invoke<{ browser: string; supported: string[] }>("cookies_browser");
+      cookieBrowser = result.browser; cookieBrowsers = result.supported;
+    } catch (error) { message = `Cookie setting failed: ${String(error)}`; }
+  }
+  async function saveCookiesBrowser() {
+    if (!isTauri()) { message = "Link download cookies apply in the desktop app only."; return; }
+    cookieBusy = true;
+    try {
+      const result = await invoke<{ browser: string; supported: string[] }>("cookies_browser", { browser: cookieBrowser });
+      cookieBrowser = result.browser; cookieBrowsers = result.supported;
+      message = cookieBrowser ? `Link downloads read cookies from ${cookieBrowser}.` : "Link downloads use no browser cookies.";
+    } catch (error) { message = `Cookie setting failed: ${String(error)}`; }
+    finally { cookieBusy = false; }
+  }
+
   async function loadAiProviders() {
     if (!isTauri()) return;
     try { const result = await invoke<{providers: AiProvider[]; activeProviderId: string | null}>("list_ai_providers"); providers = result.providers; activeProviderId = result.activeProviderId ?? ""; }
@@ -238,6 +240,7 @@ async function pollSmall() {
 onMount(refresh);
 onMount(readStrategy);
 onMount(loadAiProviders);
+onMount(loadCookiesBrowser);
 onMount(() => { void reloadSetupState(); void refreshWhisperCppModels(); });
 $effect(() => {
   const setupBusy = whisperBusy || llmSetupBusy || smallBusy;
@@ -315,12 +318,14 @@ $effect(() => {
           <p class="note">One-click local engine check. Whisper.cpp uses the bundled binary and ggml model — no Python or PyTorch.</p>
           <p class="note">GGML models: {#each runtimeStore.whisperCppModels ?? [] as model}<span class="badge" class:ok={model.ready}>{model.name} {model.ready ? "ready" : "not downloaded"}</span>{/each}</p>
           <div class="spread"><button class="btn btn-sm" disabled={!!ggmlBusy} onclick={() => downloadGgml("base")}>{ggmlBusy === "base" ? "Downloading…" : "Download GGML base (~142 MB)"}</button><button class="btn btn-sm" disabled={!!ggmlBusy} onclick={() => downloadGgml("small-q5_1")}>{ggmlBusy === "small-q5_1" ? "Downloading…" : "Download GGML small q5 (~190 MB)"}</button></div>
-          <div class="spread"><button class="btn btn-sm" disabled={doctorBusy} onclick={runSystemDoctor}>{doctorBusy ? "Checking…" : "Run system check"}</button><button class="btn btn-sm" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={smokeWhisperCppNow}>CPU smoke test</button><button class="btn btn-sm btn-primary" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={setupWhisperCppNow}>{runtimeStore.whisperEngine === "cpp" ? "Whisper.cpp active ✓" : "Setup Whisper.cpp (no Python)"}</button></div>
-          <div class="spread"><span class="note" style="margin:0;">Python venv is deprecated. Use bundled Whisper.cpp for new setups.</span><button class="btn btn-sm" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={setupWhisperCppNow}>{runtimeStore.whisperEngine === "cpp" ? "Active ✓" : "Use Whisper.cpp"}</button></div>
+          <div class="spread"><button class="btn btn-sm" disabled={doctorBusy} onclick={runSystemDoctor}>{doctorBusy ? "Checking…" : "Run system check"}</button></div>
+          <details>
+            <summary class="disclosure-summary">Advanced engine controls</summary>
+            <div class="spread"><button class="btn btn-sm" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={smokeWhisperCppNow}>CPU smoke test</button><button class="btn btn-sm btn-primary" disabled={doctorBusy || !runtimeStore.whisperCpp} onclick={setupWhisperCppNow}>{runtimeStore.whisperEngine === "cpp" ? "Whisper.cpp active ✓" : "Setup Whisper.cpp (no Python)"}</button></div>
+          </details>
+          <p class="note">Python venv is deprecated. Use bundled Whisper.cpp for new setups.</p>
           {#if !runtimeStore.whisperCpp}<p class="hint">Rebuild after running <code>scripts/fetch-bundled-assets.sh</code> to include whisper-cli and ggml-tiny.bin.</p>{/if}
-          {#if doctorBusy && runtimeStore.whisperBootstrap}<p class="hint" aria-live="polite">{runtimeStore.whisperBootstrap.message} ({Math.round(runtimeStore.whisperBootstrap.progress * 100)}%)</p>{/if}
           {#if doctorMessage}<p class="hint" aria-live="polite">{doctorMessage}</p>{/if}
-          <button class="btn btn-sm btn-quiet" disabled={!doctorBusy || !runtimeStore.whisperBootstrap} onclick={stopWhisperBootstrap}>Stop bootstrap polling</button>
         </div>
 
         <div class="panel">
@@ -362,6 +367,20 @@ $effect(() => {
             <label class="field"><span class="field-label">Model</span><input type="text" bind:value={localLlmModel} placeholder="qwen2.5-3b-instruct" /></label>
             <button class="btn btn-sm" disabled={strategyBusy || localLlmUrl.trim().length < 10} onclick={() => saveStrategy("semantic-local", "", localLlmUrl, localLlmModel)}>Save</button>
           {/if}
+        </div>
+
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Link downloads</span></div>
+          <p class="note">Facebook and TikTok often need a signed-in session. Pick a browser and yt-dlp reads that profile's cookies locally — no account data leaves this machine.</p>
+          <label class="field"><span class="field-label">Cookies from browser</span>
+            <select bind:value={cookieBrowser} disabled={cookieBusy || !cookieBrowsers.length}>
+              <option value="">Off — public links only</option>
+              {#each cookieBrowsers as browser}<option value={browser}>{browser}</option>{/each}
+            </select>
+          </label>
+          <div class="filters-row">
+            <button class="btn btn-sm" disabled={cookieBusy || !cookieBrowsers.length} onclick={saveCookiesBrowser}>{cookieBusy ? "Saving…" : "Save"}</button>
+          </div>
         </div>
 
         <div class="panel">

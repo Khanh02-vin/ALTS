@@ -116,6 +116,7 @@ pub(crate) fn ensure_llama_server<R: tauri::Runtime>(
     }
     cmd.stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    crate::spawn_guard::set_parent_death_sig(&mut cmd);
     let spawned = cmd.spawn().map_err(|e| format!("LLAMA_SPAWN:{e}"))?;
     let pid = spawned.id();
     // Detach: drop our handle but keep the pid so we can stop it later.
@@ -365,6 +366,7 @@ pub(crate) fn ensure_rag_server(
         )
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
+    crate::spawn_guard::set_parent_death_sig(&mut cmd);
     let spawned = cmd.spawn().map_err(|e| format!("RAG_SPAWN:{e}"))?;
     let pid = spawned.id();
     drop(spawned); // detach: keep only the pid so we can stop it later

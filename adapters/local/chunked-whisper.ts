@@ -9,7 +9,26 @@ import type { Transcript, Word, TranscriptSegment } from "../../packages/contrac
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 import { sourceFingerprint, chunkCacheKey, cachePath, readCachedTranscript, writeCachedTranscript } from "./analysis-cache.ts";
 
-export type ChunkedWhisperOptions = WhisperOptions & { ffmpegCommand?: string; chunkSeconds?: number; overlapSeconds?: number; offsetSeconds?: number; sourceDuration?: number; chunkTimeoutMs?: number; onProgress?: (completed: number, total: number) => void; onChunkStart?: (index: number, total: number) => void; onChunkComplete?: (index: number, total: number, cacheHit: boolean) => void; onChunkFail?: (index: number, total: number, error: string) => void };
+export type ChunkedWhisperOptions = WhisperOptions & { ffmpegCommand?: string; chunkSeconds?: number; overlapSeconds?: number; offsetSeconds?: number; sourceDuration?: number; chunkTimeoutMs?: number; boundaries?: number[]; onProgress?: (completed: number, total: number) => void; onChunkStart?: (index: number, total: number) => void; onChunkComplete?: (index: number, total: number, cacheHit: boolean) => void; onChunkFail?: (index: number, total: number, error: string) => void };
+
+/// Cut points for a long recording: the nominal multiple of `chunkSeconds`, pulled
+/// back (at most 120 s) onto the quietest 100 ms RMS window when the audio really
+/// is quiet there. Continuous loud audio keeps the nominal cut instead of splitting
+/// a word for nothing. Returns absolute seconds, always inside `(0, duration)`.
+export function planChunkBoundaries(duration: number, chunkSeconds: number, windows: Array<{ start: number; end: number; rms: number }> = []): number[] {
+  const search = Math.min(120, chunkSeconds);
+  const cuts: number[] = [];
+  for (let nominal = chunkSeconds; nominal < duration; nominal += chunkSeconds) {
+    let cut = nominal;
+    let quietest = Infinity;
+    for (const window of windows) {
+      if (window.start < nominal - search || window.start >= nominal || window.start <= (cuts[cuts.length - 1] ?? 0)) continue;
+      if (window.rms < quietest) { quietest = window.rms; cut = window.start; }
+    }
+    cuts.push(quietest <= 0.02 ? cut : nominal);
+  }
+  return cuts;
+}
 
 export async function transcribeChunkedWithWhisper(audioPath: string, sourceArtifactId: string, duration: number, options: ChunkedWhisperOptions = {}): Promise<Transcript> {
   const engine = options.engine ?? process.env.WHISPER_ENGINE ?? "cpp";
@@ -18,15 +37,21 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
   const chunkSeconds = Math.max(30, options.chunkSeconds ?? Number(process.env.WHISPER_CHUNK_SECONDS ?? 120));
   const overlap = Math.min(5, Math.max(0, options.overlapSeconds ?? 1));
   const offsetSeconds = options.offsetSeconds ?? 0;
-  const total = Math.max(1, Math.ceil(duration / chunkSeconds));
+  // Pre-planned cuts (long remote audio) win; otherwise the historical fixed-size
+  // layout, whose chunk cache keys must not change.
+  const cuts = (options.boundaries ?? []).filter((cut) => Number.isFinite(cut) && cut > 0 && cut < duration);
+  const spans = cuts.length
+    ? [...cuts.map((cut, index) => ({ start: index ? cuts[index - 1] : 0, end: cut })), { start: cuts[cuts.length - 1], end: duration }]
+    : Array.from({ length: Math.max(1, Math.ceil(duration / chunkSeconds)) }, (_, index) => ({ start: Math.max(0, index * chunkSeconds - (index ? overlap : 0)), end: Math.min(duration, (index + 1) * chunkSeconds) }));
+  const total = spans.length;
   const source = await sourceFingerprint(audioPath); const root = await import("node:fs/promises").then(({ mkdtemp }) => mkdtemp(join(tmpdir(), "local-whisper-chunks-")));
   const words: Word[] = []; const wordIndex = new Map<string, Word>(); const segments: TranscriptSegment[] = []; const segmentIndex = new Map<string, TranscriptSegment>(); let language = options.language ?? "und";
   try {
     for (let index = 0; index < total; index++) {
       // A cancel must stop the remaining chunks, not just the one in flight.
       if (options.shouldAbort?.()) throw new Error("ANALYZE_INTERRUPTED");
-      const start = offsetSeconds + Math.max(0, index * chunkSeconds - (index ? overlap : 0));
-      const end = Math.min(offsetSeconds + duration, offsetSeconds + (index + 1) * chunkSeconds);
+      const start = offsetSeconds + spans[index].start;
+      const end = offsetSeconds + spans[index].end;
       const key = await chunkCacheKey(audioPath, index, start, end, `${engine}:${cppModel || options.modelPath || options.model || "tiny"}`, options.language, whisperDevice(options), whisperFp16(options), source);
       options.onChunkStart?.(index, total);
       let cacheHit = false;

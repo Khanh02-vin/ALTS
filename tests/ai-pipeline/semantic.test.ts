@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { generateSemanticHighlights, createMockSemanticProvider, NotImplementedSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
+import { dominantHighlightAxis } from "../../packages/contracts/highlight.ts";
 
 const makeTranscript = (duration = 60): Transcript => ({
   version: 1,
@@ -53,7 +54,7 @@ const partiallyScoredProvider = {
 };
 const partiallyScored = await generateSemanticHighlights(transcript, partiallyScoredProvider);
 assert.equal(partiallyScored[0].score, 80, "semantic aggregate scores are unchanged during metadata normalization");
-assert.deepEqual(partiallyScored[0].scores, { hook: 90, summary: 63, impact: 25 });
+assert.deepEqual(partiallyScored[0].scores, { hook: 90, summary: 63, impact: 29 });
 assert.equal(partiallyScored[0].dominantAxis, "hook");
 
 // NotImplemented provider throws
@@ -152,7 +153,9 @@ const legacyAdapter = new Adapter({
 });
 const adapterResult = await legacyAdapter.generate({ transcript });
 assert.ok(adapterResult.highlights[0].scores, "adapter adds fallback component metadata");
-assert.equal(adapterResult.highlights[0].dominantAxis, undefined, "adapter derives axis using the same 70-point threshold");
+// Scale-independent: whatever the fallback scores are, the adapter must apply the
+// shared 70-point dominance rule rather than its own threshold.
+assert.equal(adapterResult.highlights[0].dominantAxis, dominantHighlightAxis(adapterResult.highlights[0].scores!), "adapter derives axis using the same 70-point threshold");
 
 // Provider-side defaults: highlightWindows slices a long transcript at 180s/30s.
 import { highlightWindows } from "../../services/ai-pipeline/providers.ts";

@@ -75,20 +75,28 @@ function rmsVariation(start: number, end: number, audioRms?: AudioRmsFeatures): 
 export function scoreHighlightComponents(signals: HighlightScoreSignals): HighlightScores {
   const duration = signals.end - signals.start;
   const durationFit = duration >= 15 && duration <= 60 ? 1 : duration < 15 ? Math.max(0, (duration - 4) / 11) : Math.max(0, (90 - duration) / 30);
-  const hook = 30 + (signals.hookCue ? 35 : 0) + (signals.text.includes("?") ? 10 : 0) + (audioPeak(signals.start, signals.end, signals.audioRms) ? 25 : 0);
+  // Audio energy only exists when RMS windows were supplied. Normalising over the
+  // measured maximum keeps a text-only clip on the same 0–100 scale instead of
+  // silently charging it the 25 hook / 15 impact points of an absent measurement.
+  const audio = signals.audioRms !== undefined;
+  const hookRaw = 30 + (signals.hookCue ? 35 : 0) + (signals.text.includes("?") ? 10 : 0) + (audio && audioPeak(signals.start, signals.end, signals.audioRms) ? 25 : 0);
+  const hookMax = audio ? 100 : 75;
   const summary = 25 + summarySimilarity(signals.text, signals.transcript) * 75;
-  const impact = 25 + (signals.complete ? 25 : 0) + (signals.pauseBoundary ? 15 : 0) + durationFit * 20 + rmsVariation(signals.start, signals.end, signals.audioRms) * 15;
+  const impactRaw = 25 + (signals.complete ? 25 : 0) + (signals.pauseBoundary ? 15 : 0) + durationFit * 20 + (audio ? rmsVariation(signals.start, signals.end, signals.audioRms) * 15 : 0);
+  const impactMax = audio ? 100 : 85;
   return {
-    hook: Math.round(Math.min(100, hook)),
+    hook: Math.round(Math.min(100, hookRaw / hookMax * 100)),
     summary: Math.round(Math.min(100, summary)),
-    impact: Math.round(Math.min(100, impact)),
+    impact: Math.round(Math.min(100, impactRaw / impactMax * 100)),
   };
 }
 
 /** Builds component metadata from provider values, or deterministic local signals when absent. */
-export function componentScoreMetadata(rawScores: unknown, fallback?: HighlightScores): {
+export function componentScoreMetadata(rawScores: unknown, fallback?: HighlightScores, scoreAudio = false): {
   scores: HighlightScores;
   dominantAxis?: HighlightAxis;
+  /** False when hook/impact were scored from text alone (no audio energy). */
+  scoreAudio: boolean;
 } {
   const source = rawScores && typeof rawScores === "object"
     ? rawScores as Partial<Record<HighlightAxis, unknown>>
@@ -98,5 +106,5 @@ export function componentScoreMetadata(rawScores: unknown, fallback?: HighlightS
     summary: normalizeComponentScore(source.summary ?? fallback?.summary),
     impact: normalizeComponentScore(source.impact ?? fallback?.impact),
   };
-  return { scores, dominantAxis: dominantHighlightAxis(scores) };
+  return { scores, dominantAxis: dominantHighlightAxis(scores), scoreAudio };
 }

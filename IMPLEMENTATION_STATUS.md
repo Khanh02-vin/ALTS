@@ -1,272 +1,115 @@
-# Implementation status
+# Implementation status — v0.1.4
+
+Updated: 2026-11-10. Scope: local working tree on `release/v0.1.4`, including uncommitted changes. These results do not certify a published installer or a clean machine.
 
 ## Local-first MVP decision
 
-The production path is intentionally reduced to one desktop/local process:
+The production path is desktop/local:
 
 ```text
-Svelte/SvelteKit → SQLite → filesystem → Faster-Whisper local → FFmpeg → MP4
+Svelte UI → Tauri commands → SQLite/filesystem
+  → captions or local Whisper → highlight analysis → Rust render engine → FFmpeg → MP4
 ```
 
-> **Architecture — dual build, static UI + RAG sidecar.** `svelte.config.js`
-> picks the adapter by `WEB_ADAPTER`: default → `adapter-static` → `web/build`
-> (Tauri `frontendDist`, embedded into the desktop binary); `WEB_ADAPTER=node`
-> → `adapter-node` → `web/build-node` (the RAG server). `beforeBuildCommand`
-> runs both (`npm run build && npm run build:node`), and `build-node` ships as
-> the `build-node` app resource.
->
-> The static webview (origin `tauri://localhost`) cannot `fetch` the sidecar
-> directly — webview CSP is `default-src 'self'`. So the YouTube Studio page
-> resolves the sidecar base URL from the Tauri command `rag_server_url` (which
-> spawns the sidecar on `127.0.0.1:4733` if it is not already healthy) and
-> routes every RAG call through `tauri-plugin-http` — its HTTP runs in Rust, so
-> webview CSP/CORS do not apply. The sidecar is stopped on app exit.
-> Standalone (browser served by `build-node`) keeps same-origin relative fetch.
+- The desktop UI uses the static SvelteKit build. The RAG sidecar uses the separate Node-adapter build; the webview calls it through `tauri-plugin-http`.
+- RAG and llama sidecars use runtime-selected loopback ports and session authentication. Do not assume the historical fixed RAG port 4733. The YouTube preview shim has its own fixed-port/CSP constraint.
+- Durable project/configuration data and regenerable caches use separate OS directories; test overrides can supply isolated roots.
+- The desktop and `lfai-render` CLI share the Rust render engine. Node tests invoke a separately built CLI executable, not the desktop test binary.
+- Progress uses commands, IPC channels and polling. There is no new general-purpose event bus.
 
-Deferred until measured demand:
+## Implemented in the current working tree
 
-- PostgreSQL, Redis/BullMQ, S3/R2, cloud workers.
-- JWT/session/tenant isolation and network rate limiting.
-- CE.SDK.
-- Managed (non-BYOK) Gemini/OpenAI cloud AI.
-- OAuth/social publishing.
-- Billing/team workspace.
+### Input and analysis
 
-## Completed
+- Local media import, metadata validation, persistent analysis jobs, retry/cancel/recovery and chunked local transcription.
+- YouTube captions-first analysis with audio fallback. Supported public Facebook/TikTok URLs route through yt-dlp audio extraction and local Whisper.
+- Analysis range cap: 1800 seconds. Long remote audio uses chunk boundaries informed by measured RMS windows when available.
+- Settings can select an allowlisted browser for yt-dlp `--cookies-from-browser`; arbitrary profile/path/flag values are rejected.
+- Heuristic/content highlight selection is available offline. Semantic providers are optional; provider failure can fall back to deterministic selection.
+- `services/ai-pipeline/highlight-scoring.ts`: Hook/Summary/Impact axes, dominant-axis metadata and audio-aware scoring. Missing audio measurements are distinguished from measured silence.
+- `services/ai-pipeline/wav-rms.ts`: PCM16 WAV RMS measurements.
+- `services/ai-pipeline/pause-snap.ts`: clip-edge snapping using transcript word gaps and punctuation, with bounded movement. This is not Silero-based clip-edge trimming.
+- `services/ai-pipeline/script-outline.ts`: script outline, highlight association and summary variants, wired into analysis enrichment.
+- Semantic result caching and windowed processing for longer transcripts.
 
-- Phase 0 documentation and scope.
-- Phase 1 independent project skeleton.
-- Phase 2 canonical contracts and validation tests.
-- Phase 3 host-agnostic media engine modules.
-- SQLite local job store with retry/recovery states.
-- Local FFmpeg adapter with probe/render/cancel.
-- **One final renderer** (ADR-002): the FFmpeg arguments live in a Tauri-free Rust crate,
-  `apps/desktop/src-tauri/crates/render-engine`. The desktop app (`src/render.rs`) and the
-  headless CLI (`crates/lfai-render`, binary `lfai-render`) are two front doors to that one
-  engine, and the Node job queue (`adapters/local/runner.ts` → `adapters/local/engine.ts`)
-  is a *client* of it — the duplicate Node renderer (`adapters/ffmpeg/`) is gone. The five
-  unused `render_enqueue`/`render_list`/`render_get`/`render_retry`/`render_drain` Tauri
-  commands that used to call back into that duplicate renderer are removed. The shared
-  `#[typeshare]` IPC structs moved into the engine crate, so `npm run contracts:generate`
-  and `npm run test:contracts-published` read the engine, and the app re-exports them
-  instead of declaring a second copy. CI builds `lfai-render` before `npm test`, because
-  the Node render tests drive the real engine binary. `tests/local/render-engine.test.ts`
-  (`test:render-engine`) pins the engine's observable behaviour: probe metadata, a real
-  1080x1920 H.264+AAC MP4 for the requested range, progress reaching 100%, and refusal to
-  overwrite the input or to start FFmpeg on an invalid plan.
-- **One source of truth for the crop path** (ADR-003): the Rust `analyze_crop_path` command
-  already picks the speaker's face, smooths the path (alpha 0.35) and assigns scene ids.
-  The Editor used to feed that output back through the TypeScript `trackFacePath`, which
-  smoothed the path a *second* time and re-derived scene cuts with a different rule (it
-  cut on face-area change, Rust does not). The renderer reads the plan, so it followed the
-  drifted path: with the subject moving from x=0.2 to x=0.8, Rust alone converged to 0.73
-  while the double-smoothed path stopped at 0.61. The Editor now maps the Rust output onto
-  contract keyframes through `packages/media-engine/reframe/crop-keyframes.ts`
-  (`cropKeyframesFromPath`), which only maps — it does not smooth, re-track, or invent
-  fallback points for frames the tracker skipped. The TypeScript copies with no production
-  call site (`generateAss`, `cropWindow`, `ffmpegCropCenterExpression`, `trackFacePath`,
-  `smoothFacePath`, `isSceneCut`, `choosePrimaryFace`, `sceneLayoutAt`, `aspectTarget`,
-  `validateEngineRenderPlan`) are removed; `packages/media-engine` keeps validation, the
-  probe and the editor's view helper `cropCenterAt`. The tracking algorithm itself was
-  split out of `analyze_crop_path` into a pure `track_crop_path` function so it can be
-  tested: four Rust tests pin that a frame without a face is skipped rather than filled
-  in, that the path is smoothed exactly once (0.41 after a 0.2→0.8 jump, where a second
-  pass would give 0.27), that a subject jump starts a new scene, and that an unconfirmed
-  speaker→face mapping produces no crop at all.
-- **Crop-path E2E scenario** (`DESKTOP_E2E_SCENARIO=crop-path`): drives the real chain
-  through the app's IPC — `sample_speaker_faces` (Haar cascade on real frames),
-  `analyze_crop_path` (the Rust tracker), contract keyframes, then `render_video` with a
-  progress channel. On the 180s dialogue fixture it found the face, produced 9 keyframes
-  across 2 scenes, and the rendered export shows the face at output-centre 0.525 where a
-  centre crop would leave it at 0.39 — the tracked crop is genuinely applied. Speaker
-  labels come from the test (diarization needs pyannote + a Hugging Face token, which a
-  clean machine does not have). Finding it surfaced a real product bug: five media
-  commands ran blocking work on the main thread and froze the webview for the whole
-  scan; they now run on blocking workers, guarded by a wiring test.
-- **Production-hardening of state layout and process trees** (ADR-004): durable data
-  (`projects.sqlite`, `analysis.sqlite`, `runtime.env`, tokens, RAG playlists) moved to
-  the OS data directory (`%APPDATA%` / `~/Library/Application Support` / `$XDG_DATA_HOME`)
-  and regenerable caches (preview, LLM, chunk caches, llama runtime + model, the Python
-  venv) to the OS cache directory — the old single `~/.cache` root lost projects to disk
-  cleaners, and the Windows fallback silently landed in `%TEMP%` (Windows does not set
-  `HOME`). `LOCAL_FIRST_STATE_DIR` still collapses both roots into one (tests/E2E); Node
-  workers get `LOCAL_FIRST_CACHE_DIR` alongside it. A copy-only migration moves legacy
-  data on first launch (never overwrites an existing file, renames the GB-size llama/venv
-  directories, keeps the legacy root as backup). The analysis worker is now spawned with
-  the `command-group` crate — a process group on Unix, a Job Object with
-  `KILL_ON_JOB_CLOSE` on Windows — so cancel works on Windows (`taskkill /F /T`) and a
-  crashed app can no longer orphan its whisper/ffmpeg tree there; six new Rust tests pin
-  the OS-path resolution and the migration semantics.
-- **Loopback sidecar auth + ephemeral ports** (ADR-005): llama-server, the RAG sidecar
-  and the preview shim no longer bind hardcoded ports (8080/4733/14872 for llama/RAG) —
-  the first two resolve a free port at spawn, and every sidecar now answers 401 to
-  requests without a per-session 128-bit token (llama via `--api-key` recorded in
-  runtime.env, RAG via `LFAI_RAG_TOKEN` gate on every handler, preview via a token in
-  the iframe URL). The webview receives `{base, token}` from `rag_server_url` and sends
-  the bearer on every call. A crash leftover is reattached through a session file
-  instead of a fixed port. Verified live (401/401/200) and pinned by wiring tests;
-  the preview shim keeps its fixed port because the webview CSP allow-lists it
-  statically, and the OAuth callback port is an external registration constraint.
-- **Batched media analysis + preview cache quota** (ADR-006): the crop/scene scans now
-  run as exactly two processes — one FFmpeg pass with an `fps` filter extracts all
-  sampled frames, and `detect-face-boxes.py` takes the whole batch (cv2 imported once,
-  unreadable frames reported as null and skipped instead of killing the scan). Measured
-  on the 180s fixture: 15.4s → 5.4s; a 30-minute video drops from ~720 process spawns
-  to 2. Sampling semantics are pinned by tests (`sample_times`: interval spacing,
-  duration clamp, the scene loop still stopping at 360 scenes). The preview cache now
-  evicts oldest-first (`*.mp4` only) under a 5 GiB cap after each publish — previously
-  nothing ever deleted a preview, so the disk leak grew with every imported video.
-- **Join step via stream copy with validation + fallback** (ADR-007): the render join
-  no longer re-encodes the whole output a second time. Segments share one encoder
-  profile, so `join_segments` first tries the concat demuxer with `-c copy` (`-an` when
-  the source has no audio, keeping the output shape identical), validates the result
-  with ffprobe (video dimensions from the aspect ratio, duration within a frame-grid
-  tolerance, audio present/absent as expected, audio-video drift ≤ 0.1s), and falls
-  back to the previous concat-filter re-encode on any mismatch or failure — the output
-  never regresses below the filter path. Baseline benchmark `bench:concat-ab` measured
-  the join at 16.3s (filter) vs 0.09s (copy) for a 24s output with no audible drift and
-  no DTS warnings; the render-success E2E on the new path is green (export decodes
-  clean, 1080x1920 + audio) and the scenario dropped from ~154s to ~126s.
-- Local Faster-Whisper CLI adapter with cleanup, timeout and transcript validation.
-- Deterministic heuristic highlight selector using sentence completeness, length and hook keywords.
-- Semantic highlight strategy + Gemini BYOK provider wired into the analysis worker (`HIGHLIGHT_STRATEGY`/`GEMINI_API_KEY` in runtime.env, `SemanticProviderAdapter` bridges the LLM provider into the pipeline); deterministic heuristic/content selector is the offline default and the automatic fallback when the provider errors or no key is set.
-- `Collection` canonical contract v1 (`packages/contracts/collection.ts`): items reference highlights/renderPlans/artifacts, contiguous positions starting at 0, no duplicate references, state ∈ {proposed, approved, rejected}, exported from barrel.
-- Tauri 2 installer bundles: `.deb`, `.rpm`, and `.AppImage` in `apps/desktop/src-tauri/target/release/bundle/` (Node, ffmpeg, ffprobe, and all TS contracts/adapters/services bundled as app resources).
-- `scripts/run-local-demo.ts`: one-command local pipeline (probe → extract audio → Whisper → highlights → 9:16 MP4).
-- Local LLM highlight strategy (`HIGHLIGHT_STRATEGY=semantic-local`): `llama-server` (bundled linux x64 binary) + Qwen2.5-3B Q4 GGUF downloaded on demand with SHA-256 verification; Tauri spawns/stops the server (`start_local_llm`/`stop_local_llm`), `LlamaCppHighlightProvider` calls its OpenAI-compatible API per transcript window (map-reduce). No API key, no network egress. See `docs/local-llm.md`.
-- Real LLM windowing + structured output (AI pipeline hardening): both `GeminiHighlightProvider` and `LlamaCppHighlightProvider` slice transcripts into 180s windows with 30s overlap (configurable via `windowSeconds`/`windowOverlapSeconds`, forwarded from `generateSemanticHighlights` through `SemanticProviderAdapter`) — long videos no longer overflow a single small-model prompt; per-window proposals merge and de-overlap via `mergeWindowHighlights`. Both providers now request schema-enforced JSON (`response_format: {type:"json_object", schema}` on llama-server, `responseMimeType:"application/json"` + `responseSchema` on Gemini), so replies parse without fence-stripping; `repairTruncatedJsonArray` remains as the fallback for llama-server builds without constrained decoding.
-- Highlight-selection eval harness (`tests/ai-pipeline/eval-highlights.test.ts` + `fixtures/highlight-eval.json`, wired as `test:eval-highlights` in `npm test`): 6 curated fixtures / 8 human-picked expected highlights, scored by time-IoU + rank@1/3/5 (threshold 0.3). Offline CI rows: heuristic, content, and two oracle semantic mocks (exact + ±2s jitter) that pin the metric code itself. Live rows auto-skip unless `GEMINI_API_KEY` is set or a llama-server answers `/v1/models` — with a real server the same run compares the bundled Qwen against the heuristic. Findings from the first live run (Qwen2.5-0.5B, llama.cpp b11160): heuristic IoU 0.75 vs semantic-local IoU 0.02 — the bundled 0.5B does not beat the heuristic on highlight picking, and it fails for two fixable reasons the harness exposed: (1) the old word-object JSON prompt cost ~4.2k tokens for a 96s clip, overflowing the production llama-server context (`ensure_llama_server` ran 4096 ctx / parallel 2 = 2048 tokens per slot, so every real window silently 400'd and fell back to the heuristic anyway); (2) 0.5B wastes its token budget echoing wordIds and picks single-word spans. Fixes shipped with the harness: prompts are now compact `wordIndex [start-end] text` lines (~3.5x smaller) with wordIds/times re-derived server-side (`highlightPrompt`/`mapWordRangeProposals`, schema no longer contains wordIds), and `ensure_llama_server` runs 8192 ctx / parallel 1. Recommendation recorded by the data: keep the heuristic as the default selector; treat semantic-local as opt-in for machines that download a larger model (1.5B+), and re-run `LOCAL_LLM_BASE_URL=... npm run test:eval-highlights` to compare before changing the bundle.
-- Heuristic v2 (default selector, no model): pause-boundary signal shipped — an internal segment gap ≥0.7s (straight from Whisper's word timings) adds +8, marking topic boundaries as natural clip edges; unit-pinned in the eval test (contiguous segments get no bonus, sub-threshold gaps get none). An intra-transcript IDF signal was implemented, swept (min-max and absolute scales, weights 2–18, plus tiebreaker-only) and **rejected by measurement**: every variant regressed the cooking-pasta case (mean IoU 0.75 → 0.58–0.67) because key moments repeat the topic's core vocabulary, which IDF penalizes as "common". Pause-only keeps the baseline IoU 0.75 / hit@5 83% intact while adding a genuinely new signal for real (non-contiguous) Whisper output. The eval harness is what turned "smarter heuristic" from a hunch into a ship/reject decision.
-- LLM result cache (`services/ai-pipeline/llm-cache.ts`, wired into both `scripts/analyze-video.ts` and `scripts/analyze-youtube.ts`): `CachedSemanticProvider` wraps the semantic provider so the same transcript replays stored highlights instead of re-calling Gemini/Qwen — retrying a job, flipping strategy back, or reopening a project no longer burns tokens/time. Key = sha256(`HIGHLIGHT_PROMPT_VERSION` + provider identity incl. model + options + transcript words); files under `<state>/llm-cache/<sha256>.json` (few KB each, immutable keys — no eviction needed). `HIGHLIGHT_PROMPT_VERSION` in `providers.ts` is the single invalidation lever: editing the prompt or output schema bumps it and stale entries stop being served. Corrupt or contract-invalid entries (e.g. overlapping highlights) are treated as misses and overwritten; empty provider results are never cached so transient failures retry. Covered by `tests/ai-pipeline/llm-cache.test.ts` (hit/miss per component, corrupt-entry fallback, empty-result no-cache).
-- Packaging gap found by inspecting the shipped artifacts of run 36967484698: neither the Windows portable nor the Linux AppImage contained `llama-server` binaries or the `build-node/` RAG sidecar — the `6c8e53f` tauri.conf mappings were lost in a later merge, so packaged builds resolved helpers through baked dev-tree paths that do not exist on customer machines (YouTube Studio RAG dead, semantic-local/embeddings unreachable). Fixed in `101a3dc`–`b2e0082`: `bundle.resources` re-adds `resources/llama` + `web/build-node` and `beforeBuildCommand` also runs `npm run build:node`; the Windows portable assembly copies `resources/llama` (exe/dll only — the git-committed Linux ELF + `.so` symlinks cannot be materialized by `cp` on Windows, which failed run 36983290219) plus `apps/web/build-node`; `llama_binary()` probes `<resources>/llama/llama-server[.exe]` via `resource_dir` before the baked dev path, platform filename only (never the committed Linux ELF on Windows); `fetch-bundled-assets.sh` skips re-fetch only on Linux (the old `-x` check on the committed ELF wrongly skipped on macOS and would ship a non-runnable binary); `build.rs` creates empty placeholders for the gitignored resource dirs so `cargo check/test` passes on a fresh clone (run 36981807321 failed on this). Release provenance: run 36967484698 published UI+backend commit `c35601d` (portable patched onto the canonical Drive ID — rclone still creates a stray `portable-windows.zip`, trashed after each publish); runs 36981807321 (build.rs fresh-clone fail, cancelled) and 36983290219 (Windows portable symlink fail) were the two fix iterations; **run 36985910843 (`b2e0082`) went fully green and its artifacts were contents-verified before publishing** — portable: `llama/llama-server.exe` + 29 DLLs + `build-node/index.js`; AppImage: `llama/llama-server` + `build-node/index.js`. Drive folder: 4 canonical IDs unchanged, sizes now 934,664,443 (portable) / 886,639,639 (macOS) / 952,203,768 (AppImage) / 942,811,396 (MSI), all `anyone:reader`. On this dev machine the launcher override `~/.local/share/applications/…desktop` points at a user-local extraction of the rebuilt `.deb` (no sudo available): custom titlebar Min/Max/Close verified via AT-SPI, YouTube Studio spawns the sidecar from the bundle (`…/build-node/index.js`, `/api/rag/playlists` 200), nav 588 ms.
-- Drive publish stray fixed at the root (`c343800`): `rclone copy` matches by destination filename, and the portable's staging name (`portable-windows.zip`) never matched the canonical customer file (`Local-first AI Video Studio Portable.zip`) — every publish created a stray next to the real link, requiring a manual API PATCH onto the canonical Drive id afterwards; the printed customer links were also wrong (dotted names that do not exist on Drive). The publish step now uses `rclone copyto` with the canonical Drive names for all four artifacts (staged sources globbed; only Drive-side names fixed), `deletefile` self-heals any leftover stray, and the link block prints canonical names so the links resolve. Mechanism verified on the live folder before dispatch (two copyto uploads to one dest name kept id `18FpeaRjJGj3bKp60cVByHCTWKxK3zq4T` with size updating, deletefile removed it), then proven end-to-end by **run 36995963427 (`c343800`)**: fully green, Drive folder ends with exactly 4 active files, all four canonical IDs unchanged, all `anyone:reader`, **no stray `portable-windows.zip`** — first publish in this project's history that needed zero manual Drive repair. Sizes after this publish: 934,664,379 (portable) / 886,639,699 (macOS) / 952,203,768 (AppImage) / 942,811,396 (MSI); GitHub Release v0.1.0 assets refreshed to match.
-- Whisper models `tiny`/`base` bundled in Tauri resources and copied to `~/.cache/whisper` on startup (`ensure_bundled_whisper_model`) — no model download required on a fresh machine.
-- Draggable timeline editor (in/out trim handles, range drag, keyboard slider) — replaces the HTML5 placeholder; edits still flow through `editor-core` `updateRange()` so contract validation stays the single source of truth.
-- YouTube Studio RAG backend (`apps/web/src/routes/api/rag/+server.ts`, dispatching rest-route `apps/web/src/routes/api/[...rest]/+server.ts`): playlist queue, manual segment ingest, TF-IDF timestamp search with deterministic synthesis — JSON files under `<state>/youtube`, strict validation, no network. YouTube Studio rail entry un-hidden; web app builds `adapter-static` for the desktop UI and `adapter-node` (`build-node`) for the RAG sidecar.
-- Hybrid RAG retrieval + local-LLM answers (YouTube Studio): ingest embeds each transcript segment via the bundled llama-server `/v1/embeddings` (vectors stored in `<state>/youtube/embeddings.json`); query ranks by cosine top-k when the LLM is reachable and falls back to the existing TF-IDF path otherwise (dims mismatch from a model swap also forces the fallback). Answer synthesis feeds the top excerpts to the local Qwen (`/v1/chat/completions`) and falls back to the deterministic excerpt string on any error/timeout; `synthesize:false` skips the LLM. The sidecar learns the LLM URL from `LOCAL_LLM_BASE_URL` (set by `ensure_rag_server`, default `127.0.0.1:8080`). `ensure_llama_server` now spawns with `--embeddings --pooling mean` — Qwen chat GGUFs default to pooling `none`, which the embeddings endpoint rejects; forcing mean pooling lets one server both embed and chat (verified against llama.cpp b11160: embeddings 896-dim, chat unaffected, related/unrelated cosine margin ~0.11 — no extra embedding model needed).
-- RAG sidecar inside the desktop app: dual-adapter build (`WEB_ADAPTER=node` → `build-node`, bundled as a resource) + Tauri command `rag_server_url` spawns the sidecar on `127.0.0.1:4733` (bundled node, stopped on exit) + `tauri-plugin-http` so the static webview reaches it despite webview CSP. Fixed a runtime panic where `LlamaState` and `RagState` were the same underlying managed type (`Arc<Mutex<Option<u32>>>`) — `RagState` is now a distinct newtype.
-- Fast YouTube clipping (URL → highlight → preview → export): paste a YouTube URL on the Studio home → `start_youtube_analysis` validates the host and reads duration metadata via `yt-dlp --skip-download` (~1s) → `scripts/analyze-youtube.ts` builds the transcript contract from captions (`scripts/yt-crawler.py --video`, no Whisper, no download) → existing heuristic/semantic selector emits highlights → the step-4 iframe seeks the clip (`start`/`end`) → export resolves fresh CDN URLs at render time (`resolve_stream_url`) and range-requests only the selected section before the usual 9:16 re-encode.
+### Review, preview and rendering
 
-## Verified
+- Candidate selection/discard state and project persistence; editor trim/crop/caption controls.
+- Dominant-axis labels use a VI/EN mapping based on transcript language, not fixed marketing phrases such as “Tóm tắt chuẩn nhất”.
+- Local preview can transcode a browser-compatible proxy per source. It is not a metadata-only operation or a final render per candidate.
+- Preview cache cleanup is best-effort, oldest-modified-first, with a 5 GiB cap on published MP4 files. In-flight `*.tmp.mp4` files are excluded from both accounting and eviction. Cache hits do not refresh mtime, so this is not strict access-based LRU.
+- Discarding the last active candidate requests deletion of the shared source proxy. Deletion failure must not prevent discard; this is not a guarantee that all temporary files are immediately removed.
+- Render plans support the subtitle-burn toggle and selected ranges. Final output uses the shared Rust renderer.
+- Crop tracking includes deadzone/smoothing and confirmed speaker/face mappings. Scene-layout proposals require user review; blur is a fill mode, not proof of slide/chart classification.
 
-```text
-cd local-first-ai-video-studio
+## Verification on this machine — 2026-11-10
+
+Environment: Linux x64, Node.js v24.21.0, existing development dependencies/resources. Commands were run in this checkout, not against a downloaded installer.
+
+| Check | Observed result |
+|---|---|
+| Quota regression before fix | Failed: in-flight temporary MP4 was deleted |
+| Focused Rust preview tests after fix | 5 passed, 0 failed |
+| Desktop `cargo test` | 76 passed, 0 failed, 19.78 s |
+| `cargo build -p lfai-render` then `npm test` | Passed, including real MP4 render tests |
+| Newly included npm suites | `test:wav-rms`, `test:script-outline`, `test:highlight-status` all passed through `npm test` |
+| Command wiring | 54 UI invocations registered |
+| `npm run check --prefix apps/web` | 0 errors, 0 warnings |
+| `npm run build --prefix apps/web` | Passed; emitted layout warning about missing `<slot />` / `{@render ...}` |
+
+The initial `npm test` failed in FFmpeg argument parsing because the existing debug CLI was stale. Rebuilding the CLI from current source, as CI does, resolved it without changing renderer source.
+
+Rust reported four unused-import warnings. A formatting check initially flagged the new test assertion; that formatting was corrected. Final `cargo fmt --check` and `git diff --check` both passed (exit code 0) after the code and documentation changes.
+
+The Rust total remains 76: the duplicate `#[test]` on the quota test was removed and the missing `#[test]` on the cache-key test was added. The total is not evidence that those two issues were absent.
+
+### Highlight evaluation from this run
+
+Dataset: 8 cases, 10 expected highlights, IoU threshold 0.3.
+
+| Evaluation row | Mean IoU | Hit@5 |
+|---|---:|---:|
+| Heuristic | 0.56 | 63% |
+| Content | 0.39 | 63% |
+| Semantic oracle (mock) | 1.00 | 100% |
+| Semantic oracle with jitter (mock) | 0.82 | 100% |
+| Axis blends 4/3/3, 3/4/3, 3/3/4 over the same candidate set | 0.69 | 88% |
+
+Oracle rows test the evaluation machinery, not a real model. Blend results do not establish an end-to-end production quality guarantee. `vlog-rambling` remains a zero-IoU case in the reported blend rows.
+
+Live Gemini evaluation was skipped because `GEMINI_API_KEY` was not set. Live local-model evaluation was skipped because no llama-server answered at the evaluation endpoint. No fresh manual GUI session, live Facebook/TikTok download, clean-machine test, installer/signing check or Windows/macOS test was performed in this verification pass.
+
+### Reproduce the checks
+
+Run from the repository root:
+
+```bash
+cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml -p lfai-render
 npm test
-contract tests: ok
-media engine tests: ok
-local runtime tests: ok
-MVP pipeline tests: ok
-local MVP heuristic tests: ok
-platform boundary tests: ok
-semantic highlight tests: ok
-idempotency gap tests: ok (all 6 gaps fixed)
-long-video map-reduce tests: ok
-json repair tests: ok
-llm cache tests: ok
-eval highlight tests: ok
-rag hybrid tests: ok
-youtube transcript tests: ok
-command wiring tests: ok (30 UI invocations all registered)
-
-cd apps/desktop/src-tauri && cargo check
-Finished `dev` profile
-cargo test
-test result: ok. 5 passed; 0 failed
-
-cd apps/web
-npm run check
-svelte-check found 0 errors and 3 warnings (pre-existing: slot deprecation in layout, implicit-close + a11y in Studio/Youtube pages)
-npm run build
-built successfully
-
-manual e2e (local LLM): llama-server + Qwen2.5-3B GGUF + LlamaCppHighlightProvider
-
-Clean-machine Docker test (tests/clean-machine/Dockerfile, ubuntu:24.04,
-no whisper/venv/state dir; ffmpeg from apt, bundled node/llama/whisper
-weights):
-  docker build -f tests/clean-machine/Dockerfile -t lfai-clean-machine .
-  docker run lfai-clean-machine bash tests/clean-machine/run-whisper-bootstrap.sh
-    → venv + openai-whisper + torch-2.14.0+cpu, runtime.env written,
-      bundled tiny.pt copied to ~/.cache/whisper
-  docker run lfai-clean-machine bash tests/clean-machine/run-analyze-pipeline.sh
-    → probe → extract → whisper (0 words on synthetic tone, expected) →
-      highlight → 9:16 render: /tmp/short-clean.mp4 1080x1920 OK
-    (idempotent: second bootstrap run skips pip install, ~2s)
-
-RAG backend (adapter-node server, LOCAL_FIRST_STATE_DIR=/tmp/rag-test-state):
-  POST /api/rag/playlists (202 queued) · POST /api/rag/ingest (200,
-  2 segments) · POST /api/rag/query (TF-IDF match + synthesis) ·
-  DELETE /api/rag/playlists/<id> (record removed) · GET /api/rag/index
-  (TF-IDF index persisted) · bad-domain playlist → 400
-  PLAYLIST_MUST_BE_YOUTUBE_URL · unrelated /api/foo → 404 UNKNOWN_ENDPOINT.
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+npm run check --prefix apps/web
+npm run build --prefix apps/web
+git diff --check
 ```
 
-- Desktop GUI e2e (release build, Wayland GNOME + Xwayland, driven through
-  AT-SPI/XSendEvent): fresh app → paste `https://www.youtube.com/watch?v=9bZkp7q19f0`
-  → step 4 with 3 Korean highlights in seconds (no Whisper phase) → preview
-  iframe plays with **no YouTube Error 153** → seek slider resets 100→0 on
-  replay and auto-stops at the clip end (`start=9&end=26`) → Render selected →
-  GTK save dialog → `Rendered: …/src-tauri/yt-short.mp4` — ffprobe: h264
-  1080×1920, 15.77 s, aac 44.1 kHz, 9.9 MB. The preview is served by the
-  loopback shim (`preview_origin` → `http://localhost:14872`; `/health`,
-  `/preview` with the `preview_query` whitelist).
+The CLI build is a prerequisite: `npm test` does not rebuild an existing `target/debug/lfai-render`. Both CI and release test jobs build it first.
 
-- SvelteKit shell with dashboard, project, editor and settings routes.
-- Config, upload validation, local auth-scope boundary and in-memory rate-limit boundary retained as future cloud seams.
-- Cloud/provider/OAuth interfaces retained outside the local runtime; no fake production credentials.
-- Docker development services and CI smoke workflow retained for future expansion.
+## Deferred until measured demand
 
-## Current MVP limitations
+Consistent with `docs/backlog.md` and the local-first scope:
 
-- Faster-Whisper still requires the local `whisper` CLI (auto-discovered via the project venv / runtime.env fallback chain); `tiny`/`base` model weights are bundled.
-- Highlight strategies (Settings → Highlight strategy): heuristic (offline default), semantic-gemini (BYOK), semantic-local (llama.cpp, offline). Without an explicit choice the deterministic heuristic/content selector stays the offline default and provider errors fall back to it.
-- Local LLM: binary committed for linux x64 only; mac/windows need their llama.cpp build added to resources when built on the right runner (release.yml runs fetch-bundled-assets.sh per-OS, which pulls the matching llama.cpp release). The 2.1 GB GGUF is downloaded on first use (never committed to git). The `llama/` resource dir is shipped in the installer via tauri.conf.json (bundle.resources `./resources/llama`).
-- YouTube Studio RAG: index/query/ingest/delete are working; the playlist **crawler** (`scripts/yt-crawler.py`, `crawl_playlist`) fills queued playlists with real video segments, and its `--video <url>` mode feeds the single-video analysis pipeline (transcript → highlights, no Whisper).
-- YouTube preview embed: the production webview origin `tauri://localhost` carries no HTTP(S) `Referer`, which YouTube rejects with `EMBEDDER_IDENTITY_MISSING_REFERRER` (on-screen "Error 153"). Fixed by `preview_origin`: an in-process loopback server on `127.0.0.1:14872` (same pattern as `YT_OAUTH_PORT=14871`) whose page embeds the clip with a `http://localhost:14872` Referer; the iframe CSP stays tight (`frame-src` = YouTube hosts + the shim only), and `/preview` validates video id (`[A-Za-z0-9_-]{11}`) plus `start < end`. Windows/Android (`http://tauri.localhost`) would work natively; dev mode (`http://localhost:5173`) also works.
-- `resources/ffmpeg` (gitignored, populated by `fetch-bundled-assets.sh` or a host copy) wins over PATH via `bundled_bin`. The johnvansickle static 7.0.2 Linux build that was sitting there segfaults (SIGSEGV) on **any** HTTPS input on this machine, so render died with `FFMPEG_EXIT:signal: 11`; replaced locally with the system ffmpeg 8.0.1 (`cp /usr/bin/ffmpeg resources/ffmpeg`) and the GUI export then succeeded. The same replacement was applied to `~/.local/bin/ffmpeg` + `ffprobe`, which the self-hosted runner's PATH resolves first when `fetch-bundled-assets.sh` takes its host-copy branch — otherwise every CI AppImage would have shipped the broken binary. If a render fails with `FFMPEG_EXIT:signal: 11` on a fresh Linux install, check that binary first — Windows CI downloads its own `ffmpeg.exe` from BtbN and is unaffected.
-- Tauri desktop shell loads the static UI from `frontendDist`; the RAG sidecar (`build-node`, spawned on demand by `rag_server_url`, stopped on exit) serves `/api/rag/*` on `127.0.0.1:4733` and the webview reaches it through `tauri-plugin-http`. Verified: full `.deb` release build, app boots, sidecar health `200` with the exact spawn env — but the click-through (load YouTube Studio → plugin fetch returns data) has not been exercised end-to-end in a real GUI session.
-- macOS/Windows installers: `release.yml` builds the Windows portable zip + MSI on `windows-latest`, the macOS `.app` bundle on `macos-latest`, and the Linux AppImage on the self-hosted `[self-hosted, self-vostro]` runner. Run `36600662949` (commit `60b3ead`, 2026-09-30) went fully green on all five jobs (`lint-test`, `windows`, `macos`, `linux`, `publish`) after the repo was made public — which lifted the hosted-runner billing gate that had blocked `windows`/`macos` since 2026-09-27 (see "GitHub Actions billing block"). See "Release artifacts" below for the customer links.
-- Customer-reported stability/perf fixes (2026-09-30, triage in `docs/customer-feedback-2026-09-30.md`): all helper processes spawn through `tool()`, which sets `CREATE_NO_WINDOW` on Windows so node/curl/kill no longer flash console windows; `panic::set_hook` logs panics to `panic.log` and the next launch surfaces the report in-app (`last_panic`), so the Windows release build's silent exits become readable; `ensure_bundled_whisper_model` copies the Whisper `.pt` into the CLI cache on a background thread instead of inside `runtime_status` (first-run page loads no longer freeze for the multi-second copy); engine/storage/license status is cached in `apps/web/src/lib/runtime-status.svelte.ts` and polled briefly until the copy finishes.
-- Windows helper layout: `fetch-bundled-assets.sh` now ships `node/bin/node.exe`, `ffmpeg.exe`, `ffprobe.exe` (Windows CreateProcess resolves `.exe`; the extensionless Unix names failed there and made the portable fall back to a PATH node that customer machines lack), `bundled_bin` probes the platform-native name first, `release.yml`'s portable assembly and a new "Verify bundled helper names" CI step (windows + linux jobs) guard against regressions before packaging. `tauri.conf.json` bundles ffmpeg/ffprobe via glob (`./resources/ffmpeg*`) so one config serves both naming schemes.
-- Desktop shell UX: `decorations: false` + an in-app title bar (`data-tauri-drag-region`, min/max/close via `@tauri-apps/api/window`); pages are keep-alive mounted by `+layout.svelte` (display-toggled) so switching never re-runs `onMount` — measured 87–126 ms warm switches and 20 rapid switches with no crash on the release build. Caution when touching the layout: the visited-pages effect must write `visited[page]` only when missing — reassigning a fresh object there loops forever and starves Svelte's update queue (invoke results silently stop rendering). `WEBVIEW2_GPU_DISABLE=1` in `runtime.env` opts Windows machines into `--disable-gpu-compositing` (mirrors the WebKitGTK DMABUF workaround) for WebView2 renderer crashes.
-- Collection contract is defined and validated but not yet wired into persistence, API, or UI (scope is P2).
-- Editor uses native HTML video/timeline controls; add CE.SDK only if this editor fails real-user requirements.
-- Tauri 2 installers (deb/rpm/AppImage) are produced but not yet code-signed; shipping to a store requires signing + notarization (see docs/codesigning-runbook.md).
-- Cloud, OAuth and publishing remain deliberately disabled.
+- PostgreSQL, Redis/BullMQ, S3/R2 and cloud workers.
+- Hosted-user JWT/session/tenant isolation and network rate limiting. Local path validation, secret handling and sidecar authentication remain required now.
+- CE.SDK: only revisit if the native editor demonstrably fails user requirements.
+- Managed non-BYOK Gemini/OpenAI services.
+- OAuth/social publishing, billing and team workspace.
 
-## Release artifacts (customer-facing links)
+## Known limits and release evidence
 
-All installers ship as GitHub Release `v0.1.0` assets and are mirrored to the `gdrive:LFaIVS-Releases/` folder.
-
-- **Linux:** `Local-first AI Video Studio_0.1.0_amd64.AppImage` — 936 151 544 bytes, built by the `linux` job of run `36803798016` (`cc842ac`, 2026-10-01 — ships the customer stability/perf fixes). The host `~/.local/bin/ffmpeg` that `fetch-bundled-assets.sh`'s host-copy branch picks up was replaced with system ffmpeg 8.0.1 (the johnvansickle static 7.0.2 there segfaults on HTTPS), so the image ships a working ffmpeg.
-- **macOS:** `Local-first AI Video Studio.zip` — 848 659 888 bytes, `.app` bundle from the same run (unsigned: right-click → Open on first launch).
-- **Windows:** `Local-first AI Video Studio_0.1.0_x64_en-US.msi` — 906 649 780 bytes (signed), and `Local-first AI Video Studio Portable.zip` — 914 911 187 bytes (unzip; double-click `local-first-ai-video-studio.exe` to run).
-
-> **Portable format fix (2026-10-01).** The previous "portable zip" files were actually uncompressed TAR archives: `windows-latest`'s GNU tar `-a` only infers *compression* from the suffix, and `.zip` is not a compression format it knows, so it wrote ustar — unopenable by Windows Explorer. `release.yml` now builds it with `7z -tzip` (7-Zip preinstalled on the runner) plus a `7z t` integrity gate, and the deflated zip also shrank the download from ~1.39 GB to ~915 MB. Run `36819798478` (`ac6b917`) built all four jobs green with the fix; the portable's content was patched in place onto its existing Drive id `14EXa9b…` so previously sent links serve the corrected archive. Its `publish` job was cancelled after the builds went green because the Drive/GitHub refresh had already been done manually from the same run's artifacts (the job's artifact re-download alone takes ~40 min on this link). The self-hosted runner's watchdog was also hardened: it no longer restarts `gh-runner` while a job is in flight (`Runner.Worker` alive) and requires two consecutive offline checks — an offline-during-heavy-load restart had twice cancelled the linux AppImage build mid-bundling.
-
-Run `36803798016` (`cc842ac`, 2026-10-01) built all four from green jobs (`lint-test`, `windows`, `macos`, `linux`); its `publish` job re-downloaded ~4.6 GB of artifacts and its `softprops/action-gh-release` step flaked mid-upload after deleting the previous assets, so the release refresh + Drive upload were completed manually from the same run's artifacts (Drive verified via API: same 4 ids, new content, `anyone:reader` intact; the portable was content-patched in place onto its existing id so previously sent links keep working). The CI `Verify bundled helper names (Windows)` step caught a real regression on the first dispatch (`cc842ac`'s predecessor `652a3f2` shipped a Windows node zip whose top-level dir was never stripped, so `node/bin/node.exe` was missing); fixed in `cc842ac`.
-
-Google Drive direct links (folder `gdrive:LFaIVS-Releases/`, all `anyone-with-link: reader`):
-
-| File | Drive id | Link |
-|---|---|---|
-| `Local-first AI Video Studio_0.1.0_amd64.AppImage` (Linux) | `1C6caeoH5fV_-CGARWDzStg2KIDygfjDV` | [open](https://drive.google.com/file/d/1C6caeoH5fV_-CGARWDzStg2KIDygfjDV/view) |
-| `Local-first AI Video Studio_0.1.0_x64_en-US.msi` (Windows signed) | `1qK9C-fncFJUVYdkrmchzccasb2jI8vr5` | [open](https://drive.google.com/file/d/1qK9C-fncFJUVYdkrmchzccasb2jI8vr5/view) |
-| `Local-first AI Video Studio.zip` (macOS) | `139vD_Jyb7bB6pygaM68Q1TpIsTQHAH1k` | [open](https://drive.google.com/file/d/139vD_Jyb7bB6pygaM68Q1TpIsTQHAH1k/view) |
-| `Local-first AI Video Studio Portable.zip` (Windows portable) | `14EXa9b2ioGWZKAgk4vkSo4e_RqFolgd2` | [open](https://drive.google.com/file/d/14EXa9b2ioGWZKAgk4vkSo4e_RqFolgd2/view) |
-
-The same three installers (AppImage/MSI/macOS zip) are also attached to GitHub Release `v0.1.0`, refreshed from the same run.
-
-> **Build provenance.** Everything above comes from run `36600662949` at commit `60b3ead`, which includes `da15097` (the YouTube URL → highlight → MP4 feature) and the `release.yml` `shell: bash` fix — the Windows `portable-zip` assembly step previously died on `windows-latest` because the default PowerShell rejects `for exe in *.exe; do …; done`; no code change was needed, only `shell: bash`. Earlier stale artifacts were removed from Drive: the pre-feature portable zip (old id `1hfdZKqCOj2rd49ZCTaqYHBjZ4Jat9nXm`, built at `c5f8dbb`) and the Sep-28 dotted-name MSI/macOS duplicates are gone (in Drive trash); an accidentally created folder masquerading under the portable name was deleted too.
-
-## GitHub Actions billing block (self-inflicted, not a code defect)
-
-The public `ci.yml` test job and the `release.yml` `windows`/`macos` jobs run on GitHub-hosted runners (`ubuntu-latest`, `windows-latest`, `macos-latest`). Since **2026-09-27 15:56**, every one of those jobs fails immediately with zero steps and the annotation:
-
-> The job was not started because recent account payments have failed or your spending limit needs to be increased.
-
-The repo was made **public** on 2026-09-29, which lifted the GitHub-hosted runner billing gate for `ubuntu-latest`, `windows-latest`, and `macos-latest`; run `36600662949` the next day was fully green on all five jobs, producing every artifact listed above. If the repo must ever go private again, the gate returns unless the payment method / Actions spending limit is fixed in *Settings → Billing & plans*.
-
-What keeps working: the self-hosted `[self-hosted, self-vostro]` jobs (`lint-test`, `linux`, `publish`) — they report directly against the linux host and are how the Linux AppImage above was produced. This is also why `release.yml` was split so the `linux` job stages its AppImage to `~/lfavis-dist/linux/` and the `publish` job reads it from that shared dir instead of round-tripping through the GitHub artifact store.
-
-The Windows `fetch-bundled-assets.sh` step downloads a fresh BtbN `ffmpeg.exe` on the runner, so the green `windows` job in run `36600662949` shipped the correct ffmpeg without any local intervention.
+- Most Replayed/comments signals, lip-movement detection and automatic slide/chart classification are not implemented. An event-bus rewrite is not part of this work.
+- Silero VAD is used in diarization; clip boundaries use transcript timing heuristics.
+- Facebook/TikTok availability depends on upstream access restrictions and yt-dlp; there is no equivalent in-app YouTube embed for those sources.
+- Best-effort preview quota does not bound temporary files during active transcodes or guarantee deletion when the OS denies it.
+- Passing the local checks is not evidence of live-provider quality or installer readiness. Historical v0.1.0 run IDs, download sizes and signing claims must not be reused as v0.1.4 provenance.
+- `release/linux-pilot-validation.md` remains historical v0.1.0 evidence until its checklist is rerun against a specific new artifact. No release was published by this maintenance pass.

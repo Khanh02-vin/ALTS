@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 const root = join(dirname(fileURLToPath(import.meta.url)), "..", "..");
 const highlight = readFileSync(join(root, "packages/contracts/highlight.ts"), "utf8");
 const contractTest = readFileSync(join(root, "tests/contracts/contracts.test.ts"), "utf8");
-const state = readFileSync(join(root, "apps/web/src/lib/studio-state.svelte.ts"), "utf8");
 const store = readFileSync(join(root, "apps/desktop/src-tauri/src/project_store.rs"), "utf8");
 const studio = readFileSync(join(root, "apps/web/src/lib/pages/Studio.svelte"), "utf8");
 const editor = readFileSync(join(root, "apps/web/src/lib/pages/Editor.svelte"), "utf8");
@@ -22,7 +21,6 @@ assert.match(contractTest, /status:\s*"saved"/, "contract tests must cover saved
 assert.match(contractTest, /status:\s*"archived"/i, "contract tests must reject unknown status");
 
 // --- Shared state / Project wiring ---
-assert.match(state, /activeHighlights|activeSelectedIds/, "shared state must derive active highlight set");
 assert.match(project, /active|discard/, "Projects page must restore active selection excluding discarded");
 
 // --- Studio wiring ---

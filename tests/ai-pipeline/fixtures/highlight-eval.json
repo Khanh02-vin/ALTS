@@ -104,6 +104,36 @@
         { "start": 10, "end": 24, "title": "The customer email" },
         { "start": 52, "end": 66, "title": "Pinned above the desk" }
       ]
+    },
+    {
+      "id": "vlog-rambling",
+      "note": "Length-bias probe: five long rambling filler windows saturate the word-count score; the real insight is short and carries no hook word. A length-agnostic ranker must still find it.",
+      "segments": [
+        { "start": 0, "end": 22, "text": "So we went to the store and bought some things and then we walked around for a while and talked about nothing at all." },
+        { "start": 22, "end": 44, "text": "The weather was fine and the drive was long but we did not mind because the music was good and the road was mostly empty." },
+        { "start": 44, "end": 66, "text": "Later that afternoon we sat on the porch and watched the clouds move slowly over the hills and nobody said a word for a while." },
+        { "start": 66, "end": 88, "text": "Then we made some coffee and talked about the old house and the people who used to live there before the road was rebuilt." },
+        { "start": 88, "end": 110, "text": "By evening the light turned orange and we packed up the chairs and drove home with the windows down and the radio low." },
+        { "start": 110, "end": 120, "text": "Nobody pays for the software, they pay for the outcome." }
+      ],
+      "expected": [
+        { "start": 110, "end": 120, "title": "Pay for the outcome" }
+      ]
+    },
+    {
+      "id": "short-hook",
+      "note": "Length-bias probe, winnable side: five long rambling filler windows saturate the word-count score; the true highlight is a short line with a hook keyword. Only a hook-weighted ranker can recover it.",
+      "segments": [
+        { "start": 0, "end": 24, "text": "We started the day early and the bus was late so we stood in the cold and waited with the other people on the corner." },
+        { "start": 24, "end": 48, "text": "At noon we found a small cafe and ordered soup and talked about the trip and where we might go the next weekend." },
+        { "start": 48, "end": 72, "text": "The afternoon passed slowly and the rain came in through the open window so we moved to the back of the room." },
+        { "start": 72, "end": 96, "text": "Someone brought a guitar and we sang along badly until the owner asked us politely to stop and let the room rest." },
+        { "start": 96, "end": 120, "text": "Later the streets were quiet and we walked back to the hotel with wet shoes and talked about the day and nothing else." },
+        { "start": 120, "end": 130.2, "text": "The biggest mistake is shipping features nobody really asked for." }
+      ],
+      "expected": [
+        { "start": 120, "end": 130.2, "title": "Shipping unasked features" }
+      ]
     }
   ]
 }

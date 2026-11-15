@@ -5,27 +5,26 @@ import { componentScoreMetadata, scoreHighlightComponents, type AudioRmsFeatures
 
 const HOOK_WORDS = /\b(how|why|secret|mistake|important|best|never|first|problem|solution|learn|key)\b/i;
 const PAUSE_SECONDS = 0.7;
-// Each candidate window covers this many seconds. Long enough to cover typical
-// highlight lengths, short enough to stay inside a single sentence.
-// Step equals window length, so windows are non-overlapping and stable across
-// engines that segment the same audio differently (e.g. openai-whisper vs
-// whisper.cpp).
-const WINDOW_SECONDS = 10.0;
-const WINDOW_STEP_SECONDS = 5.0;
+const SENTENCE_END = /[.!?]["')\]]?$/;
+// A candidate window may not exceed this many seconds. Whisper segments rarely
+// run longer; without a cap an engine that emits neither punctuation nor pauses
+// would collapse a whole recording into one highlight.
+const MAX_WINDOW_SECONDS = 30.0;
 // A window must contain at least this many seconds of audio to be a candidate.
 const MIN_WINDOW_SECONDS = 4.0;
-// Two chosen highlights may not overlap at all. Keeps highlights distinct and
-// satisfies validateHighlights (no overlapping ranges).
-const NMS_IOU_THRESHOLD = 0.0;
 
 /** Builds candidate windows over a transcript. Two strategies:
- *  1) Word-based sliding windows: slide a fixed-size window across the word
- *     timeline at WINDOW_STEP_SECONDS. Stable across engines that segment the
- *     same audio differently (e.g. openai-whisper vs whisper.cpp).
+ *  1) Sentence groups: split the word timeline at sentence-final punctuation and
+ *     pauses >= PAUSE_SECONDS, so a candidate never cuts a sentence in half.
+ *     Both signals live on the words themselves, so the same audio yields the
+ *     same candidates regardless of how an engine groups words into segments
+ *     (e.g. openai-whisper vs whisper.cpp).
  *  2) Segment-anchored fallback: when there are no words at all (e.g. manual
  *     transcript), use each segment as one candidate window.
- * The result is a set of non-overlapping candidates selected by score via NMS. */
-function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Array<{
+ * The result is a set of non-overlapping candidates selected by score via NMS.
+ * Exported with nonMaximumSuppression so the eval can re-rank the exact same
+ * candidate set with alternative scorers instead of duplicating windowing. */
+export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Array<{
   start: number;
   end: number;
   wordIds: string[];
@@ -79,41 +78,53 @@ function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Arra
   };
 
   if (words.length > 0) {
-    // Sliding-window mode: slide a fixed-size window across the word timeline.
-    // Step equals window length, so windows are non-overlapping and stable.
-    let windowStart = 0;
-    while (windowStart < transcript.duration) {
-      const windowEnd = Math.min(windowStart + WINDOW_SECONDS, transcript.duration);
-      if (transcript.duration - windowStart < MIN_WINDOW_SECONDS) break;
-      const windowWords = words.filter(
-        (w) => w.start >= windowStart && w.start < windowEnd,
-      );
-      if (windowWords.length === 0) {
-        windowStart += WINDOW_STEP_SECONDS;
-        continue;
+    type Group = { start: number; end: number; words: typeof words };
+
+    // Sentence mode: walk the words and cut at sentence ends, pauses and the
+    // max-length cap. Boundaries come from the words, never from a clock tick,
+    // so a candidate is the same span no matter which engine produced the words.
+    const groups: Group[] = [];
+    let group: Group | undefined;
+    for (let i = 0; i < words.length; i++) {
+      const word = words[i]!;
+      const prev = words[i - 1];
+      if (
+        group && prev &&
+        (SENTENCE_END.test(prev.text.trim()) ||
+          word.start - prev.end >= PAUSE_SECONDS ||
+          word.end - group.start > MAX_WINDOW_SECONDS)
+      ) {
+        groups.push(group);
+        group = undefined;
       }
-      const s = windowWords[0].start;
-      const e = Math.min(
-        windowWords[windowWords.length - 1].end,
-        windowEnd,
+      group ??= { start: word.start, end: word.end, words: [] };
+      group.end = word.end;
+      group.words.push(word);
+    }
+    if (group) groups.push(group);
+
+    for (const candidate of groups) {
+      if (candidate.end - candidate.start < MIN_WINDOW_SECONDS) continue;
+      const text = candidate.words.map((w) => w.text).join(" ");
+      const hook = candidate.words.some((w) => HOOK_WORDS.test(w.text));
+      const complete = SENTENCE_END.test(
+        candidate.words[candidate.words.length - 1]!.text.trim(),
       );
-      if (e - s < MIN_WINDOW_SECONDS) {
-        windowStart += WINDOW_STEP_SECONDS;
-        continue;
-      }
-      const text = windowWords.map((w) => w.text).join(" ");
-      const hook = windowWords.some((w) => HOOK_WORDS.test(w.text));
-      const complete = /[.!?]$/.test(
-        windowWords[windowWords.length - 1].text.trim(),
-      );
-      const prevWord = words.findLast((w) => w.end <= windowStart);
-      const nextWord = words.find((w) => w.start >= windowEnd);
-      const gapBefore = prevWord ? windowStart - prevWord.end : 0;
-      const gapAfter = nextWord ? nextWord.start - windowEnd : 0;
+      const prevWord = words.findLast((w) => w.end <= candidate.start);
+      const nextWord = words.find((w) => w.start >= candidate.end);
+      const gapBefore = prevWord ? candidate.start - prevWord.end : 0;
+      const gapAfter = nextWord ? nextWord.start - candidate.end : 0;
       const pauseBoundary =
         gapBefore >= PAUSE_SECONDS || gapAfter >= PAUSE_SECONDS;
-      addWindow(s, e, windowWords.map((w) => w.id), text, hook, complete, pauseBoundary);
-      windowStart += WINDOW_STEP_SECONDS;
+      addWindow(
+        candidate.start,
+        candidate.end,
+        candidate.words.map((w) => w.id),
+        text,
+        hook,
+        complete,
+        pauseBoundary,
+      );
     }
   } else {
     // No words at all: each segment is one candidate window.
@@ -122,7 +133,7 @@ function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Arra
       if (duration < MIN_WINDOW_SECONDS) continue;
       const text = segment.text.trim();
       const hook = HOOK_WORDS.test(text);
-      const complete = /[.!?]$/.test(text);
+      const complete = SENTENCE_END.test(text);
       const prevSegment = transcript.segments.findLast(
         (s) => s.end <= segment.start,
       );
@@ -148,16 +159,10 @@ function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Arra
   return windows;
 }
 
-function iou(a: { start: number; end: number }, b: { start: number; end: number }): number {
-  const intersection = Math.max(0, Math.min(a.end, b.end) - Math.max(a.start, b.start));
-  const union = Math.max(a.end, b.end) - Math.min(a.start, b.start);
-  return union > 0 ? intersection / union : 0;
-}
-
 /** Non-maximum suppression: keep the highest-scoring window, drop any later window
  *  that overlaps it at all, repeat. Result is sorted by start time so highlights
  *  appear in chronological order and never overlap (satisfies validateHighlights). */
-function nonMaximumSuppression(
+export function nonMaximumSuppression(
   windows: Array<{ start: number; end: number; score: number }>,
   limit: number,
 ): Array<{ start: number; end: number; score: number }> {
@@ -184,12 +189,12 @@ export function chooseHeuristicHighlights(transcript: Transcript, limit = 5, aud
     title: w.text.slice(0, 80),
     hook: w.hook ? w.text.slice(0, 100) : undefined,
     score: w.score,
-    ...componentScoreMetadata(w.scores),
+    ...componentScoreMetadata(w.scores, undefined, audioRms !== undefined),
     reason: [
       ...(w.hook ? ["hook keyword"] : []),
       ...(w.complete ? ["complete sentence"] : []),
       ...(w.pauseBoundary ? ["pause boundary"] : []),
-      "word window",
+      "sentence group",
     ]
       .filter(Boolean)
       .join(", "),

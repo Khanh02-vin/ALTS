@@ -30,6 +30,8 @@ export type Highlight = {
   scores?: HighlightScores;
   /** Optional only for compatibility with highlights persisted before axis scoring. */
   dominantAxis?: HighlightAxis;
+  /** False when hook/impact were scored from text alone; absent on highlights persisted before this flag. */
+  scoreAudio?: boolean;
   reason?: string;
   /** Optional link to a transcript outline entry. */
   outlineId?: string;
@@ -67,6 +69,9 @@ export function validateHighlights(highlights: Highlight[], duration: number): v
       }
     } else if (highlight.dominantAxis !== undefined) {
       throw new Error("Invalid highlight axis without component scores");
+    }
+    if (highlight.scoreAudio !== undefined && typeof highlight.scoreAudio !== "boolean") {
+      throw new Error("Invalid highlight audio provenance");
     }
     if (highlight.status !== undefined && highlight.status !== "active" && highlight.status !== "saved" && highlight.status !== "discarded") {
       throw new Error("Invalid highlight status");

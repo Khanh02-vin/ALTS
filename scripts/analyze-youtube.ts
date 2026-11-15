@@ -9,9 +9,10 @@ import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collecti
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
 import { buildScriptOutline, associateHighlightsWithOutline, buildSummaryVariants } from "../services/ai-pipeline/script-outline.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
-import { mkdir, rename, writeFile } from "node:fs/promises";
+import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
+import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 function createSemanticProvider(strategy: string): SemanticHighlightProvider | undefined {
   const geminiKey = process.env.GEMINI_API_KEY ?? "";
@@ -78,10 +79,14 @@ try {
     if (message !== "YOUTUBE_AUDIO_FALLBACK_ONLY" && !message.startsWith("YOUTUBE_TRANSCRIPT_UNAVAILABLE:")) throw error;
     const audioPath = process.env.ANALYSIS_PREEXTRACTED_AUDIO;
     if (!audioPath) throw new Error(YOUTUBE_AUDIO_FALLBACK_REQUIRED);
+    // The fallback already downloaded a 16 kHz mono WAV, so score audio energy from
+    // it too — otherwise this branch reports text-only axes for the same clip that a
+    // local analysis scores with audio.
+    const audioRms = parsePcm16WavRms(await readFile(audioPath));
     store.update(jobId, { phase: "transcribe", progress: 0.15 });
     const strategy = resolveHighlightStrategy();
     const semanticProvider = createSemanticProvider(strategy);
-    const analysisOptions = { command: process.env.WHISPER_COMMAND, engine: process.env.WHISPER_ENGINE === "python" ? "python" as const : "cpp" as const, model: process.env.WHISPER_MODEL, modelPath: process.env.WHISPER_MODEL_PATH, language: process.env.WHISPER_LANGUAGE, device: process.env.WHISPER_DEVICE, fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true", sourceDuration: duration, shouldAbort: () => interrupted, onProgress: (completed: number, total: number) => store.update(jobId, { phase: "transcribe", progress: 0.15 + 0.7 * completed / total }) };
+    const analysisOptions = { command: process.env.WHISPER_COMMAND, engine: process.env.WHISPER_ENGINE === "python" ? "python" as const : "cpp" as const, model: process.env.WHISPER_MODEL, modelPath: process.env.WHISPER_MODEL_PATH, language: process.env.WHISPER_LANGUAGE, device: process.env.WHISPER_DEVICE, fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true", sourceDuration: duration, shouldAbort: () => interrupted, onProgress: (completed: number, total: number) => store.update(jobId, { phase: "transcribe", progress: 0.15 + 0.7 * completed / total }), audioRms };
     const result = semanticProvider
       ? await analyzeLocalVideoWithSemantic(audioPath, url, duration, { ...analysisOptions, semanticProvider, semanticLimit: 5 })
       : await analyzeLocalVideo(audioPath, url, duration, analysisOptions);

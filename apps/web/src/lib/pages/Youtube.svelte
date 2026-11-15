@@ -63,7 +63,7 @@
   let ingestUrl = $state("");
   let ingestTitle = $state("");
   let ingestText = $state("");
-  // Kênh của tôi (Option C — OAuth own-channel)
+  // My channel (Option C — OAuth own-channel)
   let ytConnected = $state(false);
   let ytVideos = $state<{ videoId: string; title: string; publishedAt: string }[]>([]);
   let ytBusy = $state(false);
@@ -75,28 +75,28 @@
     try { const s = await invoke<{ connected: boolean }>("youtube_oauth_status"); ytConnected = s.connected; if (s.connected && !ytVideos.length) await loadOwnVideos(); } catch { /* browser */ }
   }
   async function connectYouTube() {
-    if (!isTauri()) { ytStatus = "OAuth chạy trong app desktop — tab browser không kết nối được."; return; }
-    ytBusy = true; ytStatus = "Mở trình duyệt để đăng nhập Google…";
+    if (!isTauri()) { ytStatus = "OAuth runs in the desktop app only — this browser tab cannot connect."; return; }
+    ytBusy = true; ytStatus = "Opening your browser to sign in to Google…";
     try {
       await invoke("youtube_oauth_start");
       for (let i = 0; i < 120; i++) {
         await new Promise(r => setTimeout(r, 1500));
         const s = await invoke<{ connected: boolean }>("youtube_oauth_status");
-        if (s.connected) { ytConnected = true; ytStatus = "Đã kết nối kênh YouTube."; await loadOwnVideos(); return; }
+        if (s.connected) { ytConnected = true; ytStatus = "YouTube channel connected."; await loadOwnVideos(); return; }
       }
-      ytStatus = "Hết thời gian chờ đăng nhập — thử lại.";
+      ytStatus = "Sign-in timed out — try again.";
     } catch (e) { ytStatus = String(e); } finally { ytBusy = false; }
   }
   async function loadOwnVideos() {
-    try { const data = await invoke<{ channel: string; videos: { videoId: string; title: string; publishedAt: string }[] }>("youtube_channel_videos"); ytVideos = data.videos; ytStatus = `Kênh: ${data.channel} · ${data.videos.length} video`; }
+    try { const data = await invoke<{ channel: string; videos: { videoId: string; title: string; publishedAt: string }[] }>("youtube_channel_videos"); ytVideos = data.videos; ytStatus = `Channel: ${data.channel} · ${data.videos.length} videos`; }
     catch (e) { ytStatus = String(e); }
   }
   async function ingestOwn(v: { videoId: string; title: string }) {
     ytIngestId = v.videoId;
-    try { const r = await invoke<{ videoId: string; segments: number }>("youtube_ingest_captions", { videoId: v.videoId }); ytStatus = `Indexed ${r.segments} segments từ "${v.title}" — tìm được bằng ô search.`; }
+    try { const r = await invoke<{ videoId: string; segments: number }>("youtube_ingest_captions", { videoId: v.videoId }); ytStatus = `Indexed ${r.segments} segments from "${v.title}" — searchable below.`; }
     catch (e) { ytStatus = String(e); } finally { ytIngestId = ""; }
   }
-  async function disconnectYouTube() { await invoke("youtube_oauth_disconnect").catch(() => {}); ytConnected = false; ytVideos = []; ytStatus = "Đã ngắt kết nối kênh."; }
+  async function disconnectYouTube() { await invoke("youtube_oauth_disconnect").catch(() => {}); ytConnected = false; ytVideos = []; ytStatus = "Channel disconnected."; }
 
   // In the desktop app the static webview (origin tauri://localhost) cannot
   // fetch the RAG sidecar directly — webview CSP is default-src 'self'. So we
@@ -160,7 +160,7 @@
   function clearFilters() { videoId = ""; playlistId = ""; topic = ""; }
   let confirmDeleteId = $state("");
   async function deletePlaylist(id: string) {
-    // Two-step confirm: first click arms ("Xóa?"), second click within 3s deletes.
+    // Two-step confirm: first click arms ("Delete?"), second click within 3s deletes.
     if (confirmDeleteId !== id) {
       confirmDeleteId = id;
       setTimeout(() => { if (confirmDeleteId === id) confirmDeleteId = ""; }, 3000);
@@ -186,32 +186,32 @@
 </script>
 
 <main class="bench bench-duo youtube-workspace">
-  <!-- Cột 1: nguồn dữ liệu -->
+  <!-- Column 1: knowledge sources -->
   <aside class="bench-left">
-    <div class="panel"><span class="eyebrow">Knowledge source</span><h1>YouTube Studio</h1><p class="note">Index public playlists, then search their transcripts with timestamp citations.</p></div>
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Kênh của tôi</span></span>{#if ytConnected}<span class="badge ok">connected</span>{/if}</div>
+    <div class="panel"><span class="eyebrow">Knowledge source</span><h1>Video library</h1><p class="note">Index public playlists, then search their transcripts with timestamp citations.</p></div>
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">My channel</span></span>{#if ytConnected}<span class="badge ok">connected</span>{/if}</div>
       {#if !ytConnected}
-        <p class="note">Kết nối kênh YouTube của bạn (OAuth) để lấy transcript qua API chính chủ — hợp lệ, không scrape.</p>
-        <button class="btn btn-primary btn-wide" disabled={ytBusy} onclick={connectYouTube}>{ytBusy ? "Đang chờ đăng nhập…" : "Kết nối kênh YouTube"}</button>
+        <p class="note">Connect your own YouTube channel (OAuth) to pull transcripts through the official API — no scraping.</p>
+        <button class="btn btn-primary btn-wide" disabled={ytBusy} onclick={connectYouTube}>{ytBusy ? "Waiting for sign-in…" : "Connect YouTube channel"}</button>
       {:else}
         <div class="stack">
-          {#if !ytVideos.length}<p class="note">Kênh chưa có video nào.</p>{/if}
+          {#if !ytVideos.length}<p class="note">No videos on this channel yet.</p>{/if}
           {#each ytVideos as v}
             <div class="doc-item">
-              <div class="spread"><strong>{v.title}</strong><button class="btn btn-sm btn-quiet" disabled={ytIngestId === v.videoId} onclick={() => ingestOwn(v)}>{#if ytIngestId === v.videoId}Đang lấy…{:else}<Icon name="caption" size={14} /> Lấy transcript{/if}</button></div>
+              <div class="spread"><strong>{v.title}</strong><button class="btn btn-sm btn-quiet" disabled={ytIngestId === v.videoId} onclick={() => ingestOwn(v)}>{#if ytIngestId === v.videoId}Fetching…{:else}<Icon name="caption" size={14} /> Get transcript{/if}</button></div>
               <span class="note">{v.publishedAt.slice(0, 10)}</span>
             </div>
           {/each}
         </div>
-        <button class="btn btn-quiet btn-wide" onclick={disconnectYouTube}>Ngắt kết nối</button>
+        <button class="btn btn-quiet btn-wide" onclick={disconnectYouTube}>Disconnect</button>
       {/if}
       {#if ytStatus}<div class="status-inline" aria-live="polite">{ytStatus}</div>{/if}
     </div>
     <div class="panel"><div class="panel-title"><span class="eyebrow">Add playlist</span></div><label class="field"><span class="field-label">Playlist URL</span><input aria-label="YouTube playlist URL" placeholder="https://youtube.com/playlist?..." bind:value={playlistUrl} /></label><button class="btn btn-primary btn-wide" disabled={adding || !playlistUrl.trim()} onclick={addPlaylist}>{adding ? "Queueing…" : "Queue crawl"}</button>{#if statusKind === "crawl"}<div class="status-inline" aria-live="polite">{status}</div>{/if}</div>
-    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<div class="doc-item playlist-item" class:on={playlist.id === playlistId}><button class="playlist-select" onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button><button class="playlist-delete" class:confirm={confirmDeleteId === playlist.id} aria-label={confirmDeleteId === playlist.id ? `Confirm delete ${playlist.title || playlist.playlistId}` : `Delete ${playlist.title || playlist.playlistId}`} onclick={(event) => { event.stopPropagation(); deletePlaylist(playlist.id); }}>{#if confirmDeleteId === playlist.id}Xóa?{:else}<Icon name="x" size={14} />{/if}</button></div>{/each}{/if}</div></div>
+    <div class="panel"><div class="panel-head"><span class="panel-title"><span class="eyebrow">Playlists</span></span><button class="btn btn-sm btn-quiet" onclick={loadPlaylists}>Refresh</button></div><div class="stack">{#if !playlists.length}<p class="note">No playlists registered yet.</p>{:else}{#each playlists as playlist}<div class="doc-item playlist-item" class:on={playlist.id === playlistId}><button class="playlist-select" onclick={() => playlistId = playlist.playlistId}><span class="spread"><strong>{playlist.title || playlist.playlistId}</strong><span class="badge" class:ok={playlist.status === "indexed"}>{playlist.status}</span></span><span class="doc-text">{playlist.playlistUrl}</span></button><button class="playlist-delete" class:confirm={confirmDeleteId === playlist.id} aria-label={confirmDeleteId === playlist.id ? `Confirm delete ${playlist.title || playlist.playlistId}` : `Delete ${playlist.title || playlist.playlistId}`} onclick={(event) => { event.stopPropagation(); deletePlaylist(playlist.id); }}>{#if confirmDeleteId === playlist.id}Delete?{:else}<Icon name="x" size={14} />{/if}</button></div>{/each}{/if}</div></div>
   </aside>
 
-  <!-- Cột 2: search + filters gọn + kết quả -->
+  <!-- Column 2: search, filters and results -->
   <section class="bench-center"><div class="stage">
     <div class="stage-head"><div class="stage-title"><span class="badge volt">indexed search</span><span class="stage-name">Ask your video library</span></div></div>
     <div class="stage-body">
@@ -220,7 +220,7 @@
         <button class="btn btn-primary" disabled={loading || !question.trim()} onclick={search}>{loading ? "Searching…" : "Search"}</button>
       </div>
 
-      <!-- filters: toggle + chips thay vì panel phơi ra -->
+      <!-- filters: toggle + chips instead of an always-open panel -->
       <div class="filters-row">
         <button class="btn btn-sm btn-quiet" onclick={() => showFilters = !showFilters}><Icon name="settings" size={14} /> Filters{#if filterCount}&nbsp;·&nbsp;{filterCount} active{/if}</button>
         {#if videoId.trim()}<span class="chip">Video: {videoId.trim()}<button aria-label="Clear video filter" onclick={() => videoId = ""}><Icon name="x" size={12} /></button></span>{/if}
@@ -251,7 +251,7 @@
     </div>
   </div></section>
 
-  <!-- manual ingest: modal render có điều kiện (tránh hydration claim lệch với modal luôn-tồn-tại ở root) -->
+  <!-- manual ingest: modal rendered conditionally (an always-mounted root modal would desync hydration) -->
   {#if showIngest}
       <div class="modal-back open" role="presentation" onpointerdown={(event) => { if (event.target === event.currentTarget) closeIngest(); }}>
         <div class="modal" bind:this={ingestDialog} role="dialog" aria-modal="true" aria-labelledby="manual-ingest-title" tabindex="-1" onkeydown={trapIngestFocus}>

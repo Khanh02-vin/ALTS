@@ -20,7 +20,7 @@ const store = readFileSync(join(root, "apps/desktop/src-tauri/src/project_store.
 const ranking = readFileSync(join(root, "packages/media-engine/related-videos/index.ts"), "utf8");
 
 assert.match(studio, /selectedIds\s*=\s*\$state<string\[]>/, "Studio must support persisted multi-selection");
-assert.match(studio, /function toggleCandidate/, "candidate selection must be toggleable");
+assert.match(studio, /function keepClip/, "keeping a candidate must toggle its export selection");
 assert.match(studio, /async function renderSelected/, "selected clips must render as a batch");
 assert.match(studio, /request:\s*\{ input:\s*inputPath,\s*output,\s*plan\s*\}\s*satisfies\s*RenderRequest/, "render must pass input, output and the selected RenderPlan as one typed request");
 assert.match(studio, /selectedIds\s*,\s*plans:/, "multi-selection must be saved on the project");

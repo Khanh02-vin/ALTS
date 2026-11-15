@@ -20,8 +20,6 @@ export type RuntimeInfo = {
   whisperCppModels?: Array<{ name: string; path: string; ready: boolean; bytes?: number }>;
   bundled: { node: boolean; ffmpeg: boolean; ffprobe: boolean; whisperCli?: boolean; whisperModel?: boolean };
   loaded: boolean;
-  // Whisper bootstrap progress (phase 0=not started, 1=installing, 2=copying model, 3=ready, 4=error)
-  whisperBootstrap: { phase: number; progress: number; message: string; error?: string } | null;
 };
 
 export const runtimeStore = $state<RuntimeInfo>({
@@ -35,7 +33,6 @@ export const runtimeStore = $state<RuntimeInfo>({
   bundled: { node: false, ffmpeg: false, ffprobe: false, whisperCli: false, whisperModel: false },
   whisperCppSmokePassed: false,
   loaded: false,
-  whisperBootstrap: null,
 });
 
 
@@ -103,38 +100,6 @@ export async function setupWhisperCpp(): Promise<void> {
   if (!isTauri()) throw new Error("WHISPER_CPP_DESKTOP_ONLY");
   await invoke("setup_whisper_cpp");
   await refreshRuntime(true);
-}
-
-let bootstrapPoll: ReturnType<typeof setInterval> | null = null;
-
-export async function startWhisperBootstrap(): Promise<void> {
-  if (!isTauri()) return;
-  // Kick off the bootstrap
-  await invoke("bootstrap_whisper");
-  // Start polling
-  bootstrapPoll = setInterval(async () => {
-    if (!isTauri()) { stopBootstrapPoll(); return; }
-    try {
-      const status = await invoke<{ phase: number; progress: number; message: string; error?: string } | null>("whisper_bootstrap_status");
-      if (status) {
-        runtimeStore.whisperBootstrap = { phase: status.phase, progress: status.progress, message: status.message, error: status.error };
-        if (status.phase === 3 || status.phase === 4) {
-          // 3 = ready, 4 = error - stop polling
-          stopBootstrapPoll();
-          // Refresh full runtime status to pick up the new Whisper state
-          await refreshRuntime(true);
-        }
-      } else {
-        stopBootstrapPoll();
-      }
-    } catch {
-      stopBootstrapPoll();
-    }
-  }, 1000);
-}
-
-export function stopBootstrapPoll(): void {
-  if (bootstrapPoll) { clearInterval(bootstrapPoll); bootstrapPoll = null; }
 }
 
 export function formatBytes(bytes: number) { return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`; }

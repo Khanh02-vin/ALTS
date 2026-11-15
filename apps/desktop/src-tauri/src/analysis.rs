@@ -18,7 +18,7 @@ use crate::paths::{
     is_remote_input, jobs_path, node_bin, probe_duration, runtime_env, tool, venv_python,
 };
 use crate::runtime::storage;
-use crate::youtube::youtube_video_url;
+use crate::youtube::{configured_cookie_args, remote_route, RemoteRoute};
 use crate::{guard_pro_features, io_error};
 
 pub(crate) static ANALYSIS_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -110,7 +110,7 @@ fn prepare_remote_analysis_audio(
     job_id: &str,
 ) -> Result<AnalysisAudioCleanup, String> {
     let input_url = input.to_string_lossy();
-    if !youtube_video_url(&input_url) {
+    if remote_route(&input_url).is_none() {
         return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }
     let temp_dir = app_render_temp_dir(app).map_err(|e| format!("APP_TEMP_DIR:{e}"))?;
@@ -124,9 +124,11 @@ fn prepare_remote_analysis_audio(
     let result = (|| -> Result<(), String> {
         let python = venv_python();
         if !python.is_file() {
-            return Err("PYTHON_VENV_MISSING: remote audio fallback requires yt-dlp".into());
+            return Err("PYTHON_VENV_MISSING: remote links need the app Python environment — click \"Setup Whisper\" in Settings to prepare it".into());
         }
         let template = work_dir.join("source.%(ext)s");
+        let cookies =
+            configured_cookie_args().map_err(|e| format!("ANALYSIS_AUDIO_DOWNLOAD:{e}"))?;
         let output = tool(&python)
             .args([
                 "-I",
@@ -134,9 +136,11 @@ fn prepare_remote_analysis_audio(
                 "yt_dlp",
                 "--no-playlist",
                 "-f",
-                "bestaudio",
+                // Facebook often only offers a muxed format, so fall back to "best".
+                "bestaudio/best",
                 "-o",
             ])
+            .args(&cookies)
             .arg(&template)
             .arg(input)
             .output()
@@ -255,8 +259,8 @@ pub(crate) fn start_analysis(
     let range_end = end.unwrap_or(duration);
     let init_script = helper_script(&app, "analysis-init.ts")?;
     if !analysis_range_allowed(range_start, range_end) || range_end > duration {
-        return Err(if range_end - range_start > 600.0 {
-            "ANALYZE_RANGE_EXCEEDS_600_SECONDS: select a shorter range".into()
+        return Err(if range_end - range_start > 1800.0 {
+            "ANALYZE_RANGE_EXCEEDS_1800_SECONDS: select a range of 30 minutes or less".into()
         } else {
             "INVALID_ANALYZE_RANGE".into()
         });
@@ -402,13 +406,21 @@ pub(crate) fn spawn_analysis_worker_reserved(
     thread::spawn(move || {
         let _slot = slot;
         let run = (|| -> Result<String, String> {
-            if is_remote_input(&input.to_string_lossy())
-                && !youtube_video_url(&input.to_string_lossy())
-            {
+            let route = remote_route(&input.to_string_lossy());
+            if is_remote_input(&input.to_string_lossy()) && route.is_none() {
                 return Err("INVALID_PUBLIC_VIDEO_URL".into());
             }
+            // Facebook/TikTok expose no caption track: download the audio (yt-dlp →
+            // 16 kHz mono WAV) and hand it to the same Whisper worker local files use.
+            // The guard deletes the download when this worker thread finishes.
+            let remote_audio = match route {
+                Some(RemoteRoute::Audio) => {
+                    Some(prepare_remote_analysis_audio(&app, &input, &job_id)?)
+                }
+                _ => None,
+            };
             let mut cmd = tool(node_bin(&app));
-            if is_remote_input(&input.to_string_lossy()) {
+            if matches!(route, Some(RemoteRoute::Captions)) {
                 // YouTube URL: text-only pipeline (captions via crawler), no Whisper chunks.
                 let python = venv_python();
                 if !python.is_file() {
@@ -426,9 +438,15 @@ pub(crate) fn spawn_analysis_worker_reserved(
                     .env("YT_CRAWLER", helper_script(&app, "yt-crawler.py")?);
             } else {
                 let script = helper_script(&app, "analyze-video.ts")?;
+                // A downloaded remote WAV replaces the input path as the media file;
+                // the artifact id stays the original URL so the result points at it.
+                let media_path = remote_audio
+                    .as_ref()
+                    .and_then(|cleanup| cleanup.path())
+                    .unwrap_or(input.as_path());
                 cmd.args(NODE_ARGS)
                     .arg(script)
-                    .arg(&input)
+                    .arg(media_path)
                     .arg(input.to_string_lossy().as_ref())
                     .arg(format!("{duration:.3}"))
                     .arg(format!("{range_start:.3}"))
@@ -439,7 +457,13 @@ pub(crate) fn spawn_analysis_worker_reserved(
             for (key, value) in helper_env(&app, &[]) {
                 cmd.env(key, value);
             }
-            set_analysis_audio_env(&mut cmd, audio_cleanup.path());
+            set_analysis_audio_env(
+                &mut cmd,
+                remote_audio
+                    .as_ref()
+                    .and_then(|cleanup| cleanup.path())
+                    .or_else(|| audio_cleanup.path()),
+            );
             // BELOW_NORMAL keeps the webview responsive while whisper/ffmpeg saturate
             // the CPU — every grandchild inherits the parent's priority class. Must go
             // through the group builder: its spawn() REPLACES the Command's creation
@@ -451,6 +475,7 @@ pub(crate) fn spawn_analysis_worker_reserved(
                                                          // Object with KILL_ON_JOB_CLOSE (Windows): one kill reaches the whisper
                                                          // and chunk-ffmpeg grandchildren on every platform we ship, and a crashed
                                                          // app can no longer leave an orphaned tree behind.
+            crate::spawn_guard::set_parent_death_sig(&mut cmd);
             use command_group::CommandGroup;
             let mut group = cmd.group();
             #[cfg(windows)]
@@ -468,7 +493,7 @@ pub(crate) fn spawn_analysis_worker_reserved(
             let output = output?;
             if !output.status.success() {
                 let message = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-                if is_remote_input(&input.to_string_lossy())
+                if matches!(route, Some(RemoteRoute::Captions))
                     && message
                         .lines()
                         .any(|line| line.trim() == YOUTUBE_AUDIO_FALLBACK_REQUIRED)
@@ -489,6 +514,7 @@ pub(crate) fn spawn_analysis_worker_reserved(
                         retry.env(key, value);
                     }
                     set_analysis_audio_env(&mut retry, audio_cleanup.path());
+                    crate::spawn_guard::set_parent_death_sig(&mut retry);
                     let mut retry_group = retry.group();
                     #[cfg(windows)]
                     retry_group.creation_flags(group_flags);
@@ -609,7 +635,7 @@ pub(crate) fn resume_queued_jobs(app: tauri::AppHandle, jobs: Jobs) {
             continue;
         }
         let path = PathBuf::from(input);
-        if is_remote_input(input) && !youtube_video_url(input) {
+        if is_remote_input(input) && remote_route(input).is_none() {
             let _ = store.fail(id, "INVALID_PUBLIC_VIDEO_URL");
             remove_existing_analysis_audio(&app, id);
             continue;
@@ -693,7 +719,7 @@ pub(crate) fn retry_analysis(
         return Err("JOB_NOT_FOUND".into());
     };
     let path = PathBuf::from(input);
-    if is_remote_input(input) && !youtube_video_url(input) {
+    if is_remote_input(input) && remote_route(input).is_none() {
         let _ = store.fail(&id, "INVALID_PUBLIC_VIDEO_URL");
         return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }

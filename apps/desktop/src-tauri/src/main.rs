@@ -16,6 +16,7 @@ mod providers;
 mod render;
 mod runtime;
 mod shell;
+mod spawn_guard;
 mod youtube;
 
 use analysis::{
@@ -34,7 +35,7 @@ use diarization::{
     save_diarization_token,
 };
 use paths::*;
-use preview::prepare_video_preview;
+use preview::{delete_video_preview, prepare_video_preview};
 use providers::{
     activate_ai_provider, delete_ai_provider, highlight_strategy_status, list_ai_providers,
     save_ai_provider, set_highlight_strategy,
@@ -55,6 +56,28 @@ impl Drop for RunningGuard {
         self.0.store(false, Ordering::SeqCst);
     }
 }
+
+/// Brings the already-running window back for a second launch.
+///
+/// On GTK3/mutter, `unminimize()`, `show()` and `set_focus()` are all no-ops
+/// once the window is iconified: tao forwards focus only while its own
+/// `minimized` flag is false, and that flag clears on a window-state event
+/// that never arrives. `present()` is the call that restores an iconified
+/// window, so without it a relaunch looks like it did nothing at all.
+fn restore_main_window(window: &tauri::WebviewWindow) {
+    let _ = window.unminimize();
+    #[cfg(target_os = "linux")]
+    {
+        use gtk::prelude::GtkWindowExt;
+        if let Ok(gtk_window) = window.gtk_window() {
+            gtk_window.present();
+            return;
+        }
+    }
+    let _ = window.show();
+    let _ = window.set_focus();
+}
+
 fn main() {
     install_panic_hook();
     // Move durable data out of the legacy ~/.cache root before anything reads it
@@ -97,9 +120,7 @@ fn main() {
         // used to re-run Tauri's setup and panic on the duplicate `main` webview.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
+                restore_main_window(&window);
             }
         }))
         .manage(jobs)
@@ -147,6 +168,7 @@ fn main() {
             start_analysis,
             youtube::start_youtube_analysis,
             youtube::preview_origin,
+            youtube::cookies_browser,
             analysis_status,
             list_analysis_jobs,
             retry_analysis,
@@ -156,6 +178,7 @@ fn main() {
             list_video_files,
             save_recording,
             prepare_video_preview,
+            delete_video_preview,
             render::render_video,
             render::cancel_render,
             render::recover_render_jobs,
@@ -187,6 +210,8 @@ fn main() {
         .build(tauri::generate_context!())
         .expect("error while building desktop application");
     let _ = APP_HANDLE.set(app.handle().clone());
+    #[cfg(unix)]
+    signals::install_termination_handler(app.handle().clone());
     let llama_shutdown = llama_state.clone();
     let rag_shutdown = rag_state.clone();
     app.run(move |_handle, event| {
@@ -195,6 +220,62 @@ fn main() {
             stop_analysis_workers();
         }
     });
+}
+
+/// `kill`, a systemd stop or a desktop logout used to end the process before Tauri's
+/// exit path ran, so `RunEvent::Exit` never fired and the detached sidecars outlived
+/// the app.
+#[cfg(unix)]
+mod signals {
+    use std::io::Read;
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    static WAKE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn wake(_signal: libc::c_int) {
+        // Only async-signal-safe work here: a byte on the socket wakes the thread
+        // below, which can run ordinary shutdown code. Ignoring a failed write is
+        // fine — the reader is already awake or about to be.
+        let fd = WAKE_FD.load(Ordering::Relaxed);
+        if fd >= 0 {
+            unsafe { libc::write(fd, b"x".as_ptr().cast(), 1) };
+        }
+    }
+
+    /// A caught signal is reset to SIG_DFL by `exec`, so children keep the default
+    /// disposition. A blocked mask would instead be inherited, and the `kill -TERM`
+    /// we send to the node sidecar would sit there unhandled forever.
+    pub(super) fn install_termination_handler(app: tauri::AppHandle) {
+        let (reader, writer) = match UnixStream::pair() {
+            Ok(pair) => pair,
+            Err(error) => {
+                eprintln!("cannot watch termination signals: {error}");
+                return;
+            }
+        };
+        WAKE_FD.store(writer.into_raw_fd(), Ordering::Relaxed);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            unsafe {
+                libc::signal(signal, wake as *const () as libc::sighandler_t);
+            }
+        }
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut byte = [0u8; 1];
+            loop {
+                match reader.read(&mut byte) {
+                    Ok(0) => continue,
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => return,
+                }
+            }
+            // Exit through Tauri so `RunEvent::Exit` stops the sidecars.
+            app.exit(0);
+        });
+    }
 }
 
 #[cfg(test)]
@@ -220,8 +301,8 @@ mod tests {
         sha256_file, write_runtime_env, LLAMA_RUNTIME_ASSETS, LLAMA_VERSION,
     };
     use crate::youtube::{
-        preview_page, preview_query, public_video_url, youtube_search_query, youtube_video_id,
-        youtube_video_url,
+        cookie_browser_args, preview_page, preview_query, public_video_url, remote_route,
+        youtube_search_query, youtube_video_id, youtube_video_url, RemoteRoute,
     };
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
@@ -273,15 +354,68 @@ mod tests {
 
     #[test]
     fn analysis_range_limit_accepts_boundary_and_rejects_excess() {
-        assert!(analysis_range_allowed(0.0, 600.0));
-        assert!(!analysis_range_allowed(0.0, 600.001));
+        assert!(analysis_range_allowed(0.0, 1800.0));
+        assert!(!analysis_range_allowed(0.0, 1800.001));
         assert!(!analysis_range_allowed(10.0, 9.0));
     }
 
+    /// Every remote link is analyzed, but only YouTube has a caption track we can
+    /// read: Facebook and TikTok must go through the audio download + Whisper path.
     #[test]
-    /// The preview cache must evict oldest-first under the cap and never touch
-    /// the newest file — every import adds a regenerable transcode, and nothing
-    /// else ever deleted one.
+    fn remote_route_picks_captions_only_for_youtube() {
+        for url in [
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://youtu.be/dQw4w9WgXcQ",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+        ] {
+            assert_eq!(remote_route(url), Some(RemoteRoute::Captions), "{url}");
+        }
+        for url in [
+            "https://www.facebook.com/watch/?v=123",
+            "https://www.facebook.com/reel/123",
+            "https://fb.watch/abc/",
+            "https://vm.tiktok.com/ZMrabcd123/",
+            "https://www.tiktok.com/@creator/video/7123456789012345678",
+        ] {
+            assert_eq!(remote_route(url), Some(RemoteRoute::Audio), "{url}");
+        }
+        for url in [
+            "http://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://example.com/video",
+            "https://evil-youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLtest",
+            "https://user:pass@www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "https://www.youtube.com:8443/watch?v=dQw4w9WgXcQ",
+            "not a url",
+        ] {
+            assert_eq!(remote_route(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    /// yt-dlp turns `--cookies-from-browser` into a profile lookup, so the value
+    /// crosses into an argv position the user controls from Settings. Only names
+    /// from the allowlist may get there; anything that looks like a path, a flag
+    /// or a `browser:profile` spec is rejected before it can be forwarded.
+    fn cookie_browser_args_accept_only_known_browsers() {
+        assert_eq!(cookie_browser_args("").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            cookie_browser_args(" Firefox ").unwrap(),
+            vec!["--cookies-from-browser", "firefox"]
+        );
+        for bad in [
+            "netscape",
+            "/home/u/.mozilla/firefox",
+            "chrome:Default",
+            "--config-location",
+            "firefox\n--exec",
+        ] {
+            assert!(cookie_browser_args(bad).is_err(), "{bad}");
+        }
+    }
+
+    /// The preview cache evicts published files oldest-first under the cap,
+    /// without counting or deleting in-flight transcodes.
     #[test]
     fn preview_cache_quota_evicts_oldest_first() {
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
@@ -297,8 +431,16 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(cache.join("c.mp4"), b"1234").unwrap();
 
-        // Quota 8 bytes over three 4-byte files: one must go, the oldest.
+        // In-flight transcodes must neither count toward quota nor be evicted.
+        let temporary = cache.join("pending.123.tmp.mp4");
+        std::fs::write(&temporary, b"still transcoding").unwrap();
+
+        // Quota 8 bytes over three 4-byte published files: only the oldest goes.
         preview::enforce_preview_cache_quota_at(&cache, 8);
+        assert!(
+            temporary.exists(),
+            "in-flight transcodes must be left alone"
+        );
         assert!(
             !cache.join("a.mp4").exists(),
             "the oldest preview must be evicted"
@@ -319,6 +461,7 @@ mod tests {
         );
     }
 
+    #[test]
     fn preview_proxy_cache_key_tracks_source_version_and_rejects_remote_inputs() {
         let temp_dir = std::env::temp_dir().join("lfai-test-temp");
         let _ = std::fs::create_dir_all(&temp_dir);
@@ -334,6 +477,34 @@ mod tests {
         assert_eq!(
             local_preview_source(source.to_str().unwrap()).unwrap(),
             source
+        );
+    }
+
+    /// Discard deletes exactly the proxy the producer would have written, and
+    /// nothing else: the source video and a second discard (nothing cached) are
+    /// untouched.
+    #[test]
+    fn discarding_a_preview_removes_only_the_cached_proxy() {
+        let temp_dir = std::env::temp_dir().join("lfai-test-temp");
+        let _ = std::fs::create_dir_all(&temp_dir);
+        let dir = create_temporary_render_dir(&temp_dir).unwrap();
+        let cache = dir.0.join("preview-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let source = dir.0.join("source.webm");
+        std::fs::write(&source, b"source").unwrap();
+        let source = source.canonicalize().unwrap();
+        let proxy = preview::preview_proxy_output(&cache, &source).unwrap();
+        std::fs::write(&proxy, b"proxy").unwrap();
+        let sibling = cache.join("another-source.mp4");
+        std::fs::write(&sibling, b"proxy").unwrap();
+
+        assert!(preview::remove_preview_proxy(&cache, &source).unwrap());
+        assert!(!proxy.exists(), "the discarded source's proxy must be gone");
+        assert!(sibling.exists(), "other sources' proxies must survive");
+        assert!(source.exists(), "the source video is never touched");
+        assert!(
+            !preview::remove_preview_proxy(&cache, &source).unwrap(),
+            "discarding again with nothing cached is a no-op"
         );
     }
 

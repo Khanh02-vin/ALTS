@@ -2662,7 +2662,9 @@ dependencies = [
  "base64 0.22.1",
  "command-group",
  "ed25519-dalek",
+ "gtk",
  "image",
+ "libc",
  "render-engine",
  "reqwest 0.12.28",
  "rusqlite",
@@ -4031,6 +4033,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "render-engine"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
  "typeshare",

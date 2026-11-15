@@ -11,9 +11,11 @@ use crate::paths::NODE_ARGS;
 use crate::paths::{
     analysis_range_allowed, data_dir, helper_env, helper_script, jobs_path, node_bin,
     python_binary, runtime_env, tool, venv_python, whisper_venv_bin, write_private_file,
+    write_runtime_settings,
 };
 use crate::runtime::{ensure_rag_server, RagState};
 use crate::{spawn_analysis_worker, Jobs};
+use tauri::Manager;
 
 /// Creates the app venv with only the YouTube crawler deps (yt-dlp +
 /// youtube-transcript-api). Returns false when the venv is unusable — local
@@ -501,7 +503,9 @@ pub(crate) fn youtube_ingest_captions(
     if segments.is_empty() {
         return Err("CAP_PARSE_EMPTY: phụ đề tải về rỗng hoặc định dạng lạ".into());
     }
-    let endpoint = ensure_rag_server(&RagState::default(), &app)?;
+    // The managed state holds the pid so stop_sidecars can kill it; a throwaway
+    // RagState would forget the sidecar the moment this call returns.
+    let endpoint = ensure_rag_server(&app.state::<RagState>(), &app)?;
     let body = serde_json::json!({ "videoUrl": format!("https://www.youtube.com/watch?v={video_id}"), "segments": segments });
     let body_str = body.to_string();
     let out = tool("curl")
@@ -631,6 +635,27 @@ pub(crate) fn youtube_video_url(value: &str) -> bool {
     public_video_url(value) && youtube_video_id(value).is_some()
 }
 
+/// How a remote link is analyzed. Only YouTube exposes a caption track; every
+/// other supported host is downloaded with yt-dlp and transcribed on-device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RemoteRoute {
+    Captions,
+    Audio,
+}
+
+/// The single gate every remote input passes: `None` rejects the link outright,
+/// `Captions` reads YouTube captions, `Audio` downloads the audio for Whisper.
+pub(crate) fn remote_route(value: &str) -> Option<RemoteRoute> {
+    if !public_video_url(value) {
+        return None;
+    }
+    Some(if youtube_video_id(value).is_some() {
+        RemoteRoute::Captions
+    } else {
+        RemoteRoute::Audio
+    })
+}
+
 /// Extracts a video id from a youtube.com/youtu.be link for validation only —
 /// the original (case-preserved) URL is what reaches yt-dlp afterwards.
 pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
@@ -666,15 +691,71 @@ pub(crate) fn youtube_video_id(value: &str) -> Option<String> {
     .then_some(id)
 }
 
-/// Fetches (title, duration) for a YouTube URL — one metadata-only yt-dlp call (~1s).
+/// Browsers yt-dlp can read a logged-in profile from (`--cookies-from-browser`).
+/// Closed list on purpose: the value is user-supplied and lands in yt-dlp's argv,
+/// so anything else must be rejected instead of forwarded.
+pub(crate) const COOKIE_BROWSERS: [&str; 9] = [
+    "chrome", "chromium", "firefox", "edge", "brave", "safari", "opera", "vivaldi", "whale",
+];
+
+/// Maps a stored browser choice to the yt-dlp flags. Empty means "off" and
+/// yields no flags; anything outside [`COOKIE_BROWSERS`] is an error, which also
+/// keeps paths, extra argv flags and `browser:profile` specs out of the command.
+pub(crate) fn cookie_browser_args(selection: &str) -> Result<Vec<String>, String> {
+    let selection = selection.trim().to_ascii_lowercase();
+    if selection.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !COOKIE_BROWSERS.contains(&selection.as_str()) {
+        return Err("COOKIES_BROWSER_UNSUPPORTED".into());
+    }
+    Ok(vec!["--cookies-from-browser".into(), selection])
+}
+
+/// The flags for the browser saved in `runtime.env`, re-read on every call so a
+/// Settings change applies to the next download without restarting the app.
+pub(crate) fn configured_cookie_args() -> Result<Vec<String>, String> {
+    cookie_browser_args(
+        runtime_env()
+            .get("YT_COOKIES_BROWSER")
+            .map(String::as_str)
+            .unwrap_or(""),
+    )
+}
+
+/// Reads the cookie-browser setting, or writes it when `browser` is given.
+/// Login-gated public posts (Facebook/TikTok age or region walls, YouTube
+/// "sign in to confirm") are otherwise unreachable for yt-dlp.
+#[tauri::command]
+pub(crate) fn cookies_browser(browser: Option<String>) -> Result<serde_json::Value, String> {
+    let mut settings = runtime_env();
+    if let Some(choice) = browser {
+        let choice = choice.trim().to_ascii_lowercase();
+        cookie_browser_args(&choice)?;
+        if choice.is_empty() {
+            settings.remove("YT_COOKIES_BROWSER");
+        } else {
+            settings.insert("YT_COOKIES_BROWSER".into(), choice);
+        }
+        write_runtime_settings(&settings)?;
+    }
+    Ok(serde_json::json!({
+        "browser": settings.get("YT_COOKIES_BROWSER").cloned().unwrap_or_default(),
+        "supported": COOKIE_BROWSERS,
+    }))
+}
+
+/// Fetches (title, duration) for a supported public video link — one
+/// metadata-only yt-dlp call (~1s). Host-agnostic: YouTube, Facebook, TikTok.
 pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String, f64), String> {
-    if !youtube_video_url(url) {
+    if remote_route(url).is_none() {
         return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }
     let python = venv_python();
     if !python.is_file() {
         return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into());
     }
+    let cookies = configured_cookie_args().map_err(|e| format!("YT_META:{e}"))?;
     let mut cmd = tool(&python);
     cmd.args([
         "-m",
@@ -684,6 +765,7 @@ pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String
         "--print",
         "%(title)s\t%(duration)s",
     ])
+    .args(&cookies)
     .arg(url);
     for (key, value) in helper_env(app, &[]) {
         cmd.env(key, value);
@@ -708,17 +790,19 @@ pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String
     Ok((title.to_string(), duration))
 }
 
-/// Resolves fresh CDN stream URLs at export time: YouTube URLs expire (~6h), so
-/// they must never be cached between analysis and render. YouTube is DASH-only
-/// nowadays, so this usually returns [videoUrl, audioUrl] for ffmpeg's two inputs.
+/// Resolves fresh CDN stream URLs at export time: they expire (~6h), so they
+/// must never be cached between analysis and render. YouTube is DASH-only
+/// nowadays, so this usually returns [videoUrl, audioUrl] for ffmpeg's two
+/// inputs; Facebook/TikTok usually resolve to a single muxed URL.
 pub(crate) fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Vec<String>, String> {
-    if !youtube_video_url(url) {
+    if remote_route(url).is_none() {
         return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }
     let python = venv_python();
     if !python.is_file() {
         return Err("PYTHON_VENV_MISSING: run whisper bootstrap first".into());
     }
+    let cookies = configured_cookie_args().map_err(|e| format!("YT_STREAM_RESOLVE:{e}"))?;
     let mut cmd = tool(&python);
     cmd.args([
         "-m",
@@ -728,6 +812,7 @@ pub(crate) fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Ve
         "-f",
         "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
     ])
+    .args(&cookies)
     .arg(url);
     for (key, value) in helper_env(app, &[]) {
         cmd.env(key, value);
@@ -765,7 +850,9 @@ pub(crate) fn start_youtube_analysis(
     }
     let (title, duration) = yt_video_meta(&app, &url)?;
     if !analysis_range_allowed(0.0, duration) {
-        return Err("ANALYZE_RANGE_EXCEEDS_600_SECONDS: select a shorter range".into());
+        return Err(
+            "ANALYZE_RANGE_EXCEEDS_1800_SECONDS: select a range of 30 minutes or less".into(),
+        );
     }
     let id = format!(
         "analysis-{}",
@@ -997,7 +1084,7 @@ pub(crate) fn run_yt_crawler(
         serde_json::from_slice(&output.stdout).map_err(|e| format!("CRAWLER_JSON:{e}"))?;
 
     // Ingest each result via the running RAG sidecar (bundled curl — no new HTTP dep).
-    let endpoint = ensure_rag_server(&RagState::default(), app)?;
+    let endpoint = ensure_rag_server(&app.state::<RagState>(), app)?;
     let ingest_url = format!("{}/api/rag/ingest", endpoint.base);
     let mut indexed = 0usize;
     for video in &videos {

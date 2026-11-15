@@ -10,10 +10,9 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-start-dragging",
     "dialog:default",
-    "http:allow-fetch",
-    "http:allow-fetch-send",
-    "http:allow-fetch-read-body",
-    "http:allow-fetch-cancel",
-    "http:allow-fetch-cancel-body"
+    {
+      "identifier": "http:default",
+      "allow": [{ "url": "http://127.0.0.1:*/api/rag/*" }]
+    }
   ]
 }

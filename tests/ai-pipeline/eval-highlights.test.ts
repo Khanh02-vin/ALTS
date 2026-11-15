@@ -6,7 +6,7 @@ import type { Transcript } from "../../packages/contracts/transcript.ts";
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { snapHighlightsToPauses } from "../../services/ai-pipeline/pause-snap.ts";
-import { chooseHeuristicHighlights } from "../../services/ai-pipeline/heuristic.ts";
+import { buildWindows, chooseHeuristicHighlights, nonMaximumSuppression } from "../../services/ai-pipeline/heuristic.ts";
 import { chooseContentHighlights } from "../../services/ai-pipeline/content-highlights.ts";
 import { generateSemanticHighlights, createMockSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
@@ -71,7 +71,7 @@ function timeIou(a: { start: number; end: number }, b: { start: number; end: num
 
 type CaseResult = { meanIou: number; hits: Record<number, boolean> };
 
-function scoreCase(expected: Expected[], predictions: Highlight[], ks: number[]): CaseResult {
+function scoreCase(expected: Expected[], predictions: Array<{ start: number; end: number; score: number }>, ks: number[]): CaseResult {
   const ranked = [...predictions].sort((a, b) => b.score - a.score || a.start - b.start);
   let sum = 0;
   const hits: Record<number, boolean> = {};
@@ -345,6 +345,73 @@ async function main(): Promise<void> {
   const heuristic = aggregates.get("heuristic")!;
   const content = aggregates.get("content")!;
 
+  // --- P3 seam: the exported windowing + NMS must reproduce the shipped
+  // selector exactly, so the blend probes below re-rank the same candidates.
+  for (const { item, transcript } of transcripts) {
+    const seam = nonMaximumSuppression(buildWindows(transcript), LIMIT);
+    const shipped = chooseHeuristicHighlights(transcript, LIMIT);
+    assert.deepEqual(
+      seam.map((w) => [w.start, w.end, w.score]),
+      shipped.map((h) => [h.start, h.end, h.score]),
+      `${item.id}: exported seam must reproduce chooseHeuristicHighlights`,
+    );
+  }
+
+  // --- Tier 1 probe: re-rank the identical candidate set with linear blends of
+  // the three axes. Reported, never applied to the shipped formula — this is the
+  // cheap test of whether re-weighting alone buys ranking quality. Measured
+  // 2026-11-10: all three weightings tie exactly (IoU 0.69, hit@5 7/8) because
+  // none of the axes penalises length, so no re-weighting can recover
+  // vlog-rambling. That residual gap is the evidence for a tier-2 reranker.
+  const blends: Array<{ name: string; weights: { hook: number; summary: number; impact: number } }> = [
+    { name: "blend-h/s/i 4/3/3", weights: { hook: 0.4, summary: 0.3, impact: 0.3 } },
+    { name: "blend-h/s/i 3/4/3", weights: { hook: 0.3, summary: 0.4, impact: 0.3 } },
+    { name: "blend-h/s/i 3/3/4", weights: { hook: 0.3, summary: 0.3, impact: 0.4 } },
+  ];
+  console.log("-- tier-1 linear blends over the same candidate set --");
+  for (const { name, weights } of blends) {
+    const results = transcripts.map(({ item, transcript }) => {
+      const ranked = nonMaximumSuppression(
+        buildWindows(transcript).map((w) => ({
+          start: w.start,
+          end: w.end,
+          score: weights.hook * w.scores.hook + weights.summary * w.scores.summary + weights.impact * w.scores.impact,
+        })),
+        LIMIT,
+      );
+      return { id: item.id, ...scoreCase(item.expected, ranked, ks) };
+    });
+    const agg = aggregate(results);
+    console.log(
+      `${name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@5 ${((agg.hitAt[5] ?? 0) * 100).toFixed(0)}%   [${results.map((r) => `${r.id} ${r.meanIou.toFixed(2)}`).join(", ")}]`,
+    );
+  }
+
+  // --- Per-case floors: the measured heuristic baseline, case by case. Adding a
+  // fixture without measuring it fails on "floor missing", so a new case cannot
+  // slip in untracked. A 0 floor is a known miss the word-count score cannot
+  // recover; it still has to be listed so the id cannot vanish from the map.
+  const heuristicFloors: Record<string, number> = {
+    "tutorial-export": 1,
+    "podcast-revenue": 0,
+    "cooking-pasta": 1,
+    "gaming-review": 0.5,
+    "lecture-memory": 1,
+    "interview-founder": 1,
+    "vlog-rambling": 0,
+    "short-hook": 0,
+  };
+  const heuristicPerCase = transcripts.map(({ item, transcript }) => ({
+    id: item.id,
+    iou: scoreCase(item.expected, chooseHeuristicHighlights(transcript, LIMIT), ks).meanIou,
+  }));
+  console.log(`per-case heuristic: ${heuristicPerCase.map((r) => `${r.id} ${r.iou.toFixed(4)}`).join(", ")}`);
+  for (const { id, iou } of heuristicPerCase) {
+    const floor = heuristicFloors[id];
+    assert.ok(floor !== undefined, `heuristic floor missing for fixture ${id}`);
+    assert.ok(iou >= floor, `heuristic IoU ${iou.toFixed(2)} on ${id} below floor ${floor} — candidate selection regressed`);
+  }
+
   // Metric sanity: exact oracle must be near-perfect; jittered oracle must
   // rank every expected inside top-3 while scoring clearly below 1.0.
   assert.ok(oracle.meanIou >= 0.99, `oracle IoU ${oracle.meanIou} — metric or fixture broken`);
@@ -352,8 +419,13 @@ async function main(): Promise<void> {
   assert.ok(jittered.meanIou > 0.4 && jittered.meanIou < 0.95, `jittered oracle IoU ${jittered.meanIou} outside plausible band`);
   assert.equal(jittered.hitAt[3], 1, "jittered oracle hit@3 must be 100%");
 
-  // Baselines must be non-degenerate on this dataset.
-  assert.ok(heuristic.meanIou > 0.2, `heuristic IoU ${heuristic.meanIou} too low — fixtures or heuristic regressed`);
+  // Regression gate: the documented heuristic baseline on this dataset is mean
+  // IoU 0.5625 with hit@5 on 5 of 8 cases. The two length-bias probes are known
+  // misses (the ratio below still includes them), so a candidate-selection
+  // change that drops either number must fail CI instead of only printing a
+  // lower score. The shipped score formula is unchanged since this baseline.
+  assert.ok(heuristic.meanIou >= 0.5625, `heuristic IoU ${heuristic.meanIou} below baseline 0.5625 — candidate selection regressed`);
+  assert.ok((heuristic.hitAt[5] ?? 0) >= 5 / 8, `heuristic hit@5 ${heuristic.hitAt[5]} below baseline 5/8 — candidate selection regressed`);
   assert.ok(content.meanIou > 0.2, `content IoU ${content.meanIou} too low — fixtures or content regressed`);
 
   console.log("eval highlight tests: ok");

@@ -1,8 +1,8 @@
-import { isActiveHighlight, type Highlight } from "../../../../packages/contracts/highlight.ts";
+import type { Highlight } from "../../../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../../../packages/contracts/transcript.ts";
 import type { RenderPlan, EditVariant } from "../../../../packages/contracts/render-plan.ts";
 
-// Shared between the Studio workbench, the Editor and the YouTube Studio.
+// Shared between the Studio workbench, the Editor and the video library.
 // Runes-based mutable module store (`$state` works in .svelte.ts).
 export const studioState = $state<{
   sourcePath: string;
@@ -61,21 +61,3 @@ export const studioState = $state<{
   speakerFaceMatches: { speakerA: "face-1" },
   speakerFaceConfirmed: true,
 });
-
-// Active highlights are the non-discarded subset; selection/render/export
-// must derive from these so discarding removes a clip from the export set
-// without deleting its data or plan.
-export function activeHighlights(): Highlight[] {
-  return studioState.highlights.filter(isActiveHighlight);
-}
-
-export function activeSelectedIds(): string[] {
-  const active = new Set(activeHighlights().map((highlight) => highlight.id));
-  return studioState.selectedIds.filter((id) => active.has(id));
-}
-
-export function activeSelectedId(): string {
-  const active = new Set(activeHighlights().map((highlight) => highlight.id));
-  if (active.has(studioState.selectedId)) return studioState.selectedId;
-  return activeHighlights()[0]?.id ?? "";
-}

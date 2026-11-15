@@ -28,7 +28,7 @@
   const titles: Record<PageKey, string> = {
     studio: "Local-first AI Video Studio",
     editor: "Editor · Local-first AI Video Studio",
-    youtube: "YouTube Studio · Local-first AI Video Studio",
+    youtube: "Library · Local-first AI Video Studio",
     settings: "Settings · Local-first AI Video Studio",
     project: "Project · Local-first AI Video Studio",
   };
@@ -46,12 +46,11 @@
   const items = [
     { href: "/", id: "studio", label: "Studio" },
     { href: "/projects", id: "project", label: "Projects" },
-    { href: "/editor/demo", id: "editor", label: "Editor" },
-    { href: "/youtube", id: "youtube", label: "YouTube Studio" },
+    { href: "/editor/current", id: "editor", label: "Editor" },
+    { href: "/youtube", id: "youtube", label: "Library" },
     { href: "/settings", id: "settings", label: "Settings" },
   ];
   function isOn(item: { id: string }): boolean {
-    if (item.id === "studio") return activePage === "studio" || activePage === "project";
     return activePage === item.id;
   }
 
@@ -68,7 +67,7 @@
       await getCurrentWindow().minimize();
     } catch (error) {
       console.error("[titlebar] minimize failed", error);
-      titlebarError = `Không thu nhỏ được cửa sổ: ${String(error)}`;
+      titlebarError = `Could not minimize the window: ${String(error)}`;
       setTimeout(() => { titlebarError = ""; }, 5000);
     }
   }
@@ -79,7 +78,7 @@
       await getCurrentWindow().toggleMaximize();
     } catch (error) {
       console.error("[titlebar] toggleMaximize failed", error);
-      titlebarError = `Không đổi được kích thước cửa sổ: ${String(error)}`;
+      titlebarError = `Could not resize the window: ${String(error)}`;
       setTimeout(() => { titlebarError = ""; }, 5000);
     }
   }
@@ -90,7 +89,7 @@
       await getCurrentWindow().close();
     } catch (error) {
       console.error("[titlebar] close failed", error);
-      titlebarError = `Không đóng được cửa sổ: ${String(error)}`;
+      titlebarError = `Could not close the window: ${String(error)}`;
       setTimeout(() => { titlebarError = ""; }, 5000);
     }
   }

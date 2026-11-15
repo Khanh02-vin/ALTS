@@ -8,6 +8,7 @@ import { dirname, join } from "node:path";
 import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
 import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
+import { planChunkBoundaries } from "../adapters/local/chunked-whisper.ts";
 
 const [mediaPath, sourceArtifactId, durationText, rangeStartText, rangeEndText, jobId, statePath] = process.argv.slice(2);
 const duration = Number(durationText);
@@ -98,6 +99,15 @@ try {
     offsetSeconds: rangeStart,
     sourceDuration: duration,
     audioRms,
+    // Downloaded audio can run 30 minutes: cut it into ~600 s pieces on a quiet
+    // 100 ms window so each Whisper run stays short and progress moves per chunk.
+    // Local files keep the historical 120 s layout their chunk rows expect.
+    ...(rangeEnd - rangeStart > 600 && /^https?:\/\//.test(sourceArtifactId)
+      ? {
+        chunkSeconds: 600,
+        boundaries: planChunkBoundaries(rangeEnd - rangeStart, 600, audioRms?.windows.map((window) => ({ ...window, start: window.start - rangeStart, end: window.end - rangeStart }))),
+      }
+      : {}),
     transcript: await loadTranscriptFixture(sourceArtifactId),
     onChunkStart: (index: number, total: number) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
     onChunkComplete: (index: number, total: number, cacheHit: boolean) => {

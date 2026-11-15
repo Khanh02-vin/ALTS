@@ -30,17 +30,26 @@
 
 | ID | Hạng mục | Kết quả cần đạt | Owner |
 |---|---|---|---|
-| MVP-011 | Browser editor | Preview, timeline, trim, caption, hook, crop | Editor |
-| MVP-012 | CE.SDK adapter | CE.SDK chỉ preview/editor; không thay final renderer | Editor |
+| MVP-011 | Browser editor | Preview, timeline, trim, caption, hook, crop bằng editor native hiện có | Editor |
 | MVP-013 | Local runner | SQLite/filesystem/FFmpeg chạy không upload media | Worker/DevOps |
-| MVP-014 | Cloud runner | PostgreSQL/Redis/S3/BullMQ chạy cùng contract | Backend + Worker |
 | MVP-015 | Retry/cancel/resume | Job không mất sau lỗi, restart hoặc cancel | Worker/DevOps |
 | MVP-016 | Autosave/versioning | Không mất RenderPlan và chỉnh sửa | Editor + Backend |
-| MVP-017 | Auth cơ bản | User chỉ truy cập project/artifact được cấp quyền | Backend + Security |
 | MVP-018 | E2E test | Video mẫu đi hết upload → render → download | QA |
-| MVP-019 | Security baseline | Secret, signed URL, traversal, SSRF được kiểm soát | Security |
+| MVP-019 | Security baseline | Kiểm soát secret, traversal, URL/SSRF và xác thực sidecar loopback; signed URL chỉ áp dụng khi mở phạm vi cloud | Security |
 
-## P2 — Sau MVP
+## Deferred — Chỉ mở lại khi có nhu cầu được đo
+
+Đồng bộ phạm vi local-first với [IMPLEMENTATION_STATUS.md](../IMPLEMENTATION_STATUS.md), cập nhật 2026-11-10. Các mục này không phải điều kiện hoàn tất MVP và không tự động được đưa vào sprint P1/P2.
+
+| ID | Hạng mục | Điều kiện xem xét lại | Owner |
+|---|---|---|---|
+| MVP-012 | CE.SDK adapter | Editor native không đáp ứng yêu cầu người dùng đã được kiểm chứng; không thay final renderer | Editor |
+| MVP-014 | Cloud runner | Có nhu cầu chạy từ xa được đo; khi đó mới xét PostgreSQL, Redis/BullMQ, S3/R2 và cloud workers | Backend + Worker |
+| MVP-017 | Hosted auth / tenant isolation | Mở dịch vụ nhiều người dùng qua mạng; khi đó mới triển khai JWT/session, tenant isolation và network rate limiting | Backend + Security |
+
+Cũng hoãn: AI cloud managed không dùng BYOK, OAuth/social publishing, billing và team workspace. Xác thực sidecar, bảo vệ secret và kiểm tra đầu vào local vẫn bắt buộc ngay trong MVP; không bị hoãn cùng hosted auth.
+
+## P2 — Sau MVP (ý tưởng, chưa cam kết triển khai)
 
 - Aspect ratio 1:1 và 16:9.
 - Speaker tracking nâng cao.

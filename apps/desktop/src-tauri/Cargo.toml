@@ -44,6 +44,16 @@ ed25519-dalek = { version = "2", features = ["std"] }
 time = { version = "0.3", features = ["parsing", "macros"] }
 url = "2"
 
+# Only for `Window::gtk_window()` → `present()` in the single-instance handler.
+# tauri does not re-export gtk, and 0.18 is already resolved through tao.
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"
+
+# Signal plumbing in main.rs: SIGTERM/SIGINT/SIGHUP must run the same shutdown as a
+# normal quit, otherwise the detached sidecars outlive the app.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

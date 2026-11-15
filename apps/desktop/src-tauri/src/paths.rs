@@ -18,6 +18,9 @@ use crate::contracts::AnalysisStatus;
 pub(crate) fn tool(program: impl AsRef<std::ffi::OsStr>) -> Command {
     #[cfg_attr(not(windows), allow(unused_mut))] // mutation happens in the Windows block only
     let mut command = Command::new(program);
+    // Helper children (ffmpeg transcodes, probes, kill escalations) must die
+    // with the app too — the worker/RAG guards do not cover these one-shots.
+    crate::spawn_guard::set_parent_death_sig(&mut command);
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -835,7 +838,7 @@ pub(crate) fn python_binary() -> String {
 }
 
 pub(crate) fn analysis_range_allowed(start: f64, end: f64) -> bool {
-    start.is_finite() && end.is_finite() && start >= 0.0 && end > start && end - start <= 600.0
+    start.is_finite() && end.is_finite() && start >= 0.0 && end > start && end - start <= 1800.0
 }
 
 /// Ed25519 public key (32 bytes, base64) used to verify offline licenses.

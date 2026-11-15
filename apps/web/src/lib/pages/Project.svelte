@@ -52,7 +52,7 @@
   }
 </script>
 
-<main class="bench">
+<main class="bench projects-workspace">
   <section class="bench-center">
     <div class="stage">
       <div class="stage-head"><div class="stage-title"><span class="badge volt">projects</span><span class="stage-name">Your local projects</span></div><a class="btn btn-sm btn-quiet" href="/">New project</a></div>

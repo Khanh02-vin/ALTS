@@ -48,12 +48,12 @@ assert.match(studio, /invoke\("cancel_render"\)/, "Studio must expose render can
 assert.match(studio, /if \(rendering\) \{ await new Promise\(\(resolve\) => setTimeout\(resolve, 1000\)\); continue; \}/, "a finished analysis poll must not clear busy while a render runs");
 assert.match(studio, /!watchStarted && !rendering/, "the analysis watcher must not restart while a render runs");
 assert.match(studio, /!watchStarted && !rendering/, "the analysis watcher must not restart while a render runs");
-// System Doctor panel in Settings must expose one-click check + Whisper bootstrap
+// System Doctor panel in Settings must expose one-click check + Whisper.cpp setup
 const settings = readFileSync(join(root, "apps/web/src/lib/pages/Settings.svelte"), "utf8");
 assert.match(settings, /System Doctor/, "Settings must have a System Doctor panel");
 assert.match(settings, /runSystemDoctor/, "System Doctor must have a runSystemDoctor function");
-assert.match(settings, /startWhisperBootstrap/, "System Doctor must invoke the shared bootstrap function");
-assert.match(settings, /whisperBootstrap/, "Settings must display Whisper bootstrap progress");
+assert.match(settings, /setupWhisperCpp/, "System Doctor must offer one-click Whisper.cpp setup");
+assert.match(settings, /smokeWhisperCpp/, "System Doctor must offer a Whisper.cpp smoke test");
 assert.match(settings, /runtime_status/, "System Doctor must call runtime_status for the component check");
 assert.match(settings, /bootstrap_whisper/, "System Doctor must be able to start Whisper bootstrap");
 assert.match(rust, /LFAI_RAG_TOKEN/, "the RAG sidecar must be spawned with a session token");
@@ -67,6 +67,30 @@ assert.match(youtube, /invoke<\{ base: string; token: string \}>\("rag_server_ur
 assert.match(rust, /free_loopback_port\(\)/, "sidecar ports must come from an ephemeral bind, not a constant");
 assert.match(rust, /session_token\(\)/, "sidecar sessions must carry a per-session token");
 assert.doesNotMatch(rust, /RAG_PORT: u16 = /, "the fixed RAG port must stay gone");
+
+// The webview reaches the sidecar through tauri-plugin-http, which runs the request in
+// Rust so the webview CSP does not apply. That plugin refuses every origin its ACL scope
+// does not list, and `http:default` alone explicitly allows none — the shipped build failed
+// with "url not allowed on the configured scope". The scope must stay loopback-only, cover
+// the ephemeral port, and not widen to the whole origin: `http://127.0.0.1:*` would let the
+// webview reach llama-server and any other local service.
+type CapabilityEntry = string | { identifier: string; allow?: { url?: string }[] };
+const capability = JSON.parse(
+  readFileSync(join(root, "apps/desktop/src-tauri/capabilities/default.json"), "utf8"),
+) as { permissions: CapabilityEntry[] };
+const httpScopeUrls: string[] = [];
+for (const entry of capability.permissions) {
+  if (typeof entry === "string" || !entry.identifier.startsWith("http:")) continue;
+  for (const allow of entry.allow ?? []) httpScopeUrls.push(allow.url ?? "");
+}
+assert.ok(
+  httpScopeUrls.some((url) => /^http:\/\/127\.0\.0\.1:\*\/api\/rag\/\*$/.test(url)),
+  "the http capability entry must allow the loopback RAG sidecar on its ephemeral port",
+);
+assert.ok(
+  httpScopeUrls.every((url) => /^http:\/\/127\.0\.0\.1:\*\//.test(url)),
+  "the http scope must stay on loopback with a wildcard port — a bare origin would expose every local service",
+);
 
 // Windows worker control (ADR-004): cancel/liveness use taskkill/tasklist through
 // std::process::Command — the cfg(windows) blocks only compile on Windows, so these

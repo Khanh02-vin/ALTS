@@ -54,7 +54,7 @@ export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAn
   return { transcript, highlights };
 }
 
-export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds"> & {
+export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds" | "boundaries"> & {
   /** Pre-built transcript (e.g. from a fixture): skips Whisper entirely and only selects highlights. */
   transcript?: Transcript;
   /** Optional time-indexed audio energy from the extracted mono PCM WAV. */

@@ -26,6 +26,8 @@ validateHighlights([{ ...highlight, status: "discarded" }], 60);
 validateHighlights([{ ...highlight, status: "saved" }], 60);
 validateHighlights([{ ...highlight, status: "active" }], 60);
 assert.throws(() => validateHighlights([{ ...highlight, status: "archived" } as never], 60), /status/i);
+validateHighlights([{ ...highlight, scores: { hook: 70, summary: 40, impact: 20 }, dominantAxis: "hook", scoreAudio: false }], 60);
+assert.throws(() => validateHighlights([{ ...highlight, scoreAudio: "no" } as never], 60), /audio/i);
 
 const collection = {
   version: 1 as const,

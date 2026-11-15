@@ -562,15 +562,24 @@ fn sample_speaker_faces_blocking(
     Ok(serde_json::json!(output))
 }
 
-/// Encodes a face thumbnail as a base64 data URI.
+/// Encodes a small JPEG thumbnail as a data URI the UI can render directly.
 ///
-/// The frame is already scaled to a max width of 640 by FFmpeg, so encoding the
-/// raw RGB bytes keeps the thumbnail small enough without a separate image
-/// encoder dependency.
+/// FFmpeg scales the frame to 640 px wide before detection, but raw RGB bytes for one
+/// frame are already ~2 MB, and up to four faces are returned per sample — enough to
+/// trip FACE_RESPONSE_SIZE_LIMIT. The UI expects a JPEG data URI (or hex), so encode a
+/// 96 px-wide JPEG instead.
 fn encode_thumbnail(img: &RgbImage) -> String {
-    let buf = img.clone().into_raw();
+    let width = 96u32.min(img.width().max(1));
+    let height =
+        ((img.height() as f64 / img.width().max(1) as f64) * width as f64).round().max(1.0) as u32;
+    let thumb = image::imageops::resize(img, width, height, image::imageops::FilterType::Triangle);
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 70);
+    if encoder.encode_image(&thumb).is_err() {
+        return String::new();
+    }
     format!(
-        "data:image/rgb;base64,{}",
+        "data:image/jpeg;base64,{}",
         base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &buf)
     )
 }
@@ -804,7 +813,11 @@ pub(crate) fn auto_text_boxes(
                 .status()
                 .map_err(|error| format!("OCR_FRAME_EXTRACT:{error}"))?;
             if !status.success() {
-                return Err("OCR_FRAME_EXTRACT_FAILED".into());
+                // Sampling must never block a render. A frame that cannot be extracted
+                // (for example a range that runs past the end of the media) just counts
+                // as "no text" here, and the majority check below decides the range.
+                boxes.push(None);
+                continue;
             }
             let image = image::open(&frame)
                 .map_err(|error| format!("OCR_FRAME_READ:{error}"))?
@@ -1136,8 +1149,10 @@ fn extract_and_detect(
                 .into_iter()
                 .map(|f| {
                     serde_json::json!({
-                        "x": f.center_x,
-                        "y": f.center_y,
+                        // Left/top edges, matching `track_crop_path` and the unit tests;
+                        // consumers add half the size back to reach the centre.
+                        "x": f.center_x - f.width / 2.0,
+                        "y": f.center_y - f.height / 2.0,
                         "width": f.width,
                         "height": f.height,
                         "confidence": f.confidence,

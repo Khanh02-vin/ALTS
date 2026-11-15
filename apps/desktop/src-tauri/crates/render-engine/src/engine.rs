@@ -85,6 +85,22 @@ pub fn run_render_child(
     {
         use std::os::unix::process::CommandExt;
         command.process_group(0);
+        // PR_SET_PDEATHSIG: a SIGKILLed app (OOM killer, force-quit) must not
+        // leave this encoding tree running — Drop handlers never run on SIGKILL.
+        let app_pid = std::process::id();
+        unsafe {
+            command.pre_exec(move || {
+                const PR_SET_PDEATHSIG: libc::c_int = 1;
+                if libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                // Close the fork/prctl race: if the app died in between, die too.
+                if libc::getppid() as u32 != app_pid {
+                    libc::_exit(1);
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -1673,17 +1689,19 @@ fn ass_caption_text(
     if visible.is_empty() {
         return escape_ass_text(text);
     }
-    // Emit `\k<centiseconds>` before each word except the first. Centiseconds
-    // are relative to the clipped caption's start (ASS timing is dialogue
-    // local). For the first visible word, emit `\k0` so FFmpeg anchors the
-    // highlight sweep to the visible window rather than the full cue.
+    // Emit `{\k<centiseconds>}` before each word except the first. Override
+    // tags are only interpreted inside braces; a bare `\k` is drawn as text.
+    // Centiseconds are relative to the clipped caption's start (ASS timing is
+    // dialogue local). For the first visible word, emit `{\k0}` so FFmpeg
+    // anchors the highlight sweep to the visible window rather than the full
+    // cue.
     let mut out = String::new();
     for (i, (wtext, cstart, _cend)) in visible.iter().enumerate() {
         if i == 0 {
-            out.push_str("\\k0");
+            out.push_str("{\\k0}");
         } else {
             let delta_cs = ((cstart - from) * 100.0).floor() as i64;
-            out.push_str(&format!("\\k{}", delta_cs.max(0)));
+            out.push_str(&format!("{{\\k{}}}", delta_cs.max(0)));
         }
         if i > 0 {
             out.push(' ');
@@ -2215,7 +2233,8 @@ mod tests {
         let ass = ass_dialogue(&captions, 0.5, 5.0, 650)
             .unwrap()
             .unwrap();
-        assert!(ass.contains("hello\\k100 world"), "{ass}");
+        assert!(ass.contains("{\\k0}hello{\\k100} world"), "{ass}");
+        assert!(!ass.contains("hello\\k"), "override tag leaked as text: {ass}");
         assert!(ass.contains("plain caption") && !ass.contains("plain\\k"), "{ass}");
         assert!(ass.contains("MarginV, Encoding") || ass.contains("40,40,650"), "{ass}");
         assert!(ass.contains("40,40,650"), "{ass}");

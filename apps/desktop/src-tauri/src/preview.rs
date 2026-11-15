@@ -23,7 +23,12 @@ pub(crate) fn enforce_preview_cache_quota_at(cache_dir: &Path, cap_bytes: u64) {
     let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "mp4"))
+        .filter(|path| {
+            path.extension().is_some_and(|ext| ext == "mp4")
+                && !path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().ends_with(".tmp.mp4"))
+        })
         .filter_map(|path| {
             let metadata = std::fs::metadata(&path).ok()?;
             Some((
@@ -54,6 +59,32 @@ use crate::paths::{
     transcode_preview_proxy,
 };
 
+/// The cached proxy path for `source` inside `dir`. Keyed on the source's path,
+/// size and mtime so a re-encoded file never reuses a stale proxy. The producer
+/// and the discard-time deleter both go through here so they cannot drift.
+pub(crate) fn preview_proxy_output(dir: &Path, source: &Path) -> Result<PathBuf, String> {
+    let metadata = std::fs::metadata(source).map_err(|e| format!("INPUT_PATH:{e}"))?;
+    let modified_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let key = preview_proxy_cache_key(source, metadata.len(), modified_nanos);
+    Ok(dir.join(format!("{key}.mp4")))
+}
+
+/// Drops the cached proxy for `source`, reporting whether one existed. The proxy
+/// is shared by every highlight of one source, so callers only invoke this once
+/// no active candidate is left; a missing file is a no-op, not an error.
+pub(crate) fn remove_preview_proxy(dir: &Path, source: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(preview_proxy_output(dir, source)?) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("PREVIEW_CACHE_DELETE:{error}")),
+    }
+}
+
 #[tauri::command]
 pub(crate) async fn prepare_video_preview(
     app: tauri::AppHandle,
@@ -61,21 +92,14 @@ pub(crate) async fn prepare_video_preview(
 ) -> Result<String, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let source = local_preview_source(&path)?;
-        let metadata = std::fs::metadata(&source).map_err(|e| format!("INPUT_PATH:{e}"))?;
-        let modified_nanos = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        let key = preview_proxy_cache_key(&source, metadata.len(), modified_nanos);
         let cache_dir = cache_dir().join("preview-cache");
         std::fs::create_dir_all(&cache_dir).map_err(|e| format!("PREVIEW_CACHE:{e}"))?;
-        let output = cache_dir.join(format!("{key}.mp4"));
+        let output = preview_proxy_output(&cache_dir, &source)?;
         if output.is_file() {
             return Ok(output.to_string_lossy().into_owned());
         }
-        let temporary = cache_dir.join(format!("{key}.{}.tmp.mp4", std::process::id()));
+        // `{key}.{pid}.tmp.mp4` next to the final file, so publishing is a rename.
+        let temporary = output.with_extension(format!("{}.tmp.mp4", std::process::id()));
         transcode_preview_proxy(&ffmpeg_bin(&app), &ffprobe_bin(&app), &source, &temporary)?;
         std::fs::rename(&temporary, &output).map_err(|e| {
             let _ = std::fs::remove_file(&temporary);
@@ -86,4 +110,13 @@ pub(crate) async fn prepare_video_preview(
     })
     .await
     .map_err(|error| format!("PREVIEW_WORKER:{error}"))?
+}
+
+/// Deletes the cached preview for a local source once its last candidate is
+/// discarded. Regenerable, so a failure here must not block the discard; the
+/// command reports whether a cached file was actually removed.
+#[tauri::command]
+pub(crate) fn delete_video_preview(path: String) -> Result<bool, String> {
+    let source = local_preview_source(&path)?;
+    remove_preview_proxy(&cache_dir().join("preview-cache"), &source)
 }

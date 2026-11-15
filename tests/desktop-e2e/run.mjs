@@ -22,14 +22,31 @@ function spawnSyncWhich(name) {
   try { execFileSync("which", [name], { stdio: "ignore" }); return true; } catch { return false; }
 }
 
+// Seconds of media in `path`, read the same way the renderer validates ranges.
+function probeDuration(path) {
+  const out = execFileSync("ffprobe", [
+    "-v", "error", "-show_entries", "format=duration",
+    "-of", "default=noprint_wrappers=1:nokey=1", path,
+  ], { encoding: "utf8" }).trim();
+  const seconds = Number(out);
+  if (!Number.isFinite(seconds) || seconds <= 0) {
+    throw new Error(`ffprobe could not read the duration of ${path} (got "${out}").`);
+  }
+  return seconds;
+}
+
 async function waitFor(predicate, description, limit = timeoutMs) {
   const deadline = Date.now() + limit;
+  let lastError;
   while (Date.now() < deadline) {
-    const value = await predicate();
+    let value;
+    // A predicate that looks up a freshly navigated element can throw "no such element"
+    // before the SPA finishes rendering; that means "not yet", not a failed run.
+    try { value = await predicate(); } catch (error) { lastError = error; }
     if (value) return value;
     await delay(500);
   }
-  throw new Error(`Timed out waiting for ${description} (${Math.round(limit / 1000)}s).`);
+  throw new Error(`Timed out waiting for ${description} (${Math.round(limit / 1000)}s).${lastError ? ` Last error: ${lastError.message}` : ""}`);
 }
 
 const base = `http://127.0.0.1:${port}`;
@@ -38,7 +55,12 @@ async function request(path, body, method = "POST") {
     method, ...(body === undefined ? {} : { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
   });
   const json = await response.json().catch(() => ({}));
-  if (!response.ok || json.value?.error) throw new Error(`WebDriver ${path}: ${JSON.stringify(json)}`);
+  // A W3C error envelope always carries "message"/"stacktrace"; a successful execute/sync
+  // returns arbitrary JSON, which may itself have an "error" key (invokeTauri stores
+  // {state:"error"}). Only the former is a WebDriver failure.
+  if (!response.ok || (json.value?.error && "message" in json.value)) {
+    throw new Error(`WebDriver ${path}: ${JSON.stringify(json)}`);
+  }
   return json.value;
 }
 let sessionId;
@@ -50,9 +72,21 @@ async function elements(using, value) {
   const result = await request(`/session/${sessionId}/elements`, { using, value });
   return result.map((entry) => entry["element-6066-11e4-a52e-4f735466cecf"]);
 }
-async function click(using, value) {
-  const id = await element(using, value);
-  await request(`/session/${sessionId}/element/${id}/click`, {});
+async function click(using, value, limit = 15000) {
+  // SvelteKit commits a route change after the rail link's click returns, and the page it
+  // navigates to stays display:none until then, so the next click can land on a hidden or
+  // not-yet-rendered control. Retry those transient WebDriver errors instead of failing.
+  const deadline = Date.now() + limit;
+  for (;;) {
+    try {
+      const id = await element(using, value);
+      await request(`/session/${sessionId}/element/${id}/click`, {});
+      return;
+    } catch (error) {
+      if (Date.now() >= deadline) throw error;
+      await delay(200);
+    }
+  }
 }
 // WebKitWebDriver refuses clicks on off-screen elements; bring the target into view first
 // so long candidate lists don't make runs flaky.
@@ -75,9 +109,12 @@ async function enabled(using, value) {
     return await request(`/session/${sessionId}/element/${id}/enabled`, undefined, "GET");
   } catch { return false; }
 }
-async function checked(using, value) {
-  const id = await element(using, value);
-  return request(`/session/${sessionId}/element/${id}/selected`, undefined, "GET");
+// Export selection is a per-row “Keep clip” chip, not a checkbox; press it unless the row
+// already reads “Kept” (the first candidate is pre-selected after an analysis run).
+async function keepCandidate(index) {
+  const chip = `(//div[contains(@class,'cand-list')]/div[contains(@class,'cand-item')])[${index}]/button[contains(@class,'chip')]`;
+  await waitFor(() => exists("xpath", chip), `candidate ${index} keep chip`);
+  if ((await text("xpath", chip)).trim() !== "Kept") await click("xpath", chip);
 }
 async function screenshot(label) {
   try {
@@ -98,7 +135,7 @@ async function saveDom(label) {
 /// Calls a Tauri command from inside the running app and returns its result.
 ///
 /// The crop-path scenario needs the real `analyze_crop_path` command — the one that
-/// runs FFmpeg over the source frames and the Haar-cascade face detector — and the
+/// runs FFmpeg over the source frames and the ONNX YuNet face detector — and the
 /// real `render_video` that consumes the resulting plan. Driving those through the
 /// app's own IPC keeps the test honest: it exercises the same code path a user's
 /// "Analyze local crop path" button does.
@@ -174,16 +211,15 @@ function transcriberPids(baseline) {
     const rows = execFileSync("ps", ["-eo", "pid,comm,args", "--no-headers"], { encoding: "utf8" });
     const pids = rows
       .split("\n")
-      // The transcriber runs as "<venv>/bin/python <venv>/bin/whisper ...": match on the
-      // python interpreter running the whisper entry point, so a shell that merely
-      // mentions "whisper" in its command line is not mistaken for a survivor.
+      // The default engine runs the bundled "whisper-cli"; the legacy python engine runs
+      // "<venv>/bin/python <venv>/bin/whisper". Match on the executable, not on a
+      // substring of the command line, so a shell that merely mentions "whisper" is not
+      // mistaken for a transcriber.
       .filter((line) => {
-        // ps reports the interpreter as "whisper" for the console script, and the
-        // command line still carries the real "<venv>/bin/python <venv>/bin/whisper".
         const parts = line.trim().split(/\s+/);
         const comm = parts[1] ?? "";
         const args = parts.slice(2).join(" ");
-        return (/^python/.test(comm) || comm === "whisper") && /\/bin\/whisper(\s|$)/.test(args);
+        return /^whisper/.test(comm) || (/^python/.test(comm) && /\/bin\/whisper(\s|$)/.test(args));
       })
       .map((line) => line.trim().split(/\s+/)[0])
       .filter(Boolean);
@@ -208,6 +244,11 @@ function survivingTranscribers() {
 /// Starts an analysis, waits until the transcriber is genuinely running, aborts from
 /// the UI, and requires that no transcriber process survives the cancel.
 async function runAnalysisCancelScenario(analyzeButton, videoPath) {
+  // A transcript fixture makes analyze-video.ts skip Whisper entirely, so no transcriber
+  // process can ever appear and this scenario would only report a misleading timeout.
+  if (process.env.TRANSCRIPT_FIXTURE) {
+    throw new Error("analysis-cancel needs real transcription: unset TRANSCRIPT_FIXTURE (a fixture skips Whisper).");
+  }
   const baseline = new Set();
   await click("xpath", analyzeButton);
   try {
@@ -233,17 +274,16 @@ async function runAnalysisCancelScenario(analyzeButton, videoPath) {
     throw error;
   }
   report.observations.push("No transcriber process survived the abort (the old behaviour left them running).");
-  // The app must be usable again rather than stuck mid-analysis.
   // The app must be usable again rather than stuck mid-analysis: walk back to the
-  // config step and confirm a fresh analysis can be started.
-  await click("xpath", "//button[contains(normalize-space(.), 'Config')]");
+  // setup step and confirm a fresh analysis can be started.
+  await click("xpath", "//button[contains(normalize-space(.), 'Back to setup')]");
   await waitFor(() => enabled("xpath", "//button[normalize-space(.)='Start analysis']"), "analysis to be restartable after abort", 60000);
   await screenshot("03-analysis-aborted");
 }
 
 /// Exercises the local crop path end to end, through the app's own IPC.
 ///
-/// The chain under test is: the Haar-cascade face detector finds the speaker's face in
+/// The chain under test is: the ONNX YuNet face detector finds the speaker's face in
 /// real frames, `analyze_crop_path` tracks and smooths it, the editor maps that onto
 /// contract keyframes, and the renderer crops the output to follow the subject.
 ///
@@ -253,7 +293,10 @@ async function runAnalysisCancelScenario(analyzeButton, videoPath) {
 /// talking when, and the test can say that. Everything downstream of that is the real
 /// detector, the real tracker and the real renderer.
 async function runCropPathScenario(videoPath, outputPath) {
-  const duration = Number(process.env.DESKTOP_E2E_CROP_DURATION ?? 60);
+  // The fixture is often shorter than the nominal crop window, and the renderer rejects a
+  // range that runs past the end of the media, so track the real duration.
+  const nominal = Number(process.env.DESKTOP_E2E_CROP_DURATION ?? 60);
+  const duration = Math.min(nominal, probeDuration(videoPath));
 
   // The detector needs OpenCV in the app's Python venv. Without it the command fails
   // with FACE_RUNTIME_MISSING, and the test must say so plainly rather than time out.
@@ -274,7 +317,7 @@ async function runCropPathScenario(videoPath, outputPath) {
   }
   if (!Array.isArray(samples) || samples.length === 0) {
     throw new Error(
-      "The face detector found no face in the source video. The crop scenario needs a video with a visible face (the Haar cascade cannot see a talking head off-screen).",
+      "The face detector found no face in the source video. The crop scenario needs a video with a visible face (the detector cannot see a talking head off-screen).",
     );
   }
   report.observations.push(`The face detector found ${samples.length} face(s) in the source video.`);
@@ -296,9 +339,24 @@ async function runCropPathScenario(videoPath, outputPath) {
   report.observations.push(
     `The crop path has ${path.length} point(s) across ${new Set(path.map((point) => point.sceneId)).size} scene(s), with ${distinctCenters} distinct horizontal centre(s) between ${Math.min(...centers).toFixed(3)} and ${Math.max(...centers).toFixed(3)}.`,
   );
-  if (distinctCenters < 2) {
+  // How far the path travels depends on the clip, so it is reported rather than asserted;
+  // movement, smoothing and the deadband are covered by the tracker's unit tests. What
+  // must hold for any clip is the geometry: the crop has to sit on the face the detector
+  // reported, not half a face away from it.
+  const sampled = samples.reduce((best, entry) =>
+    Math.abs(entry.time - path[0].time) < Math.abs(best.time - path[0].time) ? entry : best,
+  );
+  const nearest = path.reduce((best, point) =>
+    Math.abs(point.time - sampled.time) < Math.abs(best.time - sampled.time) ? point : best,
+  );
+  const offset = Math.hypot(nearest.centerX - sampled.centerX, nearest.centerY - sampled.centerY);
+  const tolerance = Math.max(0.05, sampled.width * 0.3);
+  report.observations.push(
+    `The crop centre at ${nearest.time}s (${nearest.centerX.toFixed(3)}, ${nearest.centerY.toFixed(3)}) is ${offset.toFixed(3)} from the detected face centre at ${sampled.time}s (${sampled.centerX.toFixed(3)}, ${sampled.centerY.toFixed(3)}); tolerance ${tolerance.toFixed(3)}.`,
+  );
+  if (offset > tolerance) {
     throw new Error(
-      "The crop path never moved: the tracker produced the same centre for every frame, so it cannot be distinguished from a fixed centre crop.",
+      `The crop path is centred ${offset.toFixed(3)} away from the detected face, so the crop would miss the subject.`,
     );
   }
   // The tracker smooths exactly once. A second smoothing pass (the behaviour ADR-003
@@ -359,18 +417,14 @@ async function runProgressCancelScenario(outputPath) {
   // The export path is fixed for the whole app, so an earlier run may have left a file
   // there: what must not happen is the cancelled render writing a new one.
   const before = await stat(outputPath).catch(() => null);
-  const boxes = await elements("css selector", ".cand-list input[type=checkbox]");
-  if (boxes.length < 2) throw new Error(`Cancel scenario needs at least two clips to make a batch render long enough to interrupt, found ${boxes.length}.`);
-  for (const box of boxes) {
-    if (!(await request(`/session/${sessionId}/element/${box}/selected`, undefined, "GET"))) {
-      await request(`/session/${sessionId}/element/${box}/click`, {});
-    }
-  }
-  const batchLabel = `Render ${boxes.length} selected clips`;
+  const count = (await elements("css selector", ".cand-list .cand-item")).length;
+  if (count < 2) throw new Error(`Cancel scenario needs at least two clips to make a batch render long enough to interrupt, found ${count}.`);
+  for (let index = 1; index <= count; index += 1) await keepCandidate(index);
+  const batchLabel = `Render ${count} selected clips`;
   const batchSelector = `//button[contains(normalize-space(.), '${batchLabel}')]`;
   await scrollTo("xpath", batchSelector);
-  await waitFor(() => enabled("xpath", batchSelector), `${boxes.length} clips selected`, 60000);
-  report.observations.push(`Selected ${boxes.length} clips for a batch render, so the export lasts long enough to interrupt.`);
+  await waitFor(() => enabled("xpath", batchSelector), `${count} clips selected`, 60000);
+  report.observations.push(`Selected ${count} clips for a batch render, so the export lasts long enough to interrupt.`);
   await screenshot("03b-batch-selected");
   await click("xpath", batchSelector);
 
@@ -426,18 +480,21 @@ async function runProgressCancelScenario(outputPath) {
   await waitFor(async () => !(await exists("xpath", "//button[normalize-space(.)='Cancel render']")), "render controls to return to idle after cancel", 120000);
   await waitFor(() => enabled("xpath", `//button[contains(normalize-space(.), '${batchLabel}')]`), "render button re-enabled after cancel", 60000);
 
-  // The export path is fixed for the whole app, so an earlier run may have left a file
-  // there: what must not happen is the cancelled render writing a new one.
-  const after = await stat(outputPath).catch(() => null);
-  const changed = after && (!before || after.mtimeMs !== before.mtimeMs || after.size !== before.size);
-  if (changed) throw new Error(`A cancelled render still wrote an export: ${outputPath} (${after.size} bytes).`);
-
   const records = readRenderRecords(tempState).flatMap((entry) => entry.renders);
   const cancelled = records.filter((entry) => entry?.status === "cancelled");
   const completed = records.filter((entry) => entry?.status === "completed");
+  const running = records.filter((entry) => entry?.status === "running");
   if (!cancelled.length) throw new Error(`No render record was persisted as cancelled. Persisted renders: ${JSON.stringify(records)}`);
-  if (completed.length) throw new Error("A render the user cancelled was persisted as completed.");
-  report.observations.push(`SQLite persisted ${cancelled.length} cancelled render record(s) and no completed ones.`);
+  if (running.length) throw new Error(`The cancelled batch left a render record stuck as running. Persisted renders: ${JSON.stringify(records)}`);
+  if (completed.length >= count) throw new Error(`The whole batch was persisted as completed even though the user cancelled it. Persisted renders: ${JSON.stringify(records)}`);
+
+  // Clips render one at a time into the same fixed E2E path, so a clip that finished
+  // before the cancel legitimately left its export there: only when no clip completed
+  // does any change to the file mean the cancelled render itself wrote an export.
+  const after = await stat(outputPath).catch(() => null);
+  const changed = after && (!before || after.mtimeMs !== before.mtimeMs || after.size !== before.size);
+  if (!completed.length && changed) throw new Error(`A cancelled render still wrote an export: ${outputPath} (${after.size} bytes).`);
+  report.observations.push(`SQLite persisted ${cancelled.length} cancelled render record(s) and ${completed.length} completed clip(s) before the cancel.`);
   await screenshot("04-render-cancelled");
 }
 let driver;
@@ -499,9 +556,11 @@ try {
   } else {
   await click("xpath", "//button[normalize-space(.)='Browse files']");
   await waitFor(async () => (await text("css selector", ".message")).includes("Video loaded"), "video loaded confirmation", 30000);
-  await waitFor(async () => (await text("css selector", ".row")).includes(basename(video)), "new project in Recent projects", 30000);
-  report.observations.push("The app confirmed video loading and listed the source in Recent projects, showing project creation.");
+  await click("xpath", "//a[@aria-label='Projects']");
+  await waitFor(async () => (await text("css selector", ".page:not(.off) .preview-card")).includes(basename(video)), "new project on the Projects page", 30000);
+  report.observations.push("The app confirmed video loading and listed the source on the Projects page, showing project creation.");
   await screenshot("02-video-loaded-project-created");
+  await click("xpath", "//a[@aria-label='Studio']");
 
   await click("xpath", "//button[normalize-space(.)='Continue to config →']");
   const analyzeButton = "//button[normalize-space(.)='Start analysis']";
@@ -526,8 +585,7 @@ try {
       report.task = "Start a multi-clip render, watch real progress percentages arrive, cancel mid-flight, and confirm the app neither claims success nor records a completed export.";
       await runProgressCancelScenario(output);
     } else {
-      const firstCheckbox = ".cand-list input[type=checkbox]";
-      if (!(await checked("css selector", firstCheckbox))) await click("css selector", firstCheckbox);
+      await keepCandidate(1);
       await waitFor(() => enabled("xpath", "//button[contains(normalize-space(.), 'Render 1 selected clip')]"), "one clip selected");
       await click("xpath", "//button[contains(normalize-space(.), 'Render 1 selected clip')]");
       await waitFor(async () => (await text("css selector", ".message")).includes("Rendered "), "render success", timeoutMs);

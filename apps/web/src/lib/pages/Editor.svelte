@@ -190,10 +190,6 @@
     keys.sort((a, b) => a.time - b.time);
     state = setCropKeyframes(state, keys.slice(0, 600)); savePlan();
   }
-  function adjustCropCenter() {
-    const current = cropCenterAt(state.plan.cropKeyframes ?? [], currentTime);
-    updateManualCropCenter(current.x);
-  }
   async function analyzeScenes() {
     if (!isTauri() || !sourcePath || sceneBusy) return;
     sceneBusy = true; sceneMessage = "Analyzing local scene samples…";
@@ -289,7 +285,6 @@
     selectedId = nextSelectedId; studioState.selectedId = nextSelectedId;
     void saveStatus();
   }
-  function saveHighlight(id: string) { setHighlightStatus(id, "saved"); }
   function discardHighlight(id: string) { setHighlightStatus(id, "discarded"); }
   function restoreHighlight(id: string) { setHighlightStatus(id, undefined); }
   async function saveStatus() {
@@ -402,7 +397,6 @@
               {#if discarded}
                 <button class="btn btn-sm" onclick={() => restoreHighlight(candidate.id)}>Restore</button>
               {:else}
-                <button class="btn btn-sm" aria-pressed={candidate.status === "saved"} onclick={() => saveHighlight(candidate.id)}>Save</button>
                 <button class="btn btn-sm" onclick={() => discardHighlight(candidate.id)}>Discard</button>
               {/if}
             </div>
@@ -415,7 +409,7 @@
       <dl class="kv"><dt>Duration</dt><dd class="tc">{clock(sourceDuration)}</dd><dt>Selected</dt><dd class="tc">{clock(range.start)}–{clock(range.end)}</dd><dt>Plan</dt><dd class="tc">v{state.plan.version}</dd></dl>
       <a class="btn btn-quiet btn-wide" href="/">← Back to Studio</a>
       {#if !isTauri()}<p class="note">Save and export are available in the installed desktop app.</p>{/if}
-      <button class="btn btn-primary btn-wide" onclick={save}>Save edits</button>
+      <button class="btn btn-primary btn-wide" disabled={!isTauri() || !studioState.projectId || !selectedId} onclick={save}>Save edits</button>
       <p class="note">Step 1: choose an active clip. Step 2: adjust the preview and dates. Step 3: save edits. Discarded clips are excluded from Studio render/export until restored. To create an MP4, return to Studio and choose Render.</p>
       {#if saveError}<div class="message" role="alert">{saveError}</div>{/if}
       {#if saved}<div class="save-toast" role="status" aria-live="polite"><Icon name="check" size={16} />Saved locally</div>{/if}
@@ -468,7 +462,7 @@
     </div>
     <details class="editor-disclosure">
       <summary>Speaker framing · optional</summary>
-      <div class="crop-review"><div class="panel-head"><span class="eyebrow">Speaker framing</span><span class="badge" class:ok={trackingEnabled}>{trackingEnabled ? "approved" : "center crop"}</span></div><p class="note">{cropMessage || "Local face path is used only after explicit review."}</p><div class="field-row"><button class="btn btn-sm" disabled={!powered || cropBusy || !studioState.transcript} onclick={analyzeCropPath}>{cropBusy ? "Analyzing…" : "Analyze local crop path"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.cropKeyframes?.length} onclick={() => setTracking(!trackingEnabled)}>{trackingEnabled ? "Use center crop" : "Approve tracking"}</button><button class="btn btn-sm btn-quiet" disabled={!trackingEnabled} onclick={adjustCropCenter}>Adjust center here</button></div><div class="field-row"><label>Crop X <input type="range" min="0" max="1" step="0.01" value={cropCenterAt(state.plan.cropKeyframes ?? [], currentTime).x} oninput={(event) => updateManualCropCenter(Number(event.currentTarget.value))} /></label></div></div>
+      <div class="crop-review"><div class="panel-head"><span class="eyebrow">Speaker framing</span><span class="badge" class:ok={trackingEnabled}>{trackingEnabled ? "approved" : "center crop"}</span></div><p class="note">{cropMessage || "Local face path is used only after explicit review."}</p><div class="field-row"><button class="btn btn-sm" disabled={!powered || cropBusy || !studioState.transcript} onclick={analyzeCropPath}>{cropBusy ? "Analyzing…" : "Analyze local crop path"}</button><button class="btn btn-sm btn-primary" disabled={!state.plan.cropKeyframes?.length} onclick={() => setTracking(!trackingEnabled)}>{trackingEnabled ? "Use center crop" : "Approve tracking"}</button></div><div class="field-row"><label>Crop X <input type="range" min="0" max="1" step="0.01" value={cropCenterAt(state.plan.cropKeyframes ?? [], currentTime).x} oninput={(event) => updateManualCropCenter(Number(event.currentTarget.value))} /></label></div></div>
       <p class="note">{clock(range.end - range.start)} selected · {trackingEnabled && state.plan.cropKeyframes?.some((key) => key.confirmed && key.confidence >= 0.5) ? "approved speaker tracking" : "center crop fallback"} · {state.plan.sceneLayouts?.some((scene) => scene.confirmed) ? "reviewed scene layout" : "static solo layout"}</p>
     </details>
     <details class="editor-disclosure">
