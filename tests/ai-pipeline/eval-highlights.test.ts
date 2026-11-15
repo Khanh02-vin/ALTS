@@ -14,7 +14,7 @@ import type { SemanticHighlightProvider } from "../../services/ai-pipeline/seman
 import { snapHighlightsToScenes } from "../../services/ai-pipeline/scene-snap.ts";
 import { parseSceneCutMetadata } from "../../services/ai-pipeline/scene-cuts.ts";
 import { generateSemanticHighlights, createMockSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
-import { GeminiHighlightProvider, LlamaCppHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
+import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
 
 /**
  * Highlight-selection eval over curated fixtures (time-IoU + rank@k).
@@ -239,9 +239,32 @@ async function main(): Promise<void> {
     rows.push({ name: "semantic-local", live: true, run: (t) => generateSemanticHighlights(t, new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBase), "llama-cpp"), { limit: LIMIT, minDuration: 10, maxDuration: 90 }) });
   }
 
+  // Real hybrid rerank row: the production two-round path against a live
+  // OpenAI-compatible endpoint. Opt in with HYBRID_EVAL_BASE_URL + HYBRID_EVAL_MODEL
+  // (optionally HYBRID_EVAL_API_KEY) so CI never calls a remote model by accident.
+  const hybridBase = process.env.HYBRID_EVAL_BASE_URL?.trim();
+  const hybridModel = process.env.HYBRID_EVAL_MODEL?.trim();
+  const hybridUp = Boolean(hybridBase && hybridModel);
+  if (hybridUp) {
+    const hybridProvider = new SemanticProviderAdapter(
+      new OpenAIChatHighlightProvider(hybridBase!, process.env.HYBRID_EVAL_API_KEY ?? "", hybridModel!),
+      `openai:${hybridBase}|${hybridModel}`,
+    );
+    rows.push({
+      name: "hybrid-rerank",
+      live: true,
+      run: async (t) => {
+        const candidates = buildRerankCandidates(t, undefined, 15);
+        if (!candidates.length) return [];
+        return rerankCandidates(t, candidates, hybridProvider, LIMIT);
+      },
+    });
+  }
+
   console.log(`== highlight eval: ${cases.length} cases, ${expectedCount} expected, IoU threshold ${THRESHOLD} ==`);
   if (!geminiKey) console.log("   (semantic-gemini skipped: GEMINI_API_KEY not set)");
   if (!llamaUp) console.log(`   (semantic-local skipped: no llama-server at ${llamaBase}/v1/models)`);
+  if (!hybridUp) console.log("   (hybrid-rerank skipped: HYBRID_EVAL_BASE_URL/HYBRID_EVAL_MODEL not set)");
 
   const aggregates = new Map<string, { meanIou: number; hitAt: Record<number, number>; failures: number; worst: { id: string; iou: number } }>();
 
