@@ -198,6 +198,7 @@ async function main(): Promise<void> {
   console.log(`current Tier-2 top-15 mean target IoU ${meanTargetIou("currentPredictions").toFixed(2)} · recall@15 ${currentRecall15.hits}/${currentRecall15.total} ${(currentRecall15.recall * 100).toFixed(0)}% · top-5 recall ${currentTop5Recall.hits}/${currentTop5Recall.total} ${(currentTop5Recall.recall * 100).toFixed(0)}%`);
   console.log(`hybrid oracle top-5 mean target IoU ${meanTargetIou("hybridPredictions").toFixed(2)} · recall@5 ${hybridRecall5.hits}/${hybridRecall5.total} ${(hybridRecall5.recall * 100).toFixed(0)}% · source shortlist recall@15 ${currentRecall15.hits}/${expectedCount} (oracle ceiling; not model performance)`);
   console.log("   note: fixture has no RMS measurements and uses synthetic word timings; it cannot measure real audio-energy/speech-rate gains.");
+
   for (const row of detailed) {
     const baseline = targetRecall(row.item.expected, row.legacyPredictions, 15);
     const current = targetRecall(row.item.expected, row.currentPredictions, 15);
@@ -270,6 +271,7 @@ async function main(): Promise<void> {
 
   for (const row of rows) {
     const results: CaseResult[] = [];
+    const targetRows: Array<{ expected: Expected[]; predictions: Highlight[] }> = [];
     let failures = 0;
     let worst = { id: "", iou: Infinity };
     let aborted = false;
@@ -291,6 +293,7 @@ async function main(): Promise<void> {
         }
         const result = scoreCase(item.expected, predictions, ks);
         results.push(result);
+        targetRows.push({ expected: item.expected, predictions });
         if (result.meanIou < worst.iou) worst = { id: item.id, iou: result.meanIou };
       } catch (error) {
         failures += 1;
@@ -302,8 +305,10 @@ async function main(): Promise<void> {
     const agg = aggregate(results);
     aggregates.set(row.name, { ...agg, failures, worst });
     const hits = ks.map((k) => `${((agg.hitAt[k] ?? 0) * 100).toFixed(0)}%`.padStart(5)).join("  ");
-    console.log(`${row.name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@1/3/5:${hits}   worst case ${worst.id} (${worst.iou.toFixed(2)})${failures ? `   failures ${failures}` : ""}`);
+    const targetRecall5 = aggregateTargetRecall(targetRows, 5);
+    console.log(`${row.name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@1/3/5:${hits}   target recall@5 ${targetRecall5.hits}/${targetRecall5.total}   worst case ${worst.id} (${worst.iou.toFixed(2)})${failures ? `   failures ${failures}` : ""}`);
   }
+
 
   // Pause-boundary signal: fixtures are contiguous, so verify directly that a
   // ≥0.7s internal gap (Whisper word-timing derived) lifts a segment's score.

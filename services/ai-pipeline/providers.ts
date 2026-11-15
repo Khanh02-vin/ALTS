@@ -329,7 +329,7 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
       const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
       const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
         method: "POST", headers: { "content-type": "application/json", ...this.authHeaders() },
-        body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 500, response_format: { type: "json_object", schema: RERANK_OUTPUT_SCHEMA }, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] }),
+        body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 1500, response_format: { type: "json_object", schema: RERANK_OUTPUT_SCHEMA }, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] }),
         signal,
       });
       if (!response.ok) throw new Error(`LLAMA_CPP_RERANK_PROVIDER_${response.status}`);
@@ -426,11 +426,16 @@ export class OpenAIChatHighlightProvider implements HighlightProvider {
       const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
       const headers: Record<string, string> = { "content-type": "application/json" };
       if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
-      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+      const payload = { model: this.model, temperature: 0.2, max_tokens: 1500, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] };
+      const send = (body: object) => fetch(`${this.baseUrl}/chat/completions`, {
         method: "POST", headers,
-        body: JSON.stringify({ model: this.model, temperature: 0.2, max_tokens: 500, response_format: { type: "json_object" }, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] }),
+        body: JSON.stringify(body),
         signal,
       });
+      // Some OpenAI-compatible gateways fail json_object reranking upstream
+      // (502 "completed without content"), so retry once without the hint.
+      let response = await send({ ...payload, response_format: { type: "json_object" } });
+      if (!response.ok && response.status >= 500) response = await send(payload);
       if (!response.ok) throw new Error(`OPENAI_CHAT_RERANK_PROVIDER_${response.status}`);
       const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
       return extractRerankSelections(parseJsonObject(raw.choices?.[0]?.message?.content ?? "", "OPENAI_CHAT_RERANK_BAD_JSON"));
