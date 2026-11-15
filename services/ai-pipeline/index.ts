@@ -1,5 +1,6 @@
 import type { WhisperOptions } from "../../adapters/local/whisper.ts";
 import { transcribeChunkedWithWhisper, type ChunkedWhisperOptions } from "../../adapters/local/chunked-whisper.ts";
+import { REMOTE_STT_FAILED } from "../../adapters/local/whisper-remote.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
 import { snapHighlightsToPauses } from "./pause-snap.ts";
@@ -81,8 +82,25 @@ export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: str
   return enrichAnalysis(transcript, highlights);
 }
 
-export type SemanticAnalyzeOptions = LocalAnalyzeOptions & {
-  semanticProvider?: SemanticHighlightProvider;
+/// Cloud STT (BYOK) is best-effort: any REMOTE_STT_FAILED failure re-runs the
+/// whole analysis on the local whisper.cpp engine, so a network outage or a
+/// bad key degrades to the offline path instead of failing the job.
+export async function analyzeLocalVideoWithSttFallback(
+  audioPath: string,
+  sourceArtifactId: string,
+  duration: number,
+  options: LocalAnalyzeOptions = {},
+): Promise<LocalClipAnalysis> {
+  try {
+    return await analyzeLocalVideo(audioPath, sourceArtifactId, duration, options);
+  } catch (error) {
+    if (!String(error).includes(REMOTE_STT_FAILED)) throw error;
+    console.warn("[ai-pipeline] cloud STT failed; falling back to the local whisper.cpp engine");
+    return await analyzeLocalVideo(audioPath, sourceArtifactId, duration, { ...options, engine: "cpp" });
+  }
+}
+
+export type SemanticAnalyzeOptions = LocalAnalyzeOptions & {  semanticProvider?: SemanticHighlightProvider;
   semanticCategory?: string;
   semanticLimit?: number;
 };

@@ -331,3 +331,96 @@ pub(crate) fn highlight_strategy_status(_app: tauri::AppHandle) -> serde_json::V
         .unwrap_or(false);
     serde_json::json!({ "strategy": strategy, "hasKey": has_key, "hasLocalUrl": has_local_url })
 }
+
+// --- Cloud speech-to-text (BYOK; OpenAI-audio compatible, e.g. Groq) ---
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CloudSttStore {
+    version: u32,
+    base_url: String,
+    api_key: String,
+    model: String,
+}
+
+pub(crate) fn read_cloud_stt_store() -> Result<CloudSttStore, String> {
+    let path = data_dir().join("stt.json");
+    if path.exists() {
+        return serde_json::from_slice(&std::fs::read(path).map_err(|e| format!("STT_READ:{e}"))?)
+            .map_err(|e| format!("STT_PARSE:{e}"));
+    }
+    Ok(CloudSttStore::default())
+}
+
+pub(crate) fn write_cloud_stt_store(store: &CloudSttStore) -> Result<(), String> {
+    write_private_file(
+        &data_dir().join("stt.json"),
+        &serde_json::to_vec_pretty(store).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("STT_WRITE:{e}"))
+}
+
+/// Flattens the cloud STT settings into the worker env; an empty key clears
+/// every STT_* entry so the worker stays on the local engine.
+pub(crate) fn flatten_cloud_stt(env: &mut HashMap<String, String>, store: &CloudSttStore) {
+    for key in ["STT_REMOTE_BASE_URL", "STT_API_KEY", "STT_REMOTE_MODEL"] {
+        env.remove(key);
+    }
+    if store.api_key.trim().is_empty() {
+        return;
+    }
+    env.insert("STT_API_KEY".into(), store.api_key.clone());
+    if !store.base_url.trim().is_empty() {
+        env.insert("STT_REMOTE_BASE_URL".into(), store.base_url.trim().to_string());
+    }
+    if !store.model.trim().is_empty() {
+        env.insert("STT_REMOTE_MODEL".into(), store.model.trim().to_string());
+    }
+}
+
+#[tauri::command]
+pub(crate) fn cloud_stt_status() -> Result<serde_json::Value, String> {
+    let store = read_cloud_stt_store()?;
+    Ok(serde_json::json!({
+        "configured": !store.api_key.trim().is_empty(),
+        "baseUrl": store.base_url,
+        "model": store.model,
+    }))
+}
+
+#[tauri::command]
+pub(crate) fn save_cloud_stt(base_url: Option<String>, api_key: Option<String>, model: Option<String>) -> Result<(), String> {
+    let key = api_key.unwrap_or_default();
+    if key.trim().is_empty() {
+        return Err("STT_KEY_REQUIRED".into());
+    }
+    let mut store = read_cloud_stt_store()?;
+    store.version = 1;
+    if let Some(v) = base_url {
+        store.base_url = v.trim().to_string();
+    }
+    store.api_key = key.trim().to_string();
+    if let Some(v) = model {
+        store.model = v.trim().to_string();
+    }
+    if store.base_url.trim().is_empty() {
+        store.base_url = "https://api.groq.com/openai/v1".into();
+    }
+    if store.model.trim().is_empty() {
+        store.model = "whisper-large-v3-turbo".into();
+    }
+    write_cloud_stt_store(&store)?;
+    let mut env = runtime_env();
+    flatten_cloud_stt(&mut env, &store);
+    write_runtime_settings(&env)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn clear_cloud_stt() -> Result<(), String> {
+    write_cloud_stt_store(&CloudSttStore::default())?;
+    let mut env = runtime_env();
+    flatten_cloud_stt(&mut env, &CloudSttStore::default());
+    write_runtime_settings(&env)?;
+    Ok(())
+}

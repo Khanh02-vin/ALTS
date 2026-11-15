@@ -1,14 +1,42 @@
-import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, resolveHighlightStrategy, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
+import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, analyzeLocalVideoWithSttFallback, resolveHighlightStrategy, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
-import { readFile, mkdir, rename, writeFile } from "node:fs/promises";
+import { readFile, mkdir, rename, writeFile, rm } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { readFileSync } from "node:fs";
 import { validateTranscript, type Transcript } from "../packages/contracts/transcript.ts";
 import { dirname, join } from "node:path";
 import { assertAudioTrack } from "../adapters/local/probe-audio.ts";
+import { resolveWhisperEngine } from "../adapters/local/whisper-engine.ts";
+import { REMOTE_STT_FAILED } from "../adapters/local/whisper-remote.ts";
 import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collections.ts";
+import { parseSrtVtt, transcriptFromSubtitles, pickSubtitleTrack } from "../services/ai-pipeline/subtitles.ts";
 import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
 import { planChunkBoundaries } from "../adapters/local/chunked-whisper.ts";
+
+/// Embedded-subtitle probe (subtitle-first): a local file that already carries
+/// a subtitle track skips Whisper — the cues become the transcript and are
+/// scored exactly like an injected fixture. Best-effort: any probe/extract
+/// failure returns undefined and the pipeline stays on Whisper.
+async function embeddedSubtitleTranscript(mediaPath: string, duration: number, language?: string): Promise<Transcript | undefined> {
+  const probe = spawnSync(process.env.FFPROBE_PATH ?? "ffprobe", ["-v", "error", "-show_entries", "stream=index,codec_type:stream_tags=language", "-of", "json", mediaPath], { encoding: "utf8", timeout: 30_000 });
+  if (probe.status !== 0) return undefined;
+  const streams = (JSON.parse(probe.stdout || "{}")?.streams ?? []) as Array<{ index: number; codec_type?: string; tags?: { language?: string } }>;
+  const track = pickSubtitleTrack(streams.map((stream) => ({ index: stream.index, codecType: stream.codec_type, language: stream.tags?.language })), language);
+  if (track === undefined) return undefined;
+  const relative = streams.filter((stream) => stream.codec_type === "subtitle").findIndex((stream) => stream.index === track);
+  if (relative < 0) return undefined;
+  const out = join(tmpdir(), `lfai-sub-${Date.now()}-${process.pid}.srt`);
+  const extract = spawnSync(process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-loglevel", "error", "-i", mediaPath, "-map", `0:s:${relative}`, "-f", "srt", out], { encoding: "utf8", timeout: 60_000 });
+  if (extract.status !== 0) return undefined;
+  const cues = parseSrtVtt(readFileSync(out, "utf8"));
+  rm(out, { force: true }).catch(() => {});
+  if (!cues.length) return undefined;
+  console.warn(`[analyze-video] using embedded subtitle track — Whisper skipped`);
+  return transcriptFromSubtitles(sourceArtifactId, duration, language ?? "und", cues, "embedded-subs");
+}
 
 const [mediaPath, sourceArtifactId, durationText, rangeStartText, rangeEndText, jobId, statePath] = process.argv.slice(2);
 const duration = Number(durationText);
@@ -90,7 +118,7 @@ try {
 
   const analyzeOptions = {
     command: process.env.WHISPER_COMMAND,
-    engine: process.env.WHISPER_ENGINE === "python" ? "python" as const : "cpp" as const,
+    engine: resolveWhisperEngine(process.env.WHISPER_ENGINE),
     model: process.env.WHISPER_MODEL,
     modelPath: process.env.WHISPER_MODEL_PATH,
     language: process.env.WHISPER_LANGUAGE,
@@ -108,7 +136,7 @@ try {
         boundaries: planChunkBoundaries(rangeEnd - rangeStart, 600, audioRms?.windows.map((window) => ({ ...window, start: window.start - rangeStart, end: window.end - rangeStart }))),
       }
       : {}),
-    transcript: await loadTranscriptFixture(sourceArtifactId),
+    transcript: (await loadTranscriptFixture(sourceArtifactId)) ?? (await embeddedSubtitleTranscript(mediaPath, duration, process.env.WHISPER_LANGUAGE)),
     onChunkStart: (index: number, total: number) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
     onChunkComplete: (index: number, total: number, cacheHit: boolean) => {
       store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });
@@ -131,9 +159,19 @@ try {
     : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
-  const result = semanticProvider
-    ? await analyzeLocalVideoWithSemantic(mediaPath, sourceArtifactId, rangeEnd - rangeStart, { semanticProvider, semanticLimit: 5, ...analyzeOptions })
-    : await analyzeLocalVideo(mediaPath, sourceArtifactId, rangeEnd - rangeStart, analyzeOptions);
+  // Cloud STT (BYOK) is best-effort: a REMOTE_STT_FAILED failure re-runs the
+  // whole analysis on the local whisper.cpp engine before the job can fail.
+  const attemptAnalysis = (engine: "python" | "cpp" | "openai-audio" | undefined) => semanticProvider
+    ? analyzeLocalVideoWithSemantic(mediaPath, sourceArtifactId, rangeEnd - rangeStart, { semanticProvider, semanticLimit: 5, ...analyzeOptions, engine })
+    : analyzeLocalVideoWithSttFallback(mediaPath, sourceArtifactId, rangeEnd - rangeStart, { ...analyzeOptions, engine });
+  let result;
+  try {
+    result = await attemptAnalysis(analyzeOptions.engine);
+  } catch (error) {
+    if (!String(error).includes(REMOTE_STT_FAILED)) throw error;
+    console.warn("[analyze-video] cloud STT failed; falling back to the local whisper.cpp engine");
+    result = await attemptAnalysis("cpp");
+  }
   if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
   // Free tier: only the top 3 highlights, CPU + tiny already enforced by start_analysis.
   if (process.env.LICENSE_TIER !== "pro") result.highlights = result.highlights.slice(0, 3);

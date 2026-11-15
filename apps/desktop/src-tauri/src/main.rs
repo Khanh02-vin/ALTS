@@ -37,8 +37,9 @@ use diarization::{
 use paths::*;
 use preview::{delete_video_preview, prepare_video_preview};
 use providers::{
-    activate_ai_provider, delete_ai_provider, highlight_strategy_status, list_ai_providers,
-    save_ai_provider, set_highlight_strategy,
+    activate_ai_provider, clear_cloud_stt, cloud_stt_status, delete_ai_provider,
+    highlight_strategy_status, list_ai_providers, save_ai_provider, save_cloud_stt,
+    set_highlight_strategy,
 };
 use runtime::{
     bootstrap_whisper, clear_analysis_cache, download_llm_model, download_whisper_cpp_model,
@@ -147,6 +148,9 @@ fn main() {
             save_ai_provider,
             activate_ai_provider,
             delete_ai_provider,
+            cloud_stt_status,
+            save_cloud_stt,
+            clear_cloud_stt,
             start_local_llm,
             stop_local_llm,
             rag_server_url,

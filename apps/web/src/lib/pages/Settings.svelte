@@ -17,6 +17,11 @@ let strategy = $state("heuristic");
   type AiProvider = { id: string; name: string; baseUrl: string; model: string; hasKey: boolean };
   let providers = $state<AiProvider[]>([]);
   let activeProviderId = $state("");
+  let cloudStt = $state<{ configured: boolean; baseUrl: string; model: string }>({ configured: false, baseUrl: "", model: "" });
+  let sttBaseUrl = $state("https://api.groq.com/openai/v1");
+  let sttApiKey = $state("");
+  let sttModel = $state("whisper-large-v3-turbo");
+  let sttBusy = $state(false);
   let providerFormOpen = $state(false);
   let editingProviderId = $state("");
   let providerName = $state("");
@@ -187,6 +192,31 @@ async function pollSmall() {
     try { const result = await invoke<{providers: AiProvider[]; activeProviderId: string | null}>("list_ai_providers"); providers = result.providers; activeProviderId = result.activeProviderId ?? ""; }
     catch (error) { message = `Provider list failed: ${String(error)}`; }
   }
+  async function loadCloudStt() {
+    if (!isTauri()) return;
+    try {
+      cloudStt = await invoke<{ configured: boolean; baseUrl: string; model: string }>("cloud_stt_status");
+      if (cloudStt.baseUrl) sttBaseUrl = cloudStt.baseUrl;
+      if (cloudStt.model) sttModel = cloudStt.model;
+    } catch (error) { message = `Cloud STT status failed: ${String(error)}`; }
+  }
+  async function saveCloudStt() {
+    sttBusy = true;
+    try {
+      await invoke("save_cloud_stt", { baseUrl: sttBaseUrl, apiKey: sttApiKey, model: sttModel });
+      await loadCloudStt(); sttApiKey = ""; message = "Cloud transcription saved — analysis uploads audio only while configured.";
+    } catch (error) { message = `Cloud STT save failed: ${String(error)}`; }
+    finally { sttBusy = false; }
+  }
+  async function clearCloudStt() {
+    sttBusy = true;
+    try {
+      await invoke("clear_cloud_stt"); await loadCloudStt(); sttApiKey = "";
+      message = "Cloud transcription disabled — analysis stays on-device.";
+    } catch (error) { message = `Cloud STT clear failed: ${String(error)}`; }
+    finally { sttBusy = false; }
+  }
+
   function openProviderForm(provider?: AiProvider) {
     editingProviderId = provider?.id ?? ""; providerName = provider?.name ?? ""; providerBaseUrl = provider?.baseUrl ?? "https://api.openai.com/v1"; providerApiKey = ""; providerModel = provider?.model ?? ""; providerFormOpen = true;
   }
@@ -239,6 +269,7 @@ async function pollSmall() {
 }
 onMount(refresh);
 onMount(readStrategy);
+onMount(loadCloudStt);
 onMount(loadAiProviders);
 onMount(loadCookiesBrowser);
 onMount(() => { void reloadSetupState(); void refreshWhisperCppModels(); });
@@ -295,6 +326,19 @@ $effect(() => {
           </div>
           {#if smallProgress}<p class="hint" aria-live="polite">{smallProgress.message}{smallProgress.error ? ` — ${smallProgress.error}` : ""}</p>{/if}
         {/if}
+        </div>
+
+        <div class="panel">
+          <div class="panel-title"><span class="eyebrow">Cloud transcription (BYOK)</span></div>
+          <p class="note">Optional: send extracted audio to an OpenAI-audio-compatible endpoint (e.g. Groq whisper-large-v3-turbo) instead of local Whisper — 30-minute audio returns in seconds, with better accuracy. If the endpoint fails, analysis automatically falls back to on-device Whisper. No key = fully on-device.</p>
+          <div class="field-row"><label>Endpoint <input type="url" bind:value={sttBaseUrl} placeholder="https://api.groq.com/openai/v1" /></label></div>
+          <div class="field-row"><label>API key <input type="password" bind:value={sttApiKey} placeholder={cloudStt.configured ? "configured — paste a new key to replace" : "gsk_…"} autocomplete="off" /></label></div>
+          <div class="field-row"><label>Model <input type="text" bind:value={sttModel} placeholder="whisper-large-v3-turbo" /></label></div>
+          <div class="spread" style="margin-top:.5rem;">
+            <button class="btn btn-sm" disabled={sttBusy || !sttApiKey.trim()} onclick={saveCloudStt}>{sttBusy ? "Saving…" : "Save cloud STT"}</button>
+            {#if cloudStt.configured}<button class="btn btn-sm btn-quiet" disabled={sttBusy} onclick={clearCloudStt}>Disable (on-device only)</button>{/if}
+          </div>
+          {#if cloudStt.configured}<p class="hint" aria-live="polite">Active: {cloudStt.model || "whisper-large-v3-turbo"} via {cloudStt.baseUrl || "https://api.groq.com/openai/v1"}</p>{/if}
         </div>
 
         <div class="panel">

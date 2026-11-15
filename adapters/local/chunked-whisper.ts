@@ -8,6 +8,7 @@ import { runAbortable } from "./abortable.ts";
 import type { Transcript, Word, TranscriptSegment } from "../../packages/contracts/transcript.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 import { sourceFingerprint, chunkCacheKey, cachePath, readCachedTranscript, writeCachedTranscript } from "./analysis-cache.ts";
+import { transcribeWithRemoteStt, REMOTE_STT_DEFAULT_MODEL } from "./whisper-remote.ts";
 
 export type ChunkedWhisperOptions = WhisperOptions & { ffmpegCommand?: string; chunkSeconds?: number; overlapSeconds?: number; offsetSeconds?: number; sourceDuration?: number; chunkTimeoutMs?: number; boundaries?: number[]; onProgress?: (completed: number, total: number) => void; onChunkStart?: (index: number, total: number) => void; onChunkComplete?: (index: number, total: number, cacheHit: boolean) => void; onChunkFail?: (index: number, total: number, error: string) => void };
 
@@ -52,7 +53,7 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
       if (options.shouldAbort?.()) throw new Error("ANALYZE_INTERRUPTED");
       const start = offsetSeconds + spans[index].start;
       const end = offsetSeconds + spans[index].end;
-      const key = await chunkCacheKey(audioPath, index, start, end, `${engine}:${cppModel || options.modelPath || options.model || "tiny"}`, options.language, whisperDevice(options), whisperFp16(options), source);
+      const key = await chunkCacheKey(audioPath, index, start, end, engine === "openai-audio" ? `openai-audio:${process.env.STT_REMOTE_MODEL ?? REMOTE_STT_DEFAULT_MODEL}` : `${engine}:${cppModel || options.modelPath || options.model || "tiny"}`, options.language, whisperDevice(options), whisperFp16(options), source);
       options.onChunkStart?.(index, total);
       let cacheHit = false;
       let part: Transcript;
@@ -65,7 +66,9 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
             await runAbortable(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], { timeoutMs: options.chunkTimeoutMs ?? 120_000, abortLabel: "CHUNK_FFMPEG_ABORTED", shouldAbort: options.shouldAbort });
             const result = engine === "cpp"
               ? await transcribeWithWhisperCpp(chunk, sourceArtifactId, options.sourceDuration ?? duration, { command: cppCommand ?? "whisper-cli", modelPath: cppModel ?? "", language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort })
-              : await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
+              : engine === "openai-audio"
+                ? await transcribeWithRemoteStt(chunk, sourceArtifactId, options.sourceDuration ?? duration, { language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort })
+                : await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
             await writeCachedTranscript(cachePath(source, key), result); return result;
           } finally { await rm(chunk, { force: true }); }
         })();

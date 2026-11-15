@@ -28,3 +28,12 @@ export function resolveWhisperModelPath(
   if (!path || path.toLowerCase().endsWith(".pt")) return fallbackCpp;
   return path;
 }
+
+/// Resolves the transcription engine from a runtime.env / settings value.
+/// "openai-audio" selects the BYOK cloud STT endpoint; anything else that is
+/// not "python" falls back to the bundled whisper.cpp CLI.
+export function resolveWhisperEngine(raw: string | undefined, fallback: "python" | "cpp" | "openai-audio" = "cpp"): "python" | "cpp" | "openai-audio" {
+  const value = raw?.trim();
+  if (value === "python" || value === "openai-audio") return value;
+  return fallback;
+}
