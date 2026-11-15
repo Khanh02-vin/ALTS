@@ -25,3 +25,8 @@ apps/desktop/src-tauri/resources/lfai-render
 apps/desktop/src-tauri/*.mp4
 artifacts/
 release/
+# Local desktop-e2e build outputs (the e2e README generates the config per run)
+apps/desktop/src-tauri/local-first-desktop-e2e-web/
+apps/desktop/src-tauri/local-first-desktop-e2e-tauri.json
+# Local manual GUI test captures
+gui-test-screenshots/
