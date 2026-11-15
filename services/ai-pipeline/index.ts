@@ -4,6 +4,7 @@ import { REMOTE_STT_FAILED } from "../../adapters/local/whisper-remote.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
 import { snapHighlightsToPauses } from "./pause-snap.ts";
+import { snapHighlightsToScenes } from "./scene-snap.ts";
 import type { AudioRmsFeatures } from "./highlight-scoring.ts";
 import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
@@ -60,6 +61,8 @@ export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "
   transcript?: Transcript;
   /** Optional time-indexed audio energy from the extracted mono PCM WAV. */
   audioRms?: AudioRmsFeatures;
+  /** Optional video scene-cut timestamps, used only for boundary alignment. */
+  sceneCuts?: number[];
 };
 
 export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: string, duration: number, options: LocalAnalyzeOptions = {}): Promise<LocalClipAnalysis> {
@@ -72,7 +75,8 @@ export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: str
   const selected = duration > 120
     ? chooseContentHighlights(transcript, 5, options.audioRms)
     : chooseHeuristicHighlights(transcript, 5, options.audioRms);
-  const highlights = snapHighlightsToPauses(selected, transcript);
+  const sceneCuts = options.sceneCuts ?? [];
+  const highlights = snapHighlightsToScenes(snapHighlightsToPauses(selected, transcript), transcript, sceneCuts);
   validateTranscript(transcript);
   // Chunked transcription shifts every timestamp by the range offset, so the
   // highlights carry absolute source times — validate them against the source

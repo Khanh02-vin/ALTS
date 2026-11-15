@@ -1,4 +1,4 @@
-import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, analyzeLocalVideoWithSttFallback, resolveHighlightStrategy, SemanticProviderAdapter, NotImplementedSemanticProvider, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
+import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, analyzeLocalVideoWithSttFallback, resolveHighlightStrategy, SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/index.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
@@ -15,6 +15,21 @@ import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collecti
 import { parseSrtVtt, transcriptFromSubtitles, pickSubtitleTrack } from "../services/ai-pipeline/subtitles.ts";
 import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
 import { planChunkBoundaries } from "../adapters/local/chunked-whisper.ts";
+import { parseSceneCutMetadata } from "../services/ai-pipeline/scene-cuts.ts";
+
+function detectLocalSceneCuts(mediaPath: string, sourceArtifactId: string, duration: number): number[] {
+  if (/^https?:\/\//i.test(sourceArtifactId) || /\.(?:wav|mp3|m4a|aac|flac|ogg)$/i.test(mediaPath)) return [];
+  try {
+    const result = spawnSync(process.env.FFMPEG_COMMAND ?? "ffmpeg", [
+      "-nostdin", "-hide_banner", "-loglevel", "error", "-i", mediaPath,
+      "-vf", "scdet=threshold=20,metadata=print:file=-", "-an", "-f", "null", "-",
+    ], { encoding: "utf8", timeout: 30_000, maxBuffer: 4 * 1024 * 1024 });
+    if (result.status !== 0 || result.error) return [];
+    return parseSceneCutMetadata(`${result.stdout ?? ""}\n${result.stderr ?? ""}`, duration);
+  } catch {
+    return [];
+  }
+}
 
 /// Embedded-subtitle probe (subtitle-first): a local file that already carries
 /// a subtitle track skips Whisper — the cues become the transcript and are
@@ -137,6 +152,7 @@ try {
       }
       : {}),
     transcript: (await loadTranscriptFixture(sourceArtifactId)) ?? (await embeddedSubtitleTranscript(mediaPath, duration, process.env.WHISPER_LANGUAGE)),
+    sceneCuts: detectLocalSceneCuts(mediaPath, sourceArtifactId, duration),
     onChunkStart: (index: number, total: number) => store?.updateChunk(jobId!, index, { status: "running", attempts: 1 }),
     onChunkComplete: (index: number, total: number, cacheHit: boolean) => {
       store?.updateChunk(jobId!, index, { status: "completed", error: cacheHit ? "cache hit" : null });
@@ -148,6 +164,8 @@ try {
     // Kills the whisper/ffmpeg child currently running instead of letting it finish
     // after this process is asked to stop (the old flag was only read between chunks).
     shouldAbort: () => interrupted,
+    whisperPrompt: process.env.WHISPER_PROMPT?.trim() || undefined,
+    useDtw: process.env.WHISPER_DTW === "1" || process.env.WHISPER_DTW === "true",
   };
 
   // CachedSemanticProvider: same transcript + prompt version replays stored

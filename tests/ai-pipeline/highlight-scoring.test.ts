@@ -27,7 +27,10 @@ const strongText = {
 function windows(seconds: number, rms: (index: number) => number): AudioRmsFeatures {
   return {
     windows: Array.from({ length: seconds }, (_, index) => ({ start: index, end: index + 1, rms: rms(index) })),
-    query: () => 0,
+    query: (start, end) => {
+      const overlapping = Array.from({ length: seconds }, (_, index) => ({ start: index, end: index + 1, rms: rms(index) })).filter((window) => window.end > start && window.start < end);
+      return overlapping.length ? overlapping.reduce((sum, window) => sum + window.rms, 0) / overlapping.length : 0;
+    },
   };
 }
 
@@ -67,5 +70,18 @@ assert.equal(componentScoreMetadata(undefined, textOnly, true).scoreAudio, true)
 // Provider values win over the deterministic fallback, and defaults stay explicit.
 assert.deepEqual(componentScoreMetadata({ hook: 80 }, textOnly).scores, { hook: 80, summary: textOnly.summary, impact: textOnly.impact });
 assert.equal(componentScoreMetadata({ hook: 80 }, textOnly).scoreAudio, false);
+
+// Aggregate selection score should respond to measured energy and word-timed speech rate.
+import { scoreAggregateHighlight } from "../../services/ai-pipeline/highlight-scoring.ts";
+const candidate = { start: 0, end: 10, text: "Start with a complete example.", transcript, hookCue: false, complete: true, pauseBoundary: false };
+const quietAudio = windows(30, () => 0.01);
+const energeticAudio = windows(30, (index) => index < 10 ? 0.08 : 0.01);
+const lowRateTranscript = { ...transcript, words: Array.from({ length: 10 }, (_, i) => ({ id: `low-${i}`, text: "word", start: i, end: i + 0.5 })) } as Transcript;
+const highRateTranscript = { ...transcript, words: Array.from({ length: 30 }, (_, i) => ({ id: `high-${i}`, text: "word", start: i / 3, end: i / 3 + 0.2 })) } as Transcript;
+const baseAggregate = scoreAggregateHighlight({ ...candidate, transcript: lowRateTranscript });
+assert.ok(scoreAggregateHighlight({ ...candidate, transcript: highRateTranscript }) > baseAggregate, "higher speech rate should moderately improve aggregate rank");
+assert.ok(scoreAggregateHighlight({ ...candidate, transcript: lowRateTranscript, audioRms: energeticAudio }) > scoreAggregateHighlight({ ...candidate, transcript: lowRateTranscript, audioRms: quietAudio }), "high energy should improve aggregate rank");
+assert.equal(scoreAggregateHighlight({ ...candidate, transcript: lowRateTranscript }), scoreAggregateHighlight({ ...candidate, transcript: lowRateTranscript, audioRms: undefined }), "missing audio should preserve text-only ranking");
+assert.ok(baseAggregate >= 0 && baseAggregate <= 100);
 
 console.log("highlight-scoring: ok");

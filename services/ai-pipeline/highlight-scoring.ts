@@ -17,6 +17,28 @@ export type HighlightScoreSignals = {
   audioRms?: AudioRmsFeatures;
 };
 
+export type AggregateHighlightSignals = Pick<HighlightScoreSignals, "start" | "end" | "text" | "transcript" | "hookCue" | "complete" | "pauseBoundary" | "audioRms"> & { baseScore?: number };
+
+/** Add bounded, deterministic audio-energy and speech-rate evidence to selector ranking. */
+export function scoreAggregateHighlight(signals: AggregateHighlightSignals): number {
+  const duration = Math.max(0.001, signals.end - signals.start);
+  const wordCount = signals.transcript.words.length
+    ? signals.transcript.words.filter((word) => word.start >= signals.start && word.end <= signals.end).length
+    : tokens(signals.text).length;
+  const legacyBaseline = Math.min(100, wordCount * 5 + (signals.hookCue ? 25 : 0) + (signals.complete ? 10 : 0) + (signals.pauseBoundary ? 8 : 0));
+  const baseline = Math.max(0, Math.min(100, signals.baseScore ?? legacyBaseline));
+  const speechRate = wordCount / duration;
+  // Reward a moderate speaking pace lightly; this should refine, not replace,
+  // the selector's existing text-quality rank.
+  const speechBonus = signals.audioRms && wordCount > 0 ? Math.max(0, 4 * (1 - Math.abs(speechRate - 3) / 3)) : 0;
+  const energyWindows = signals.audioRms?.windows.filter((window) => window.end > signals.start && window.start < signals.end) ?? [];
+  const energy = energyWindows.length
+    ? energyWindows.reduce((sum, window) => sum + window.rms, 0) / energyWindows.length
+    : 0;
+  const energyBonus = signals.audioRms && energyWindows.length ? Math.min(10, Math.max(0, energy / 0.08 * 10)) : 0;
+  return Math.max(0, Math.min(100, Math.round(baseline + speechBonus + energyBonus)));
+}
+
 /** Coerces component scores into their literal inclusive 0–100 scale. */
 export function normalizeComponentScore(value: unknown): number {
   if (typeof value !== "number" && typeof value !== "string") return 0;

@@ -1,7 +1,7 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
-import { componentScoreMetadata, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
+import { componentScoreMetadata, scoreAggregateHighlight, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 
 const HOOK_WORDS = /\b(how|why|secret|mistake|important|best|never|first|problem|solution|learn|key)\b/i;
 const PAUSE_SECONDS = 0.7;
@@ -13,18 +13,7 @@ const MAX_WINDOW_SECONDS = 30.0;
 // A window must contain at least this many seconds of audio to be a candidate.
 const MIN_WINDOW_SECONDS = 4.0;
 
-/** Builds candidate windows over a transcript. Two strategies:
- *  1) Sentence groups: split the word timeline at sentence-final punctuation and
- *     pauses >= PAUSE_SECONDS, so a candidate never cuts a sentence in half.
- *     Both signals live on the words themselves, so the same audio yields the
- *     same candidates regardless of how an engine groups words into segments
- *     (e.g. openai-whisper vs whisper.cpp).
- *  2) Segment-anchored fallback: when there are no words at all (e.g. manual
- *     transcript), use each segment as one candidate window.
- * The result is a set of non-overlapping candidates selected by score via NMS.
- * Exported with nonMaximumSuppression so the eval can re-rank the exact same
- * candidate set with alternative scorers instead of duplicating windowing. */
-export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): Array<{
+export type HeuristicWindow = {
   start: number;
   end: number;
   wordIds: string[];
@@ -34,20 +23,13 @@ export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures
   pauseBoundary: boolean;
   score: number;
   scores: { hook: number; summary: number; impact: number };
-}> {
+};
+
+/** Builds candidate windows from transcript boundaries for ranking and evaluation. */
+export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): HeuristicWindow[] {
 
   const words = transcript.words;
-  const windows: Array<{
-    start: number;
-    end: number;
-    wordIds: string[];
-    text: string;
-    hook: boolean;
-    complete: boolean;
-    pauseBoundary: boolean;
-    score: number;
-    scores: { hook: number; summary: number; impact: number };
-  }> = [];
+  const windows: HeuristicWindow[] = [];
 
   const addWindow = (
     start: number,
@@ -58,12 +40,7 @@ export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures
     complete: boolean,
     pauseBoundary: boolean,
   ) => {
-    const wordCount = wordIds.length || text.split(/\s+/).filter(Boolean).length;
-    const score = Math.min(
-      100,
-      wordCount * 5 + (hook ? 25 : 0) + (complete ? 10 : 0) +
-        (pauseBoundary ? 8 : 0),
-    );
+    const score = scoreAggregateHighlight({ start, end, text, transcript, hookCue: hook, complete, pauseBoundary, audioRms, baseScore: Math.min(100, (wordIds.length || text.split(/\s+/).filter(Boolean).length) * 5 + (hook ? 25 : 0) + (complete ? 10 : 0) + (pauseBoundary ? 8 : 0)) });
     const scores = scoreHighlightComponents({
       start,
       end,
@@ -171,6 +148,17 @@ export function nonMaximumSuppression(
   for (const w of sorted) {
     const overlaps = chosen.some((c) => w.start < c.end && c.start < w.end);
     if (!overlaps) chosen.push(w);
+    if (chosen.length >= limit) break;
+  }
+  return chosen.sort((a, b) => a.start - b.start);
+}
+
+export function selectHeuristicWindows<T extends { start: number; end: number; score: number }>(windows: T[], limit: number): T[] {
+  const sorted = [...windows].sort((a, b) => b.score - a.score || a.start - b.start);
+  const chosen: T[] = [];
+  for (const window of sorted) {
+    if (chosen.some((selected) => window.start < selected.end && selected.start < window.end)) continue;
+    chosen.push(window);
     if (chosen.length >= limit) break;
   }
   return chosen.sort((a, b) => a.start - b.start);
