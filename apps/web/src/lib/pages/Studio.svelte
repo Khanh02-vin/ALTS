@@ -437,15 +437,14 @@
     } catch (error) { message = `Could not create project: ${String(error)}`; }
   }
 
-  /// Default analysis range: the whole video, capped at the 10-minute default.
-  /// The old hard-coded 600 s exceeded short videos and made the backend reject
-  /// "Start analysis" (INVALID_ANALYZE_RANGE) with no visible feedback.
+  /// Default analysis range: the whole video, no 600 s cap — a 30-minute video
+  /// is scored in full instead of only its first 10 minutes.
   function applyDefaultRange(duration: number) {
     const seconds = Number.isFinite(duration) && duration > 0 ? Math.floor(duration) : 0;
     analyzeStart = 0;
-    analyzeEnd = seconds > 0 ? Math.min(600, seconds) : 600;
+    analyzeEnd = Math.floor(Math.max(0, seconds));
     manualStart = 0;
-    manualEnd = seconds > 0 ? seconds : 600;
+    manualEnd = Math.floor(Math.max(0, seconds));
   }
 
   // Single reset path for "no source loaded". loadVideo and the Remove button
@@ -1007,14 +1006,7 @@ function clock(seconds: number) { return `${Math.floor(seconds / 60)}:${String(M
     </div>
 
     <div class="card">
-      <div class="section-title">Range (seconds{meta ? ` · full ${clock(meta.duration)}` : ""})</div>
-      <div class="field-row">
-        <label>Start <input type="number" min="0" max={meta && meta.duration > 0 ? Math.max(0, Math.floor(meta.duration) - 1) : undefined} bind:value={analyzeStart} /></label>
-        <label>End <input type="number" min="1" max={meta && meta.duration > 0 ? Math.floor(meta.duration) : undefined} bind:value={analyzeEnd} /></label>
-      </div>
-      {#if meta && meta.duration > 0 && analyzeEnd > Math.floor(meta.duration)}
-        <p class="hint">Range is clamped to the video length ({clock(meta.duration)}) when analysis starts.</p>
-      {/if}
+      <div class="section-title">Analyze the full video</div>
       <button class="btn btn-primary btn-wide" disabled={!inputPath || !sourceVerified || busy || analyzeEnd <= analyzeStart} onclick={runtimeStore.ready ? analyze : () => (manualFallbackOpen = !manualFallbackOpen)}>
         {#if busy}<span class="spinner"></span>{/if}
         {busy ? "Processing…" : "Start analysis"}
