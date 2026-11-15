@@ -6,8 +6,13 @@ import type { Transcript } from "../../packages/contracts/transcript.ts";
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { snapHighlightsToPauses } from "../../services/ai-pipeline/pause-snap.ts";
-import { buildWindows, chooseHeuristicHighlights, nonMaximumSuppression } from "../../services/ai-pipeline/heuristic.ts";
-import { chooseContentHighlights } from "../../services/ai-pipeline/content-highlights.ts";
+import { buildWindows, chooseHeuristicHighlights, nonMaximumSuppression, selectHeuristicWindows } from "../../services/ai-pipeline/heuristic.ts";
+import { buildContentWindows, chooseContentHighlights } from "../../services/ai-pipeline/content-highlights.ts";
+import { buildRerankCandidates, rerankCandidates } from "../../services/ai-pipeline/hybrid-highlights.ts";
+import { scoreAggregateHighlight } from "../../services/ai-pipeline/highlight-scoring.ts";
+import type { SemanticHighlightProvider } from "../../services/ai-pipeline/semantic.ts";
+import { snapHighlightsToScenes } from "../../services/ai-pipeline/scene-snap.ts";
+import { parseSceneCutMetadata } from "../../services/ai-pipeline/scene-cuts.ts";
 import { generateSemanticHighlights, createMockSemanticProvider, SemanticProviderAdapter } from "../../services/ai-pipeline/semantic.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
 
@@ -71,6 +76,19 @@ function timeIou(a: { start: number; end: number }, b: { start: number; end: num
 
 type CaseResult = { meanIou: number; hits: Record<number, boolean> };
 
+type TargetRecall = { hits: number; total: number; recall: number };
+
+function targetRecall(expected: Expected[], predictions: Array<{ start: number; end: number }>, k: number): TargetRecall {
+  const ranked = predictions.slice(0, k);
+  const hits = expected.filter((target) => ranked.some((prediction) => timeIou(target, prediction) >= THRESHOLD)).length;
+  return { hits, total: expected.length, recall: expected.length ? hits / expected.length : 0 };
+}
+
+function targetMeanIou(expected: Expected[], predictions: Array<{ start: number; end: number }>): number {
+  const sum = expected.reduce((total, target) => total + Math.max(0, ...predictions.map((prediction) => timeIou(target, prediction))), 0);
+  return expected.length ? sum / expected.length : 0;
+}
+
 function scoreCase(expected: Expected[], predictions: Array<{ start: number; end: number; score: number }>, ks: number[]): CaseResult {
   const ranked = [...predictions].sort((a, b) => b.score - a.score || a.start - b.start);
   let sum = 0;
@@ -80,6 +98,12 @@ function scoreCase(expected: Expected[], predictions: Array<{ start: number; end
     for (const k of ks) hits[k] = (hits[k] ?? false) || ranked.slice(0, k).some((p) => timeIou(target, p) >= THRESHOLD);
   }
   return { meanIou: expected.length ? sum / expected.length : 0, hits };
+}
+
+function aggregateTargetRecall(results: Array<{ expected: Expected[]; predictions: Array<{ start: number; end: number }> }>, k: number): TargetRecall {
+  const total = results.reduce((sum, result) => sum + result.expected.length, 0);
+  const hits = results.reduce((sum, result) => sum + targetRecall(result.expected, result.predictions, k).hits, 0);
+  return { hits, total, recall: total ? hits / total : 0 };
 }
 
 function aggregate(results: CaseResult[]): { meanIou: number; hitAt: Record<number, number> } {
@@ -115,6 +139,73 @@ async function main(): Promise<void> {
   const transcripts = cases.map((item) => ({ item, transcript: buildTranscript(item) }));
   const expectedCount = cases.reduce((sum, item) => sum + item.expected.length, 0);
   const ks = [1, 3, 5];
+
+  const detailedRows = transcripts.map(({ item, transcript }) => {
+    const usesContent = transcript.duration > 120;
+    const windows = usesContent ? buildContentWindows(transcript) : buildWindows(transcript);
+    const legacyWindows = windows.map((window) => {
+      const wordCount = window.wordIds.length || window.text.split(/\s+/).filter(Boolean).length;
+      const score = usesContent
+        ? Math.max(0, Math.min(100, Math.round(window.quality.completeness * .25 + window.quality.coherence * .2 + window.quality.hook * .2 + window.quality.value * .2 + window.quality.ending * .15 - window.quality.abruptCutPenalty * .25)))
+        : Math.min(100, wordCount * 5 + (window.hook ? 25 : 0) + (window.complete ? 10 : 0) + (window.pauseBoundary ? 8 : 0));
+      return { ...window, score };
+    });
+    const currentWindows = windows;
+    const legacyTop = selectHeuristicWindows(legacyWindows, 15);
+    const currentTop = selectHeuristicWindows(currentWindows, 15);
+    const legacyTop5 = selectHeuristicWindows(legacyWindows, 5).map((window) => ({ start: window.start, end: window.end }));
+    const currentTop5 = selectHeuristicWindows(currentWindows, 5).map((window) => ({ start: window.start, end: window.end }));
+    const legacyPredictions = legacyTop.map((window) => ({ start: window.start, end: window.end }));
+    const currentPredictions = currentTop.map((window) => ({ start: window.start, end: window.end }));
+    const candidates = buildRerankCandidates(transcript, undefined, 15);
+    assert.ok(candidates.length <= 15, `${item.id}: hybrid shortlist must be capped at 15`);
+    if (item.id === "short-hook") {
+      assert.ok(candidates.some((candidate) => timeIou(item.expected[0]!, candidate) >= THRESHOLD), "short-hook must be present in the real top-15 shortlist");
+    }
+    const provider: SemanticHighlightProvider = {
+      async generate() { throw new Error("eval rerank must not call semantic generation"); },
+      async rerank({ candidates: offered, limit }) {
+        assert.equal(offered.length, candidates.length);
+        return { selections: offered
+          .map((candidate) => ({ candidateId: candidate.id, score: Math.max(0, ...item.expected.map((target) => timeIou(target, candidate))) * 100 }))
+          .sort((a, b) => b.score - a.score)
+          .slice(0, limit) };
+      },
+    };
+    return (async () => ({
+      item,
+      transcript,
+      legacyPredictions,
+      currentPredictions,
+      legacyTop5,
+      currentTop5,
+      hybridPredictions: await rerankCandidates(transcript, candidates, provider, 5),
+    }))();
+  });
+  const detailed = await Promise.all(detailedRows);
+  assert.equal(detailed.reduce((sum, row) => sum + row.item.expected.length, 0), expectedCount);
+  const baselineRecall15 = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.legacyPredictions })), 15);
+  const currentRecall15 = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.currentPredictions })), 15);
+  const legacyTop5Recall = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.legacyTop5 })), 5);
+  const currentTop5Recall = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.currentTop5 })), 5);
+  const hybridRecall5 = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.hybridPredictions })), 5);
+  const meanTargetIou = (key: "legacyPredictions" | "currentPredictions" | "hybridPredictions") => detailed.reduce((sum, row) => sum + targetMeanIou(row.item.expected, row[key]), 0) / detailed.length;
+  assert.equal(baselineRecall15.recall, currentRecall15.recall, "with no audio, current Tier-2 score should match legacy target recall");
+  assert.equal(legacyTop5Recall.recall, currentTop5Recall.recall, "with no audio, current Tier-2 top-5 should match legacy top-5 recall");
+
+  console.log("-- same-fixture ranking ablation (legacy/current use same candidate windows) --");
+  console.log(`legacy baseline top-15 mean target IoU ${meanTargetIou("legacyPredictions").toFixed(2)} · recall@15 ${baselineRecall15.hits}/${baselineRecall15.total} ${(baselineRecall15.recall * 100).toFixed(0)}% · top-5 recall ${legacyTop5Recall.hits}/${legacyTop5Recall.total} ${(legacyTop5Recall.recall * 100).toFixed(0)}%`);
+  console.log(`current Tier-2 top-15 mean target IoU ${meanTargetIou("currentPredictions").toFixed(2)} · recall@15 ${currentRecall15.hits}/${currentRecall15.total} ${(currentRecall15.recall * 100).toFixed(0)}% · top-5 recall ${currentTop5Recall.hits}/${currentTop5Recall.total} ${(currentTop5Recall.recall * 100).toFixed(0)}%`);
+  console.log(`hybrid oracle top-5 mean target IoU ${meanTargetIou("hybridPredictions").toFixed(2)} · recall@5 ${hybridRecall5.hits}/${hybridRecall5.total} ${(hybridRecall5.recall * 100).toFixed(0)}% · source shortlist recall@15 ${currentRecall15.hits}/${expectedCount} (oracle ceiling; not model performance)`);
+  console.log("   note: fixture has no RMS measurements and uses synthetic word timings; it cannot measure real audio-energy/speech-rate gains.");
+  for (const row of detailed) {
+    const baseline = targetRecall(row.item.expected, row.legacyPredictions, 15);
+    const current = targetRecall(row.item.expected, row.currentPredictions, 15);
+    const baseline5 = targetRecall(row.item.expected, row.legacyTop5, 5);
+    const current5 = targetRecall(row.item.expected, row.currentTop5, 5);
+    const hybrid = targetRecall(row.item.expected, row.hybridPredictions, 5);
+    console.log(`   ${row.item.id.padEnd(20)} recall@15 legacy ${baseline.hits}/${baseline.total} current ${current.hits}/${current.total} · recall@5 legacy ${baseline5.hits}/${baseline5.total} current ${current5.hits}/${current5.total} hybrid-oracle ${hybrid.hits}/${hybrid.total}`);
+  }
 
   const rows: Row[] = [
     { name: "heuristic", run: (t) => chooseHeuristicHighlights(t, LIMIT) },
@@ -235,6 +326,20 @@ async function main(): Promise<void> {
   assert.deepEqual(snapped[0].wordIds, ["first", "last"], "word IDs are refreshed after snapping");
   assert.equal(snapped[0].score, selected[0].score, "snapping must not change aggregate score");
   assert.equal(snapped[0].id, selected[0].id, "snapping must preserve selected identity/order");
+
+  // Scene cuts adjust boundaries only when a cut is very close, and refresh word IDs.
+  const sceneSnapped = snapHighlightsToScenes(selected, snapTranscript, [10.1, 20.25]);
+  assert.equal(sceneSnapped[0].start, 10.1);
+  assert.equal(sceneSnapped[0].end, 20.25);
+  assert.deepEqual(sceneSnapped[0].wordIds, ["first", "last"]);
+  assert.equal(sceneSnapped[0].score, selected[0].score);
+  assert.deepEqual(snapHighlightsToScenes(selected, snapTranscript, [8, 22]), selected, "distant scene cuts must not move boundaries");
+  assert.deepEqual(parseSceneCutMetadata("frame:1 lavfi.scd.time=10.1 lavfi.scd.score=22\nframe:2 lavfi.scd.time=20.25 lavfi.scd.score=25", 32), [10.1, 20.25]);
+  const shortClip = { ...selected[0], start: 10.4, end: 14.2 };
+  const partialSceneSnap = snapHighlightsToScenes([shortClip], snapTranscript, [10.1, 14.0]);
+  assert.equal(partialSceneSnap[0].start, 10.1, "a valid start snap remains even when end snap would make the clip too short");
+  assert.equal(partialSceneSnap[0].end, shortClip.end, "invalid short end snap is rejected independently");
+  assert.deepEqual(parseSceneCutMetadata("lavfi.scd.time=0\nlavfi.scd.time=32", 32), [], "cuts at video edges must be ignored");
 
   const ineligibleTranscript: Transcript = {
     ...snapTranscript,
