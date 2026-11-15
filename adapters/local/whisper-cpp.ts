@@ -13,6 +13,8 @@ export type WhisperCppOptions = {
   timestampOffset?: number;
   idPrefix?: string;
   shouldAbort?: () => boolean;
+  prompt?: string;  // Topic keywords for better accuracy
+  dtw?: boolean;    // Use DTW for more accurate timestamps
 };
 
 type Token = { text?: string; offsets?: { from?: number; to?: number } };
@@ -83,9 +85,18 @@ export async function transcribeWithWhisperCpp(
   const dir = await mkdtemp(join(tmpdir(), "local-whisper-cpp-"));
   const outputPrefix = join(dir, "result");
   try {
+    const args = [
+      "-m", options.modelPath,
+      "-f", audioPath,
+      "-ojf",
+      "-of", outputPrefix,
+      ...(options.language ? ["-l", options.language] : []),
+      ...(options.prompt ? ["--prompt", options.prompt] : []),
+      ...(options.dtw ? ["--dtw"] : []),
+    ];
     await runAbortable(
       options.command,
-      ["-m", options.modelPath, "-f", audioPath, "-ojf", "-of", outputPrefix, ...(options.language ? ["-l", options.language] : [])],
+      args,
       { timeoutMs: options.timeoutMs ?? 20 * 60_000, abortLabel: "WHISPER_CPP_ABORTED", shouldAbort: options.shouldAbort, env: { LD_LIBRARY_PATH: dirname(options.command) } },
     );
     const json = JSON.parse(await readFile(`${outputPrefix}.json`, "utf8")) as Output;

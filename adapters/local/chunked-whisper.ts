@@ -63,11 +63,11 @@ export async function transcribeChunkedWithWhisper(audioPath: string, sourceArti
         part = cached ?? await (async () => {
           const chunk = join(root, `chunk-${index}.wav`);
           try {
-            await runAbortable(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], { timeoutMs: options.chunkTimeoutMs ?? 120_000, abortLabel: "CHUNK_FFMPEG_ABORTED", shouldAbort: options.shouldAbort });
+            await runAbortable(options.ffmpegCommand ?? process.env.FFMPEG_COMMAND ?? "ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", start.toFixed(3), "-t", (end - start).toFixed(3), "-i", audioPath, "-af", "highpass=80,lowpass=8000,afftdn,dynaudnorm", "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", chunk], { timeoutMs: options.chunkTimeoutMs ?? 120_000, abortLabel: "CHUNK_FFMPEG_ABORTED", shouldAbort: options.shouldAbort });
             const result = engine === "cpp"
-              ? await transcribeWithWhisperCpp(chunk, sourceArtifactId, options.sourceDuration ?? duration, { command: cppCommand ?? "whisper-cli", modelPath: cppModel ?? "", language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort })
+              ? await transcribeWithWhisperCpp(chunk, sourceArtifactId, options.sourceDuration ?? duration, { command: cppCommand ?? "whisper-cli", modelPath: cppModel ?? "", language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort, prompt: options.whisperPrompt, dtw: options.useDtw })
               : engine === "openai-audio"
-                ? await transcribeWithRemoteStt(chunk, sourceArtifactId, options.sourceDuration ?? duration, { language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort })
+                ? await transcribeWithRemoteStt(chunk, sourceArtifactId, options.sourceDuration ?? duration, { language: options.language, timestampOffset: start, idPrefix: `c${index}-`, shouldAbort: options.shouldAbort, prompt: options.whisperPrompt, dtw: options.useDtw })
                 : await transcribeWithWhisper(chunk, sourceArtifactId, options.sourceDuration ?? duration, { ...options, timestampOffset: start, idPrefix: `c${index}-` });
             await writeCachedTranscript(cachePath(source, key), result); return result;
           } finally { await rm(chunk, { force: true }); }
