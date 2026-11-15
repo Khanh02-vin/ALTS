@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import { GeminiHighlightProvider, HIGHLIGHT_OUTPUT_SCHEMA, OpenAIChatHighlightProvider, highlightPrompt, mapWordRangeProposals } from "../../services/ai-pipeline/providers.ts";
+import { GeminiHighlightProvider, HIGHLIGHT_OUTPUT_SCHEMA, OpenAIChatHighlightProvider, highlightPrompt, mapWordRangeProposals, RERANK_OUTPUT_SCHEMA } from "../../services/ai-pipeline/providers.ts";
 
 /**
  * OpenAI-compatible chat highlight provider: POST {baseUrl}/chat/completions
@@ -162,6 +162,19 @@ const okChoices = (content: string) =>
   const fields = config.responseSchema.properties.highlights.items.properties;
   assert.deepEqual(Object.keys(fields.scores.properties), ["hook", "summary", "impact"]);
   assert.ok(!("dominantAxis" in fields));
+}
+
+// 11. Hybrid rerank sends only candidate metadata and accepts candidate IDs.
+{
+  const captured = stubFetch(() => okChoices(JSON.stringify({ selections: [{ candidateId: "candidate-1", score: 94, title: "Top moment", reason: "clear payoff" }] })));
+  const provider = new OpenAIChatHighlightProvider("https://api.example.com/v1", "key", "model");
+  const candidates = [{ id: "candidate-1", start: 5, end: 12, text: "A concise explanation with payoff.", confidence: 80, energy: 0.24, silenceBoundary: true, componentScores: { hook: 80, summary: 70, impact: 75 } }];
+  const result = await provider.rerank({ transcript: makeTranscript(), candidates, limit: 5 });
+  assert.deepEqual(result.selections[0], { candidateId: "candidate-1", score: 94, title: "Top moment", reason: "clear payoff" });
+  const sent = JSON.parse(String(captured[0].init.body)) as { messages: Array<{ content: string }>; response_format: { type: string; schema?: unknown } };
+  assert.match(sent.messages[0].content, /silenceBoundary/);
+  assert.match(sent.messages[0].content, /candidate-1/);
+  assert.equal(sent.response_format.type, "json_object");
 }
 
 console.log("openai-chat provider tests passed");

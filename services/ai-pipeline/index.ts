@@ -4,20 +4,15 @@ import { REMOTE_STT_FAILED } from "../../adapters/local/whisper-remote.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
 import { chooseHeuristicHighlights } from "./heuristic.ts";
 import { snapHighlightsToPauses } from "./pause-snap.ts";
+import { buildRerankCandidates, rerankCandidates } from "./hybrid-highlights.ts";
 import { snapHighlightsToScenes } from "./scene-snap.ts";
+import { NotImplementedSemanticProvider, type SemanticHighlightProvider } from "./semantic.ts";
 import type { AudioRmsFeatures } from "./highlight-scoring.ts";
 import { validateHighlights, type Highlight } from "../../packages/contracts/highlight.ts";
 import { validateTranscript, type Transcript } from "../../packages/contracts/transcript.ts";
 import { associateHighlightsWithOutline, buildScriptOutline, buildSummaryVariants, type ScriptOutlineItem, type SummaryVariant } from "./script-outline.ts";
-// The values are used below; `export * from "./semantic.ts"` only re-exports them
-// and does not bring them into this module's scope. Without this import the
-// semantic strategies threw ReferenceError and silently fell back to heuristic.
-import {
-  generateSemanticHighlights,
-  NotImplementedSemanticProvider,
-  type SemanticHighlightOptions,
-  type SemanticHighlightProvider,
-} from "./semantic.ts";
+// Real callers use analyzeLocalVideo/analyzeLocalVideoWithSemantic.
+import type { SemanticHighlightProvider } from "./semantic.ts";
 export * from "./variants.ts";
 export * from "./diarization.ts";
 // ponytail: mockTranscribe/mockHighlights deleted — analyzeVideo now returns deterministic placeholder.
@@ -59,16 +54,18 @@ export function analyzeVideo(sourceArtifactId: string, duration: number): ClipAn
 export type LocalAnalyzeOptions = WhisperOptions & Pick<ChunkedWhisperOptions, "onProgress" | "onChunkStart" | "onChunkComplete" | "onChunkFail" | "chunkSeconds" | "overlapSeconds" | "offsetSeconds" | "boundaries"> & {
   /** Pre-built transcript (e.g. from a fixture): skips Whisper entirely and only selects highlights. */
   transcript?: Transcript;
-  /** Optional time-indexed audio energy from the extracted mono PCM WAV. */
   audioRms?: AudioRmsFeatures;
+  semanticProvider?: SemanticHighlightProvider;
+  semanticLimit?: number;
   /** Optional video scene-cut timestamps, used only for boundary alignment. */
   sceneCuts?: number[];
 };
 
 export async function analyzeLocalVideo(audioPath: string, sourceArtifactId: string, duration: number, options: LocalAnalyzeOptions = {}): Promise<LocalClipAnalysis> {
+  if (options.semanticProvider) {
+    return analyzeLocalVideoWithSemantic(audioPath, sourceArtifactId, duration, options);
+  }
   const sourceDuration = options.sourceDuration ?? duration;
-  // An injected transcript (fixture or pre-computed cache) replaces transcription:
-  // Whisper is never spawned, and every downstream step stays the real pipeline.
   const transcript = options.transcript
     ? await Promise.resolve(options.transcript)
     : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
@@ -104,10 +101,7 @@ export async function analyzeLocalVideoWithSttFallback(
   }
 }
 
-export type SemanticAnalyzeOptions = LocalAnalyzeOptions & {  semanticProvider?: SemanticHighlightProvider;
-  semanticCategory?: string;
-  semanticLimit?: number;
-};
+export type SemanticAnalyzeOptions = LocalAnalyzeOptions & { semanticCategory?: string; semanticLimit?: number };
 
 export async function analyzeLocalVideoWithSemantic(
   audioPath: string,
@@ -121,24 +115,24 @@ export async function analyzeLocalVideoWithSemantic(
     : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
 
   const provider = options.semanticProvider ?? new NotImplementedSemanticProvider();
+  const fallback = duration > 120
+    ? chooseContentHighlights(transcript, 15, options.audioRms)
+    : chooseHeuristicHighlights(transcript, 15, options.audioRms);
+  const fallbackSnapped = snapHighlightsToScenes(snapHighlightsToPauses(fallback, transcript), transcript, options.sceneCuts ?? []).slice(0, 5);
   let highlights: Highlight[];
   try {
-    highlights = await generateSemanticHighlights(transcript, provider, {
-      category: options.semanticCategory,
-      limit: options.semanticLimit,
-      minDuration: 10,
-      maxDuration: 90,
-    });
-    highlights = snapHighlightsToPauses(highlights, transcript);
+    const candidates = buildRerankCandidates(transcript, options.audioRms, 15);
+    if (candidates.length && provider.rerank) {
+      const reranked = await rerankCandidates(transcript, candidates, provider, Math.min(5, options.semanticLimit ?? 5));
+      highlights = reranked.length ? snapHighlightsToScenes(snapHighlightsToPauses(reranked, transcript), transcript, options.sceneCuts ?? []) : fallbackSnapped;
+    } else {
+      highlights = fallbackSnapped;
+    }
   } catch (error) {
-    // Provider (e.g. Gemini) failure or unsupported input: fall back to the
-    // deterministic selector so the user still gets candidates instead of a hard error.
-    const fallback = duration > 120
-      ? chooseContentHighlights(transcript, 5, options.audioRms)
-      : chooseHeuristicHighlights(transcript, 5, options.audioRms);
-    console.warn(`[ai-pipeline] semantic provider failed (${error instanceof Error ? error.message : error}); fell back to ${duration > 120 ? "content" : "heuristic"} selector`);
-    highlights = snapHighlightsToPauses(fallback, transcript);
+    console.warn(`[ai-pipeline] semantic rerank failed (${error instanceof Error ? error.message : error}); keeping local shortlist`);
+    highlights = fallbackSnapped;
   }
+
   validateTranscript(transcript);
   // Highlights use absolute source timestamps (see analyzeLocalVideo).
   validateHighlights(highlights, sourceDuration);

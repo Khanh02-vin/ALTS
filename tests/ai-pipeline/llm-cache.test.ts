@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { CachedSemanticProvider, llmCacheKey } from "../../services/ai-pipeline/llm-cache.ts";
 import { HIGHLIGHT_PROMPT_VERSION } from "../../services/ai-pipeline/providers.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import type { SemanticHighlightProvider, SemanticHighlightResult } from "../../services/ai-pipeline/semantic.ts";
+import type { SemanticHighlightProvider, SemanticHighlightResult, SemanticRerankResult } from "../../services/ai-pipeline/semantic.ts";
 
 /**
  * LLM result cache: same transcript + prompt version replays stored highlights
@@ -90,6 +90,20 @@ const emptyCached = new CachedSemanticProvider(emptyInner, "fake:empty");
 await emptyCached.generate({ transcript });
 await emptyCached.generate({ transcript });
 assert.equal(emptyCalls, 2, "empty results must not be cached");
+
+// Candidate metadata participates in rerank identity and identical reranks cache.
+let rerankCalls = 0;
+const rerankInner: SemanticHighlightProvider = {
+  async generate(): Promise<SemanticHighlightResult> { return { highlights: [], provider: "fake" }; },
+  async rerank(): Promise<SemanticRerankResult> { rerankCalls += 1; return { selections: [{ candidateId: "candidate-1", score: 82 }] }; },
+};
+const rerankCached = new CachedSemanticProvider(rerankInner, "fake:rerank");
+const candidates = [{ id: "candidate-1", start: 1, end: 4, text: "candidate text", confidence: 70, energy: 0.2, silenceBoundary: true }];
+await rerankCached.rerank!({ transcript, candidates, limit: 5 });
+await rerankCached.rerank!({ transcript, candidates, limit: 5 });
+assert.equal(rerankCalls, 1, "same candidate shortlist should hit rerank cache");
+await rerankCached.rerank!({ transcript, candidates: [{ ...candidates[0], energy: 0.9 }], limit: 5 });
+assert.equal(rerankCalls, 2, "candidate metadata changes must miss rerank cache");
 
 rmSync(state, { recursive: true, force: true });
 console.log("llm cache tests: ok");

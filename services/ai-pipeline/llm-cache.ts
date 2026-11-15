@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import type { Highlight } from "../../packages/contracts/highlight.ts";
-import type { SemanticHighlightOptions, SemanticHighlightProvider, SemanticHighlightResult } from "./semantic.ts";
+import type { SemanticHighlightOptions, SemanticHighlightProvider, SemanticHighlightResult, SemanticRerankCandidate, SemanticRerankResult } from "./semantic.ts";
 import { HIGHLIGHT_PROMPT_VERSION } from "./providers.ts";
 
 /**
@@ -28,14 +28,14 @@ export function llmCacheKey(identity: string, transcript: Transcript, options?: 
   return createHash("sha256").update([HIGHLIGHT_PROMPT_VERSION, identity, JSON.stringify(options ?? {}), JSON.stringify({ sourceArtifactId: transcript.sourceArtifactId, duration: transcript.duration, words: transcript.words })].join("\0")).digest("hex");
 }
 
-type CachedEntry = { highlights: Highlight[]; identity: string; promptVersion: string; cachedAt: string };
+type CachedEntry = { highlights: Highlight[]; selections?: SemanticRerankResult["selections"]; identity: string; promptVersion: string; cachedAt: string };
 
-function readEntry(path: string, identity: string): SemanticHighlightResult | undefined {
+function readEntry(path: string, identity: string): CachedEntry | undefined {
   try {
     const entry = JSON.parse(readFileSync(path, "utf8")) as CachedEntry;
-    if (entry.promptVersion !== HIGHLIGHT_PROMPT_VERSION || entry.identity !== identity || !Array.isArray(entry.highlights) || !entry.highlights.length) return undefined;
-    validateHighlights(entry.highlights, Number.MAX_SAFE_INTEGER);
-    return { highlights: entry.highlights, provider: entry.identity };
+    if (entry.promptVersion !== HIGHLIGHT_PROMPT_VERSION || entry.identity !== identity || !Array.isArray(entry.highlights)) return undefined;
+    if (entry.highlights.length) validateHighlights(entry.highlights, Number.MAX_SAFE_INTEGER);
+    return entry;
   } catch { return undefined; }
 }
 
@@ -55,15 +55,33 @@ export class CachedSemanticProvider implements SemanticHighlightProvider {
   private readonly identity: string;
   constructor(inner: SemanticHighlightProvider, identity: string) { this.inner = inner; this.identity = identity; }
 
+  async rerank(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> {
+    if (!this.inner.rerank) throw new Error("SEMANTIC_RERANK_UNSUPPORTED");
+    const cacheOptions = { mode: "rerank", limit: input.limit, candidates: input.candidates };
+    const key = llmCacheKey(this.identity, input.transcript, cacheOptions);
+    const path = join(cacheDir(), `${key}.json`);
+    const cached = readEntry(path, this.identity);
+    if (cached?.selections?.length) return { selections: cached.selections };
+    const result = await this.inner.rerank(input);
+    try {
+      mkdirSync(cacheDir(), { recursive: true });
+      const temp = `${path}.${process.pid}.tmp`;
+      writeFileSync(temp, JSON.stringify({ highlights: [], selections: result.selections, identity: this.identity, promptVersion: HIGHLIGHT_PROMPT_VERSION, cachedAt: new Date().toISOString() } satisfies CachedEntry));
+      renameSync(temp, path);
+    } catch { /* a cache failure must not fail reranking */ }
+    return result;
+  }
+
   async generate(input: { transcript: Transcript; options?: SemanticHighlightOptions; signal?: AbortSignal }): Promise<SemanticHighlightResult> {
     const key = llmCacheKey(this.identity, input.transcript, input.options);
     const path = join(cacheDir(), `${key}.json`);
     const cached = readEntry(path, this.identity);
-    if (cached) return cached;
+    if (cached && cached.highlights.length) return { highlights: cached.highlights, provider: cached.identity };
     const result = await this.inner.generate(input);
     // Only successful, non-empty results are worth replaying; empty output may
     // be a transient provider quirk and should retry next time.
-    if (result.highlights.length) writeEntry(path, this.identity, result);
+    if (!result.highlights.length) return result;
+    writeEntry(path, this.identity, result);
     return result;
   }
 }

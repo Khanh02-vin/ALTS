@@ -20,6 +20,21 @@ export type SemanticHighlightResult = {
   rawProposals?: SemanticHighlightProposal[];
 };
 
+export type SemanticRerankCandidate = {
+  id: string;
+  start: number;
+  end: number;
+  text: string;
+  confidence: number;
+  energy?: number;
+  silenceBoundary: boolean;
+  componentScores?: HighlightScores;
+};
+
+export type SemanticRerankResult = {
+  selections: Array<{ candidateId: string; score: number; title?: string; reason?: string }>;
+};
+
 export type SemanticHighlightOptions = {
   category?: string;
   limit?: number;
@@ -35,6 +50,7 @@ export interface SemanticHighlightProvider {
   generate(
     input: { transcript: Transcript; options?: SemanticHighlightOptions; signal?: AbortSignal }
   ): Promise<SemanticHighlightResult>;
+  rerank?(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult>;
 }
 
 export class NotImplementedSemanticProvider implements SemanticHighlightProvider {
@@ -201,10 +217,17 @@ export function createMockSemanticProvider(
  * SemanticHighlightProvider shape expected by the local-first pipeline.
  */
 export class SemanticProviderAdapter implements SemanticHighlightProvider {
-  private readonly inner: { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> };
+  private readonly inner: {
+    choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>;
+    rerank?(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult>;
+  };
   private readonly name: string;
-  constructor(inner: { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]> }, name = "semantic-llm") { this.inner = inner; this.name = name; }
+  constructor(inner: { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; rerank?(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> }, name = "semantic-llm") { this.inner = inner; this.name = name; }
 
+  async rerank(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> {
+    if (!this.inner.rerank) throw new Error("SEMANTIC_RERANK_UNSUPPORTED");
+    return this.inner.rerank(input);
+  }
   async generate(input: { transcript: Transcript; options?: SemanticHighlightOptions; signal?: AbortSignal }): Promise<SemanticHighlightResult> {
     const highlights = (await this.inner.choose({
       transcript: input.transcript,

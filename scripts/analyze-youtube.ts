@@ -1,6 +1,6 @@
 import { chooseContentHighlights } from "../services/ai-pipeline/content-highlights.ts";
 import { chooseHeuristicHighlights } from "../services/ai-pipeline/heuristic.ts";
-import { generateSemanticHighlights, SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/semantic.ts";
+import { SemanticProviderAdapter, type SemanticHighlightProvider } from "../services/ai-pipeline/semantic.ts";
 import { GeminiHighlightProvider, LlamaCppHighlightProvider, OpenAIChatHighlightProvider } from "../services/ai-pipeline/providers.ts";
 import { CachedSemanticProvider } from "../services/ai-pipeline/llm-cache.ts";
 import { analyzeLocalVideo, analyzeLocalVideoWithSemantic, resolveHighlightStrategy } from "../services/ai-pipeline/index.ts";
@@ -13,6 +13,7 @@ import { groupHighlightsIntoCollections } from "../services/ai-pipeline/collecti
 import { validateHighlights, type Highlight } from "../packages/contracts/highlight.ts";
 import { buildScriptOutline, associateHighlightsWithOutline, buildSummaryVariants } from "../services/ai-pipeline/script-outline.ts";
 import { AnalysisStore } from "../adapters/local/analysis-store.ts";
+import { buildRerankCandidates, rerankCandidates } from "../services/ai-pipeline/hybrid-highlights.ts";
 import { parsePcm16WavRms } from "../services/ai-pipeline/wav-rms.ts";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
@@ -114,9 +115,9 @@ try {
     store.update(jobId, { phase: "transcribe", progress: 0.15 });
     const strategy = resolveHighlightStrategy();
     const semanticProvider = createSemanticProvider(strategy);
-    const analysisOptions = { command: process.env.WHISPER_COMMAND, engine: resolveWhisperEngine(process.env.WHISPER_ENGINE), model: process.env.WHISPER_MODEL, modelPath: process.env.WHISPER_MODEL_PATH, language: process.env.WHISPER_LANGUAGE, device: process.env.WHISPER_DEVICE, fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true", sourceDuration: duration, shouldAbort: () => interrupted, onProgress: (completed: number, total: number) => store.update(jobId, { phase: "transcribe", progress: 0.15 + 0.7 * completed / total }), audioRms, transcript: injectedTranscript };
+    const analysisOptions = { command: process.env.WHISPER_COMMAND, engine: resolveWhisperEngine(process.env.WHISPER_ENGINE), model: process.env.WHISPER_MODEL, modelPath: process.env.WHISPER_MODEL_PATH, language: process.env.WHISPER_LANGUAGE, device: process.env.WHISPER_DEVICE, fp16: process.env.WHISPER_FP16 === undefined ? undefined : process.env.WHISPER_FP16 === "1" || process.env.WHISPER_FP16 === "true", sourceDuration: duration, shouldAbort: () => interrupted, onProgress: (completed: number, total: number) => store.update(jobId, { phase: "transcribe", progress: 0.15 + 0.7 * completed / total }), audioRms, transcript: injectedTranscript, semanticProvider, semanticLimit: 5 };
     const result = semanticProvider
-      ? await analyzeLocalVideoWithSemantic(audioPath, url, duration, { ...analysisOptions, semanticProvider, semanticLimit: 5 })
+      ? await analyzeLocalVideoWithSemantic(audioPath, url, duration, analysisOptions)
       : await analyzeLocalVideo(audioPath, url, duration, analysisOptions);
     if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
     if (process.env.LICENSE_TIER !== "pro") result.highlights = result.highlights.slice(0, 3);
@@ -149,18 +150,20 @@ try {
     : strategy === "semantic-local" ? new CachedSemanticProvider(new SemanticProviderAdapter(new LlamaCppHighlightProvider(llamaBaseUrl, llamaModel), "llama-cpp"), `llama-cpp:${llamaModel}`)
     : undefined;
 
-  const chooseFallback = (): Highlight[] => duration > 120 ? chooseContentHighlights(transcript) : chooseHeuristicHighlights(transcript);
+  const chooseFallback = (): Highlight[] => duration > 120 ? chooseContentHighlights(transcript, 15, audioRms) : chooseHeuristicHighlights(transcript, 15, audioRms);
   let highlights: Highlight[];
   if (semanticProvider) {
+    const fallback = chooseFallback().slice(0, 5);
     try {
-      highlights = await generateSemanticHighlights(transcript, semanticProvider, { limit: 5, minDuration: 10, maxDuration: 90 });
+      const candidates = buildRerankCandidates(transcript, undefined, 15);
+      const reranked = candidates.length ? await rerankCandidates(transcript, candidates, semanticProvider, 5) : [];
+      highlights = reranked.length ? reranked : fallback;
     } catch (error) {
-      // Provider failure must not lose the job: fall back to the deterministic selector.
-      console.warn(`[ai-pipeline] semantic provider failed (${error instanceof Error ? error.message : error}); fell back to ${duration > 120 ? "content" : "heuristic"} selector`);
-      highlights = chooseFallback();
+      console.warn(`[analyze-youtube] semantic rerank failed (${error instanceof Error ? error.message : error}); keeping local shortlist`);
+      highlights = fallback;
     }
   } else {
-    highlights = chooseFallback();
+    highlights = chooseFallback().slice(0, 5);
   }
   if (interrupted) throw new Error("ANALYZE_INTERRUPTED");
   const scriptOutline = buildScriptOutline(transcript);

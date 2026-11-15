@@ -3,13 +3,14 @@ import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { validateTranscript } from "../../packages/contracts/transcript.ts";
 import type { EditVariant } from "../../packages/contracts/render-plan.ts";
+import type { SemanticRerankCandidate, SemanticRerankResult } from "./semantic.ts";
 import { componentScoreMetadata, normalizeHighlightScore, scoreHighlightComponents } from "./highlight-scoring.ts";
 export { GeminiTranscriptVariantProvider, LlamaCppTranscriptVariantProvider } from "./variants.ts";
 
 export interface TranscriptionProvider { transcribe(input: { audio: Uint8Array; sourceArtifactId: string; duration: number; signal?: AbortSignal }): Promise<Transcript>; }
 /** choose() may receive window bounds (seconds) so callers control how a long transcript
  *  is sliced per LLM call; omit them for the shared defaults. */
-export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; }
+export interface HighlightProvider { choose(input: { transcript: Transcript; signal?: AbortSignal; windowSeconds?: number; overlapSeconds?: number }): Promise<Highlight[]>; rerank?(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult>; }
 export interface TranscriptVariantProvider { generate(input: { transcript: Transcript; signal?: AbortSignal }): Promise<EditVariant[]>; }
 
 export class OpenAITranscriptionProvider implements TranscriptionProvider {
@@ -106,7 +107,60 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
 /** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
  *  every cache key, so editing the prompt or schema below only requires a bump
  *  here — stored LLM results from the old prompt stop being served. */
-export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v2-component-scores";
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v3-hybrid-rerank";
+
+export const RERANK_OUTPUT_SCHEMA = {
+  type: "object",
+  properties: { selections: { type: "array", items: {
+    type: "object",
+    properties: { candidateId: { type: "string" }, score: { type: "number" }, title: { type: "string" }, reason: { type: "string" } },
+    required: ["candidateId", "score"],
+  } } },
+  required: ["selections"],
+} as const;
+
+const GEMINI_RERANK_SCHEMA = {
+  type: "OBJECT",
+  properties: { selections: { type: "ARRAY", items: {
+    type: "OBJECT",
+    properties: { candidateId: { type: "STRING" }, score: { type: "NUMBER" }, title: { type: "STRING" }, reason: { type: "STRING" } },
+    required: ["candidateId", "score"],
+  } } },
+  required: ["selections"],
+} as const;
+
+export function rerankPrompt(candidates: SemanticRerankCandidate[], limit: number): string {
+  const compact = candidates.map(({ id, start, end, text, confidence, energy, silenceBoundary, componentScores }) => ({
+    id, duration: Math.round((end - start) * 10) / 10, text, confidence,
+    energy: energy === undefined ? "unavailable" : energy,
+    silenceBoundary, componentScores,
+  }));
+  return `Rerank these preselected transcript candidates for short-video highlights. Select up to ${Math.min(5, Math.max(1, limit))} distinct candidate IDs only; do not invent spans. confidence is the local heuristic score, energy is normalized audio RMS (or unavailable), and silenceBoundary indicates a nearby pause. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string}]}. Candidates:\n${JSON.stringify(compact)}`;
+}
+
+function parseJsonObject(text: string, errorCode: string): unknown {
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/)?.[1] ?? text;
+  const start = fenced.search(/[\[{]/);
+  if (start < 0) throw new Error(`${errorCode}:${text.slice(0, 120)}`);
+  const candidate = fenced.slice(start);
+  try { return JSON.parse(candidate); }
+  catch {
+    try { return JSON.parse(repairTruncatedJsonArray(candidate.trimEnd())); }
+    catch { throw new Error(`${errorCode}:${text.slice(0, 120)}`); }
+  }
+}
+
+/** Parse a rerank response defensively; candidate identity is verified downstream. */
+export function extractRerankSelections(value: unknown): SemanticRerankResult {
+  const selections = value && typeof value === "object" ? (value as { selections?: unknown }).selections : undefined;
+  if (!Array.isArray(selections)) throw new Error("LLM_RERANK_SHAPE");
+  return { selections: selections.flatMap((item) => {
+    if (!item || typeof item !== "object") return [];
+    const value = item as Record<string, unknown>;
+    if (typeof value.candidateId !== "string" || typeof value.score !== "number" || !Number.isFinite(value.score)) return [];
+    return [{ candidateId: value.candidateId, score: value.score, title: typeof value.title === "string" ? value.title : undefined, reason: typeof value.reason === "string" ? value.reason : undefined }];
+  }) };
+}
 
 /** Compact transcript rendering: one "wordIndex [start-end] text" line per word.
  *  A full word-object JSON prompt costs ~4k tokens for a 96s clip; these lines
@@ -165,6 +219,21 @@ export class GeminiHighlightProvider implements HighlightProvider {
     }
     const highlights = mergeWindowHighlights(perWindow, input.transcript);
     validateHighlights(highlights, input.transcript.duration); return highlights;
+  }
+  async rerank(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> {
+    return this.circuitBreaker.execute(async () => {
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const combined = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
+      const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ contents: [{ parts: [{ text: rerankPrompt(input.candidates, input.limit) }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_RERANK_SCHEMA } }),
+        signal: combined,
+      });
+      if (!response.ok) throw new Error(`GEMINI_RERANK_PROVIDER_${response.status}`);
+      const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
+      const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";
+      return extractRerankSelections(JSON.parse(text.replace(/^```json\s*|\s*```$/g, "")));
+    });
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     return this.circuitBreaker.execute(async () => {
@@ -253,6 +322,21 @@ export class LlamaCppHighlightProvider implements HighlightProvider {
     const highlights = mergeWindowHighlights(perWindow, input.transcript);
     validateHighlights(highlights, input.transcript.duration); return highlights;
   }
+  async rerank(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> {
+    return this.circuitBreaker.execute(async () => {
+      const modelId = await this.resolvedModelId(input.signal);
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
+      const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
+        method: "POST", headers: { "content-type": "application/json", ...this.authHeaders() },
+        body: JSON.stringify({ model: modelId, temperature: 0.2, max_tokens: 500, response_format: { type: "json_object", schema: RERANK_OUTPUT_SCHEMA }, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`LLAMA_CPP_RERANK_PROVIDER_${response.status}`);
+      const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      return extractRerankSelections(parseJsonObject(raw.choices?.[0]?.message?.content ?? "", "LLAMA_CPP_RERANK_BAD_JSON"));
+    });
+  }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     return this.circuitBreaker.execute(async () => {
       const modelId = await this.resolvedModelId(signal);
@@ -335,6 +419,22 @@ export class OpenAIChatHighlightProvider implements HighlightProvider {
     }
     const highlights = mergeWindowHighlights(perWindow, input.transcript);
     validateHighlights(highlights, input.transcript.duration); return highlights;
+  }
+  async rerank(input: { transcript: Transcript; candidates: SemanticRerankCandidate[]; limit: number; signal?: AbortSignal }): Promise<SemanticRerankResult> {
+    return this.circuitBreaker.execute(async () => {
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const signal = input.signal ? AbortSignal.any([input.signal, timeout]) : timeout;
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (this.apiKey) headers["authorization"] = `Bearer ${this.apiKey}`;
+      const response = await fetch(`${this.baseUrl}/chat/completions`, {
+        method: "POST", headers,
+        body: JSON.stringify({ model: this.model, temperature: 0.2, max_tokens: 500, response_format: { type: "json_object" }, messages: [{ role: "user", content: rerankPrompt(input.candidates, input.limit) }] }),
+        signal,
+      });
+      if (!response.ok) throw new Error(`OPENAI_CHAT_RERANK_PROVIDER_${response.status}`);
+      const raw = await response.json() as { choices?: Array<{ message?: { content?: string } }> };
+      return extractRerankSelections(parseJsonObject(raw.choices?.[0]?.message?.content ?? "", "OPENAI_CHAT_RERANK_BAD_JSON"));
+    });
   }
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     return this.circuitBreaker.execute(async () => {
