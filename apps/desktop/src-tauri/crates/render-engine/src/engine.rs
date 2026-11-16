@@ -1317,6 +1317,10 @@ pub fn render_segments(
         "16:9" => (1920, 1080),
         _ => (1080, 1920),
     };
+    let jump_cut = plan
+        .and_then(|value| value.get("effects"))
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|effects| effects.iter().any(|effect| effect.as_str() == Some("jump-cut")));
     let partial = join_segments(
         ffmpeg,
         ffprobe,
@@ -1327,6 +1331,7 @@ pub fn render_segments(
         &temp,
         on_progress,
         progress_log,
+        jump_cut,
     )?;
 
     // Atomic output: write to a sibling .tmp file first, probe-verify it, then atomically
@@ -1389,7 +1394,15 @@ pub fn join_segments(
     temp: &TemporaryRenderDir,
     on_progress: &dyn ProgressSink,
     progress_log: &Path,
+    jump_cut: bool,
 ) -> Result<PathBuf, String> {
+    if jump_cut {
+        if let Some(graph) = jump_cut_graph(segments.len(), has_audio) {
+            return join_segments_with_graph(
+                ffmpeg, segments, has_audio, total_duration, temp, on_progress, progress_log, &graph,
+            );
+        }
+    }
     let copy = temp.0.join("joined-copy.mp4");
     let copied = join_segments_copy(
         ffmpeg,
@@ -1429,6 +1442,39 @@ pub fn join_segments(
     }
 }
 
+fn join_segments_with_graph(
+    ffmpeg: &Path,
+    segments: &[PathBuf],
+    has_audio: bool,
+    total_duration: f64,
+    temp: &TemporaryRenderDir,
+    on_progress: &dyn ProgressSink,
+    progress_log: &Path,
+    graph: &str,
+) -> Result<PathBuf, String> {
+    let partial = temp.0.join("joined-jumpcut.mp4");
+    let mut cmd = tool(ffmpeg);
+    cmd.args(["-y", "-nostdin", "-hide_banner", "-loglevel", "error"]);
+    for segment in segments {
+        cmd.arg("-i").arg(segment);
+    }
+    cmd.args(["-filter_complex", graph, "-map", "[vout]"])
+        .args(["-c:v", "libx264", "-preset", "fast", "-crf", "22", "-pix_fmt", "yuv420p"])
+        .args(["-movflags", "+faststart"]);
+    if has_audio {
+        cmd.args(["-map", "[aout]", "-c:a", "aac", "-b:a", "128k"]);
+    }
+    run_render_child(
+        cmd.arg(&partial),
+        on_progress,
+        (90.0, 98.0),
+        total_duration,
+        "joining",
+        progress_log,
+    )?;
+    Ok(partial)
+}
+
 /// Stream-copy join via the concat demuxer.
 fn join_segments_copy(
     ffmpeg: &Path,
@@ -1466,6 +1512,59 @@ fn join_segments_copy(
     );
     let _ = std::fs::remove_file(&list);
     result
+}
+
+/// Filter graph for a multi-range export: a gentle punch-in on each later
+/// range makes the jump deliberate, and a 30ms audio acrossfade removes the
+/// click at the splice. Returns None for a single range (normal concat).
+pub fn jump_cut_graph(count: usize, has_audio: bool) -> Option<String> {
+    if count < 2 {
+        return None;
+    }
+    let mut graph = String::new();
+    for index in 0..count {
+        if index == 0 {
+            graph.push_str(&format!("[{index}:v:0]null[v{index}]"));
+        } else {
+            graph.push_str(&format!(
+                "[{index}:v:0]scale=iw*1.04:ih*1.04,crop=iw/1.04:ih/1.04,setsar=1[v{index}]"
+            ));
+        }
+    }
+    let mut audio = String::new();
+    if has_audio {
+        for index in 0..count {
+            audio.push_str(&format!("[{index}:a:0]"));
+        }
+    }
+    // Chain acrossfades: each step folds the accumulated video/audio with the
+    // next range. 30ms is short enough to keep speech rhythm intact.
+    let mut vcurrent = 0usize;
+    let mut acurrent = 0usize;
+    for index in 1..count {
+        let vout = count + index;
+        if has_audio {
+            let aout = vout + count;
+            graph.push_str(&format!(
+                ";[v{vcurrent}][a{acurrent}][v{index}][a{index}]acrossfade=d=0.03:c1=tri:c2=tri[v{vout}][a{aout}]"
+            ));
+            vcurrent = vout;
+            acurrent = aout;
+        } else {
+            graph.push_str(&format!(
+                ";[v{vcurrent}][v{index}]concat=n=2:v=1:a=0[v{vout}]"
+            ));
+            vcurrent = vout;
+        }
+    }
+    graph.push_str(&format!(";[v{vcurrent}]setsar=1[vout]"));
+    if has_audio {
+        graph.push_str(&format!(";[a{acurrent}]anull[aout]"));
+    } else {
+        // The test asserts no crossfade without audio; keep the graph honest.
+        debug_assert!(!graph.contains("acrossfade"));
+    }
+    Some(graph)
 }
 
 /// The previous join: concat filter with a full re-encode. Kept as the fallback.
@@ -1810,7 +1909,7 @@ impl Drop for TemporarySubtitle {
 mod tests {
     use super::{
         ass_dialogue, composition_graph_filter, has_confirmed_crop_keyframes, is_confirmed_zero_face_scene,
-        text_box_delogo_filter, zero_face_scene_graph_filter,
+        jump_cut_graph, text_box_delogo_filter, zero_face_scene_graph_filter,
     };
     use serde_json::json;
 
@@ -1819,6 +1918,18 @@ mod tests {
             "personBox": { "left": person_left, "right": person_right, "top": 0.1, "bottom": 0.9 },
             "textBox": text.map(|(left, right)| json!({ "left": left, "right": right, "top": 0.02, "bottom": 0.18 })),
         })
+    }
+
+    #[test]
+    fn jump_cut_uses_acrossfade_and_punch_in_zoom() {
+        let graph = jump_cut_graph(2, true).unwrap();
+        assert!(graph.contains("acrossfade=d=0.03"), "{graph}");
+        assert!(graph.contains("scale=iw*1.04"), "{graph}");
+        assert!(graph.contains("1.04"), "{graph}");
+        assert!(graph.contains("[vout]") && graph.contains("[aout]"), "{graph}");
+        let no_audio = jump_cut_graph(2, false).unwrap();
+        assert!(no_audio.contains("acrossfade") == false, "{no_audio}");
+        assert!(jump_cut_graph(1, true).is_none());
     }
 
     #[test]

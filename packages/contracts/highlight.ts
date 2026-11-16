@@ -16,13 +16,18 @@ export function activeHighlightIds(highlights: Highlight[]): Set<string> {
   return new Set(activeHighlights(highlights).map((highlight) => highlight.id));
 }
 
+export type HighlightRange = { start: Timestamp; end: Timestamp; wordIds: string[]; role?: "setup" | "core" | "payoff" };
+
 export type Highlight = {
   version: typeof CONTRACT_VERSION;
   id: string;
   sourceArtifactId: string;
+  /** Union span of ranges; for a legacy single-range highlight this is that range. */
   start: Timestamp;
   end: Timestamp;
   wordIds: string[];
+  /** Optional for backward compatibility; when present, start/end/wordIds are their union. */
+  ranges?: HighlightRange[];
   title: string;
   hook?: string;
   score: number;
@@ -54,6 +59,23 @@ export function validateHighlights(highlights: Highlight[], duration: number): v
       throw new Error("Invalid highlight metadata");
     }
     assertRange(highlight.start, highlight.end, duration);
+    if (highlight.ranges?.length) {
+      let previousRangeEnd = -1;
+      let unionStart = Infinity;
+      let unionEnd = -Infinity;
+      const unionWordIds: string[] = [];
+      for (const range of highlight.ranges) {
+        assertRange(range.start, range.end, duration, "range");
+        if (range.start < previousRangeEnd) throw new Error("Highlight ranges are not in chronological order");
+        previousRangeEnd = range.end;
+        unionStart = Math.min(unionStart, range.start);
+        unionEnd = Math.max(unionEnd, range.end);
+        unionWordIds.push(...range.wordIds);
+      }
+      assertRange(unionStart, unionEnd, duration, "union");
+      if (highlight.start !== unionStart || highlight.end !== unionEnd) throw new Error("Highlight union does not match ranges");
+      if (new Set(highlight.wordIds).size !== new Set(unionWordIds).size || highlight.wordIds.some((id) => !unionWordIds.includes(id))) throw new Error("Highlight wordIds do not match range union");
+    }
     if (!Number.isFinite(highlight.score) || highlight.score < 0 || highlight.score > 100) {
       throw new Error("Invalid highlight score");
     }

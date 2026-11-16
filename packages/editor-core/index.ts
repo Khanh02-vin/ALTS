@@ -3,6 +3,7 @@ import type { Transcript } from "../contracts/transcript.ts";
 import type { Caption, EditVariant, RenderPlan, RenderRange } from "../contracts/render-plan.ts";
 import { validateRenderPlan } from "../contracts/render-plan.ts";
 import { snapHighlightsToPauses } from "../../services/ai-pipeline/pause-snap.ts";
+import { highlightRangesToRenderRanges } from "../../services/ai-pipeline/multi-range.ts";
 
 export function createEditorStateFromVariant(transcript: Transcript, variant: EditVariant): EditorState {
   if (variant.sourceArtifactId !== transcript.sourceArtifactId) throw new Error("VARIANT_SOURCE_MISMATCH");
@@ -32,7 +33,9 @@ function updatePlan(state: EditorState, patch: PlanPatch): EditorState {
 }
 
 export function createEditorState(sourceArtifactId: string, duration: number, selected: Highlight): EditorState {
-  const plan: RenderPlan = { version: 1, sourceArtifactId, ranges: [{ start: selected.start, end: selected.end }], aspectRatio: "9:16", cropMode: "track", layout: "solo", captions: [], hook: selected.hook ? { text: selected.hook, start: selected.start, end: Math.min(selected.start + 5, selected.end) } : undefined, outputProfile: { container: "mp4", codec: "h264" } };
+  const ranges = highlightRangesToRenderRanges(selected.ranges);
+  const renderRanges = ranges.length ? ranges : [{ start: selected.start, end: selected.end }];
+  const plan: RenderPlan = { version: 1, sourceArtifactId, ranges: renderRanges, aspectRatio: "9:16", cropMode: "track", layout: "solo", captions: [], hook: selected.hook ? { text: selected.hook, start: selected.start, end: Math.min(selected.start + 5, selected.end) } : undefined, ...(ranges.length > 1 ? { effects: ["jump-cut"] } : {}), outputProfile: { container: "mp4", codec: "h264" } };
   validateRenderPlan(plan, duration);
   return { sourceArtifactId, duration, selected, plan };
 }

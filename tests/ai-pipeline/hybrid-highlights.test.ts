@@ -47,6 +47,19 @@ assert.equal(reranked.find((item) => item.title === "LLM choice")?.title, "LLM c
 assert.equal(reranked.find((item) => item.title === "LLM choice")?.start, candidates[1]!.highlight.start, "LLM cannot change candidate timestamps");
 assert.ok(reranked.every((highlight) => candidates.some((candidate) => candidate.id === highlight.id)), "reranked items must map back to supplied candidates");
 
+const multiProvider: SemanticHighlightProvider = {
+  async generate() { throw new Error("unused"); },
+  async rerank() { return { selections: [
+    { candidateId: candidates[0]!.id, score: 90, sentenceRanges: [
+      { startSentenceId: "sentence-0", endSentenceId: "sentence-2" },
+      { startSentenceId: "sentence-5", endSentenceId: "sentence-6" },
+    ] },
+  ] }; },
+};
+const multi = await rerankCandidates(transcript, candidates, multiProvider, 5);
+assert.equal(multi.length, 1, "invalid sentence IDs must fall back to the original single-range highlight");
+assert.equal(multi[0]!.ranges, undefined);
+
 const failingProvider: SemanticHighlightProvider = {
   async generate() { throw new Error("unused"); },
   async rerank() { throw new Error("provider offline"); },

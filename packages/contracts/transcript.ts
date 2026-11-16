@@ -30,12 +30,12 @@ export type Transcript = {
   provider: string;
 };
 
-export function assertRange(start: number, end: number, duration?: number): void {
+export function assertRange(start: number, end: number, duration?: number, label = "Timestamp"): void {
   if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= start) {
-    throw new Error("Invalid timestamp range");
+    throw new Error(`Invalid ${label.toLowerCase()} range`);
   }
   if (duration !== undefined && (!Number.isFinite(duration) || end > duration)) {
-    throw new Error("Timestamp exceeds duration");
+    throw new Error(`${label} exceeds duration`);
   }
 }
 

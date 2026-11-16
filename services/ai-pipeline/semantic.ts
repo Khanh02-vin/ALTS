@@ -37,6 +37,8 @@ export type SemanticRerankCandidate = {
     complete: boolean;
     missing: string[];
   };
+  sentenceRange?: { from: string; to: string };
+  sentences?: Array<{ id: string; start: number; end: number; text: string }>;
 };
 
 export type SemanticRerankResult = {
@@ -46,6 +48,7 @@ export type SemanticRerankResult = {
     title?: string;
     reason?: string;
     completenessCheck?: { hasClearSubject: boolean; hasConclusion: boolean };
+    sentenceRanges?: Array<{ startSentenceId: string; endSentenceId: string }>;
   }>;
 };
 

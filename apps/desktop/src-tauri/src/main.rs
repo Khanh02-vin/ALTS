@@ -700,6 +700,7 @@ mod tests {
             &dir,
             &sink,
             &temp_dir.join("progress.log"),
+            false,
         )
         .expect("a uniform copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
@@ -754,6 +755,7 @@ mod tests {
             &dir,
             &sink,
             &temp_dir.join("progress.log"),
+            false,
         )
         .expect("the -an copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, false, (160, 120), 4.0, 2)
@@ -809,6 +811,7 @@ mod tests {
             &dir,
             &sink,
             &temp_dir.join("progress.log"),
+            false,
         )
         .expect("the fallback must produce a valid join");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)

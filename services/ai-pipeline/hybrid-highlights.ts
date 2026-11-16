@@ -1,6 +1,7 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import { buildSemanticUnits } from "./semantic-units.ts";
+import { buildSemanticUnits, buildSentences } from "./semantic-units.ts";
+import { unionHighlightRanges, buildValidatedRanges, type HighlightRange } from "./multi-range.ts";
 import { scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 import type { SemanticHighlightProvider, SemanticRerankCandidate, SemanticRerankResult } from "./semantic.ts";
 
@@ -10,6 +11,8 @@ export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRm
   if (!Number.isFinite(limit) || limit <= 0) return [];
   const count = Math.min(15, Math.max(1, Math.floor(limit)));
   const units = buildSemanticUnits(transcript, audioRms, { sceneCuts, limit: count });
+  const sentences = buildSentences(transcript);
+  const sentenceById = new Map(sentences.map((sentence) => [sentence.id, sentence]));
   const selected = units.map((unit) => unit.highlight);
   const words = transcript.words;
   return selected.map((highlight, index) => {
@@ -34,6 +37,12 @@ export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRm
       silenceBoundary,
       componentScores: highlight.scores ?? scoreHighlightComponents({ start: highlight.start, end: highlight.end, text, transcript, audioRms }),
       narrative: units[index]!.arc,
+      sentenceRange: { from: units[index]!.sentenceIds[0]!, to: units[index]!.sentenceIds.at(-1)! },
+      sentences: (() => {
+        const first = sentences.findIndex((sentence) => sentence.id === units[index]!.sentenceIds[0]);
+        const last = sentences.findIndex((sentence) => sentence.id === units[index]!.sentenceIds.at(-1));
+        return sentences.slice(Math.max(0, first - 4), Math.min(sentences.length, last + 5)).map(({ id, start, end, text: sentenceText, wordIds }) => ({ id, start, end, text: sentenceText, wordIds }));
+      })(),
       highlight,
     };
   });
@@ -49,6 +58,7 @@ export async function rerankCandidates(
   if (!provider.rerank) throw new Error("SEMANTIC_RERANK_UNSUPPORTED");
   const result: SemanticRerankResult = await provider.rerank({ transcript, candidates, limit: Math.min(5, Math.max(1, limit)) });
   const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+  const selectionByCandidateId = new Map(result.selections.map((selection) => [selection.candidateId, selection]));
   const used = new Set<string>();
   const chosen: Array<{ candidate: HybridCandidate; score: number; title?: string; reason?: string }> = [];
   for (const selection of result.selections) {
@@ -72,11 +82,21 @@ export async function rerankCandidates(
     nonOverlapping.push(item);
     if (nonOverlapping.length >= Math.min(5, Math.max(1, limit))) break;
   }
-  return nonOverlapping.map(({ candidate, score, title, reason }) => ({
-    ...candidate.highlight,
-    id: candidate.id,
-    score,
-    title: title?.trim().slice(0, 120) || candidate.highlight.title,
-    reason: reason?.trim().slice(0, 500) || candidate.highlight.reason,
-  })).sort((a, b) => a.start - b.start);
+  return nonOverlapping.map(({ candidate, score, title, reason }) => {
+    const ranges = buildValidatedRanges(
+      (selectionByCandidateId.get(candidate.id)?.sentenceRanges),
+      candidate.sentences,
+      transcript,
+      { start: candidate.highlight.start, end: candidate.highlight.end, wordIds: candidate.highlight.wordIds },
+    );
+    const union = ranges ? unionHighlightRanges(ranges) : undefined;
+    return {
+      ...candidate.highlight,
+      id: candidate.id,
+      ...(union ? { ...union, ranges } : {}),
+      score,
+      title: title?.trim().slice(0, 120) || candidate.highlight.title,
+      reason: reason?.trim().slice(0, 500) || candidate.highlight.reason,
+    };
+  }).sort((a, b) => a.start - b.start);
 }

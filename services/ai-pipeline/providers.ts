@@ -107,14 +107,15 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
 /** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
  *  every cache key, so editing the prompt or schema below only requires a bump
  *  here — stored LLM results from the old prompt stop being served. */
-export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v5-narrative-check";
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v6-multi-range";
 
 export const RERANK_OUTPUT_SCHEMA = {
   type: "object",
   properties: { selections: { type: "array", items: {
     type: "object",
     properties: { candidateId: { type: "string" }, score: { type: "number" }, title: { type: "string" }, reason: { type: "string" },
-      completenessCheck: { type: "object", properties: { hasClearSubject: { type: "boolean" }, hasConclusion: { type: "boolean" } }, required: ["hasClearSubject", "hasConclusion"] } },
+      completenessCheck: { type: "object", properties: { hasClearSubject: { type: "boolean" }, hasConclusion: { type: "boolean" } }, required: ["hasClearSubject", "hasConclusion"] },
+      sentenceRanges: { type: "array", items: { type: "object", properties: { startSentenceId: { type: "string" }, endSentenceId: { type: "string" } }, required: ["startSentenceId", "endSentenceId"] } } },
     required: ["candidateId", "score"],
   } } },
   required: ["selections"],
@@ -125,18 +126,20 @@ const GEMINI_RERANK_SCHEMA = {
   properties: { selections: { type: "ARRAY", items: {
     type: "OBJECT",
     properties: { candidateId: { type: "STRING" }, score: { type: "NUMBER" }, title: { type: "STRING" }, reason: { type: "STRING" },
-      completenessCheck: { type: "OBJECT", properties: { hasClearSubject: { type: "BOOLEAN" }, hasConclusion: { type: "BOOLEAN" } }, required: ["hasClearSubject", "hasConclusion"] } },
+      completenessCheck: { type: "OBJECT", properties: { hasClearSubject: { type: "BOOLEAN" }, hasConclusion: { type: "BOOLEAN" } }, required: ["hasClearSubject", "hasConclusion"] },
+      sentenceRanges: { type: "ARRAY", items: { type: "OBJECT", properties: { startSentenceId: { type: "STRING" }, endSentenceId: { type: "STRING" } }, required: ["startSentenceId", "endSentenceId"] } } },
     required: ["candidateId", "score"],
   } } },
   required: ["selections"],
 } as const;
 
 export function rerankPrompt(candidates: SemanticRerankCandidate[], limit: number): string {
-  const compact = candidates.map(({ id, start, end, text, confidence, energy, silenceBoundary, componentScores, narrative }) => ({
+  const compact = candidates.map(({ id, start, end, text, confidence, energy, silenceBoundary, componentScores, narrative, sentenceRange, sentences }) => ({
     id, duration: Math.round((end - start) * 10) / 10, text, confidence,
     energy: energy === undefined ? "unavailable" : energy,
     silenceBoundary, componentScores,
     localNarrative: narrative ?? "unavailable",
+    ...(sentenceRange && sentences ? { ownSentences: sentenceRange, availableSentences: sentences } : {}),
   }));
   const count = Math.min(5, Math.max(1, limit));
   // Grading each clip against explicit criteria and demanding a spread of scores
@@ -154,7 +157,9 @@ Spread the scores across the range; do not give every clip a similar score.
 
 confidence is the local heuristic score, energy is normalized audio RMS (or unavailable), and silenceBoundary marks a nearby pause — use them as weak hints only.
 
-Select up to ${count} clips using ONLY the given ids. Do not invent spans. For each selection include completenessCheck with hasClearSubject and hasConclusion; a clip that merely opens a topic or stops mid-thought is not complete, even when localNarrative says otherwise. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string,"completenessCheck":{"hasClearSubject":boolean,"hasConclusion":boolean}}]} sorted from highest to lowest score.
+Select up to ${count} clips using ONLY the given ids. Do not invent spans. For each selection include completenessCheck with hasClearSubject and hasConclusion; a clip that merely opens a topic or stops mid-thought is not complete, even when localNarrative says otherwise.
+If a clip's payoff sits after a short hedge, optionally return sentenceRanges with 2-3 {startSentenceId,endSentenceId} pairs using ONLY IDs from that clip's availableSentences. Local code turns those IDs into exact timestamps and drops the in-between hedge; never invent IDs or seconds. Omit sentenceRanges to keep the original span.
+Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string,"completenessCheck":{"hasClearSubject":boolean,"hasConclusion":boolean},"sentenceRanges":[{"startSentenceId":string,"endSentenceId":string}]}]} sorted from highest to lowest score.
 
 Clips:\n${JSON.stringify(compact)}`;
 }
@@ -182,7 +187,14 @@ export function extractRerankSelections(value: unknown): SemanticRerankResult { 
     const completenessCheck = check && typeof check === "object" && typeof (check as { hasClearSubject?: unknown }).hasClearSubject === "boolean" && typeof (check as { hasConclusion?: unknown }).hasConclusion === "boolean"
       ? (check as { hasClearSubject: boolean; hasConclusion: boolean })
       : undefined;
-    return [{ candidateId: value.candidateId, score: value.score, title: typeof value.title === "string" ? value.title : undefined, reason: typeof value.reason === "string" ? value.reason : undefined, ...(completenessCheck ? { completenessCheck } : {}) }];
+    const ranges = Array.isArray(value.sentenceRanges) ? value.sentenceRanges.flatMap((range) => {
+      if (!range || typeof range !== "object") return [];
+      const item = range as { startSentenceId?: unknown; endSentenceId?: unknown };
+      return typeof item.startSentenceId === "string" && typeof item.endSentenceId === "string"
+        ? [{ startSentenceId: item.startSentenceId, endSentenceId: item.endSentenceId }]
+        : [];
+    }) : [];
+    return [{ candidateId: value.candidateId, score: value.score, title: typeof value.title === "string" ? value.title : undefined, reason: typeof value.reason === "string" ? value.reason : undefined, ...(completenessCheck ? { completenessCheck } : {}), ...(ranges.length ? { sentenceRanges: ranges } : {}) }];
   }) };
 }
 
