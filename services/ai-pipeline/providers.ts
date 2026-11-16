@@ -107,7 +107,7 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
 /** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
  *  every cache key, so editing the prompt or schema below only requires a bump
  *  here — stored LLM results from the old prompt stop being served. */
-export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v3-hybrid-rerank";
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v4-rubric-rerank";
 
 export const RERANK_OUTPUT_SCHEMA = {
   type: "object",
@@ -135,7 +135,25 @@ export function rerankPrompt(candidates: SemanticRerankCandidate[], limit: numbe
     energy: energy === undefined ? "unavailable" : energy,
     silenceBoundary, componentScores,
   }));
-  return `Rerank these preselected transcript candidates for short-video highlights. Select up to ${Math.min(5, Math.max(1, limit))} distinct candidate IDs only; do not invent spans. confidence is the local heuristic score, energy is normalized audio RMS (or unavailable), and silenceBoundary indicates a nearby pause. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string}]}. Candidates:\n${JSON.stringify(compact)}`;
+  const count = Math.min(5, Math.max(1, limit));
+  // Grading each clip against explicit criteria and demanding a spread of scores
+  // matters: without it the model returns near-identical scores and the top pick
+  // is effectively random within that tie. confidence is the local heuristic
+  // score, energy is normalized audio RMS, silenceBoundary marks a nearby pause.
+  return `These ${compact.length} clips come from one recording. The best short video contains the single most useful idea in it, not its introduction.
+
+Rank the clips and score each 0-100 against these criteria:
+- Self-contained: makes sense with no outside context.
+- Hook: the opening seconds name a problem or create curiosity.
+- Payoff: delivers a concrete answer, insight, rule or result — not setup, small talk or filler.
+Penalise greetings, filler, setup-only clips, and clips that merely introduce a topic without answering it. Avoid clips that only set up a topic; prefer the clip where the actual point lands.
+Spread the scores across the range; do not give every clip a similar score.
+
+confidence is the local heuristic score, energy is normalized audio RMS (or unavailable), and silenceBoundary marks a nearby pause — use them as weak hints only.
+
+Select up to ${count} clips using ONLY the given ids. Do not invent spans. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string}]} sorted from highest to lowest score.
+
+Clips:\n${JSON.stringify(compact)}`;
 }
 
 function parseJsonObject(text: string, errorCode: string): unknown {
