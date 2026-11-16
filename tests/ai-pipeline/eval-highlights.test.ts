@@ -100,6 +100,21 @@ function scoreCase(expected: Expected[], predictions: Array<{ start: number; end
   return { meanIou: expected.length ? sum / expected.length : 0, hits };
 }
 
+function contains(expected: { start: number; end: number }, prediction: { start: number; end: number }): boolean {
+  return prediction.start <= expected.start && prediction.end >= expected.end;
+}
+
+function containmentRecall(expected: Expected[], predictions: Array<{ start: number; end: number }>, k: number): TargetRecall {
+  const hits = expected.filter((target) => predictions.slice(0, k).some((prediction) => contains(target, prediction))).length;
+  return { hits, total: expected.length, recall: expected.length ? hits / expected.length : 0 };
+}
+
+function aggregateContainmentRecall(results: Array<{ expected: Expected[]; predictions: Array<{ start: number; end: number }> }>, k: number): TargetRecall {
+  const total = results.reduce((sum, result) => sum + result.expected.length, 0);
+  const hits = results.reduce((sum, result) => sum + containmentRecall(result.expected, result.predictions, k).hits, 0);
+  return { hits, total, recall: total ? hits / total : 0 };
+}
+
 function aggregateTargetRecall(results: Array<{ expected: Expected[]; predictions: Array<{ start: number; end: number }> }>, k: number): TargetRecall {
   const total = results.reduce((sum, result) => sum + result.expected.length, 0);
   const hits = results.reduce((sum, result) => sum + targetRecall(result.expected, result.predictions, k).hits, 0);
@@ -160,14 +175,16 @@ async function main(): Promise<void> {
     const candidates = buildRerankCandidates(transcript, undefined, 15);
     assert.ok(candidates.length <= 15, `${item.id}: hybrid shortlist must be capped at 15`);
     if (item.id === "short-hook") {
-      assert.ok(candidates.some((candidate) => timeIou(item.expected[0]!, candidate) >= THRESHOLD), "short-hook must be present in the real top-15 shortlist");
+      // Semantic units are deliberately longer than a single highlight, so the
+      // target must be *contained* in a unit rather than reach an IoU of 0.3.
+      assert.ok(candidates.some((candidate) => candidate.start <= item.expected[0]!.start && candidate.end >= item.expected[0]!.end), "short-hook must be covered by the real top-15 shortlist");
     }
     const provider: SemanticHighlightProvider = {
       async generate() { throw new Error("eval rerank must not call semantic generation"); },
       async rerank({ candidates: offered, limit }) {
         assert.equal(offered.length, candidates.length);
         return { selections: offered
-          .map((candidate) => ({ candidateId: candidate.id, score: Math.max(0, ...item.expected.map((target) => timeIou(target, candidate))) * 100 }))
+          .map((candidate) => ({ candidateId: candidate.id, score: Math.max(0, ...item.expected.map((target) => contains(target, candidate) ? 100 - (candidate.end - candidate.start) * 0.2 : 0)) }))
           .sort((a, b) => b.score - a.score)
           .slice(0, limit) };
       },
@@ -188,7 +205,8 @@ async function main(): Promise<void> {
   const currentRecall15 = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.currentPredictions })), 15);
   const legacyTop5Recall = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.legacyTop5 })), 5);
   const currentTop5Recall = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.currentTop5 })), 5);
-  const hybridRecall5 = aggregateTargetRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.hybridPredictions })), 5);
+  const hybridRecall5 = aggregateContainmentRecall(detailed.map((row) => ({ expected: row.item.expected, predictions: row.hybridPredictions })), 5);
+  const meanUnitDuration = detailed.reduce((sum, row) => sum + row.hybridPredictions.reduce((inner, highlight) => inner + highlight.end - highlight.start, 0), 0) / Math.max(1, detailed.reduce((sum, row) => sum + row.hybridPredictions.length, 0));
   const meanTargetIou = (key: "legacyPredictions" | "currentPredictions" | "hybridPredictions") => detailed.reduce((sum, row) => sum + targetMeanIou(row.item.expected, row[key]), 0) / detailed.length;
   assert.equal(baselineRecall15.recall, currentRecall15.recall, "with no audio, current Tier-2 score should match legacy target recall");
   assert.equal(legacyTop5Recall.recall, currentTop5Recall.recall, "with no audio, current Tier-2 top-5 should match legacy top-5 recall");
@@ -196,7 +214,7 @@ async function main(): Promise<void> {
   console.log("-- same-fixture ranking ablation (legacy/current use same candidate windows) --");
   console.log(`legacy baseline top-15 mean target IoU ${meanTargetIou("legacyPredictions").toFixed(2)} · recall@15 ${baselineRecall15.hits}/${baselineRecall15.total} ${(baselineRecall15.recall * 100).toFixed(0)}% · top-5 recall ${legacyTop5Recall.hits}/${legacyTop5Recall.total} ${(legacyTop5Recall.recall * 100).toFixed(0)}%`);
   console.log(`current Tier-2 top-15 mean target IoU ${meanTargetIou("currentPredictions").toFixed(2)} · recall@15 ${currentRecall15.hits}/${currentRecall15.total} ${(currentRecall15.recall * 100).toFixed(0)}% · top-5 recall ${currentTop5Recall.hits}/${currentTop5Recall.total} ${(currentTop5Recall.recall * 100).toFixed(0)}%`);
-  console.log(`hybrid oracle top-5 mean target IoU ${meanTargetIou("hybridPredictions").toFixed(2)} · recall@5 ${hybridRecall5.hits}/${hybridRecall5.total} ${(hybridRecall5.recall * 100).toFixed(0)}% · source shortlist recall@15 ${currentRecall15.hits}/${expectedCount} (oracle ceiling; not model performance)`);
+  console.log(`hybrid oracle top-5 containment recall ${hybridRecall5.hits}/${hybridRecall5.total} ${(hybridRecall5.recall * 100).toFixed(0)}% · mean unit ${meanUnitDuration.toFixed(0)}s · source shortlist recall@15 ${currentRecall15.hits}/${expectedCount} (oracle ceiling; not model performance)`);
   console.log("   note: fixture has no RMS measurements and uses synthetic word timings; it cannot measure real audio-energy/speech-rate gains.");
 
   for (const row of detailed) {
@@ -204,8 +222,8 @@ async function main(): Promise<void> {
     const current = targetRecall(row.item.expected, row.currentPredictions, 15);
     const baseline5 = targetRecall(row.item.expected, row.legacyTop5, 5);
     const current5 = targetRecall(row.item.expected, row.currentTop5, 5);
-    const hybrid = targetRecall(row.item.expected, row.hybridPredictions, 5);
-    console.log(`   ${row.item.id.padEnd(20)} recall@15 legacy ${baseline.hits}/${baseline.total} current ${current.hits}/${current.total} · recall@5 legacy ${baseline5.hits}/${baseline5.total} current ${current5.hits}/${current5.total} hybrid-oracle ${hybrid.hits}/${hybrid.total}`);
+    const hybrid = containmentRecall(row.item.expected, row.hybridPredictions, 5);
+    console.log(`   ${row.item.id.padEnd(20)} recall@15 legacy ${baseline.hits}/${baseline.total} current ${current.hits}/${current.total} · recall@5 legacy ${baseline5.hits}/${baseline5.total} current ${current5.hits}/${current5.total} hybrid-containment ${hybrid.hits}/${hybrid.total}`);
   }
 
   const rows: Row[] = [
@@ -306,7 +324,9 @@ async function main(): Promise<void> {
     aggregates.set(row.name, { ...agg, failures, worst });
     const hits = ks.map((k) => `${((agg.hitAt[k] ?? 0) * 100).toFixed(0)}%`.padStart(5)).join("  ");
     const targetRecall5 = aggregateTargetRecall(targetRows, 5);
-    console.log(`${row.name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@1/3/5:${hits}   target recall@5 ${targetRecall5.hits}/${targetRecall5.total}   worst case ${worst.id} (${worst.iou.toFixed(2)})${failures ? `   failures ${failures}` : ""}`);
+    const hybridRow = row.name === "hybrid-rerank";
+    const coverage = hybridRow ? aggregateContainmentRecall(targetRows, 5) : targetRecall5;
+    console.log(`${row.name.padEnd(20)} IoU ${agg.meanIou.toFixed(2)}   hit@1/3/5:${hits}   ${hybridRow ? "containment" : "target recall"}@5 ${coverage.hits}/${coverage.total}   worst case ${worst.id} (${worst.iou.toFixed(2)})${failures ? `   failures ${failures}` : ""}`);
   }
 
 

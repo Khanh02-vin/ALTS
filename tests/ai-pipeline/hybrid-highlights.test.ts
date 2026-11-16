@@ -3,11 +3,12 @@ import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { buildRerankCandidates, rerankCandidates } from "../../services/ai-pipeline/hybrid-highlights.ts";
 import type { SemanticHighlightProvider, SemanticRerankResult } from "../../services/ai-pipeline/semantic.ts";
 
-const words = Array.from({ length: 150 }, (_, index) => ({
-  id: `w-${index}`, text: index % 20 === 0 ? "important" : "word", start: index * 0.5, end: index * 0.5 + 0.4,
-}));
+const words = Array.from({ length: 150 }, (_, index) => {
+  const start = index * 0.5 + Math.floor(index / 20) * 1.2;
+  return { id: `w-${index}`, text: index % 20 === 0 ? "important." : "word", start, end: start + 0.4 };
+});
 const transcript: Transcript = {
-  version: 1, sourceArtifactId: "hybrid", duration: 80, language: "en", provider: "fixture", words,
+  version: 1, sourceArtifactId: "hybrid", duration: words[words.length - 1]!.end + 2, language: "en", provider: "fixture", words,
   segments: Array.from({ length: 10 }, (_, index) => ({
     id: `s-${index}`, start: index * 8, end: index * 8 + 7.5,
     text: "This is an important useful idea with a complete result.",

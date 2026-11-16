@@ -121,7 +121,7 @@ export async function analyzeLocalVideoWithSemantic(
   const fallbackSnapped = snapHighlightsToScenes(snapHighlightsToPauses(fallback, transcript), transcript, options.sceneCuts ?? []).slice(0, 5);
   let highlights: Highlight[];
   try {
-    const candidates = buildRerankCandidates(transcript, options.audioRms, 15);
+    const candidates = buildRerankCandidates(transcript, options.audioRms, 15, options.sceneCuts ?? []);
     if (candidates.length && provider.rerank) {
       const reranked = await rerankCandidates(transcript, candidates, provider, Math.min(5, options.semanticLimit ?? 5));
       highlights = reranked.length ? snapHighlightsToScenes(snapHighlightsToPauses(reranked, transcript), transcript, options.sceneCuts ?? []) : fallbackSnapped;

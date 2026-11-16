@@ -1,18 +1,15 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
-import { chooseContentHighlights } from "./content-highlights.ts";
-import { chooseHeuristicHighlights } from "./heuristic.ts";
+import { buildSemanticUnits } from "./semantic-units.ts";
 import { scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 import type { SemanticHighlightProvider, SemanticRerankCandidate, SemanticRerankResult } from "./semantic.ts";
 
 export type HybridCandidate = SemanticRerankCandidate & { highlight: Highlight };
 
-export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRmsFeatures, limit = 15): HybridCandidate[] {
+export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRmsFeatures, limit = 15, sceneCuts: number[] = []): HybridCandidate[] {
   if (!Number.isFinite(limit) || limit <= 0) return [];
   const count = Math.min(15, Math.max(1, Math.floor(limit)));
-  const selected = transcript.duration > 120
-    ? chooseContentHighlights(transcript, count, audioRms)
-    : chooseHeuristicHighlights(transcript, count, audioRms);
+  const selected = buildSemanticUnits(transcript, audioRms, { sceneCuts, limit: count }).map((unit) => unit.highlight);
   const words = transcript.words;
   return selected.map((highlight, index) => {
     const text = words.length
