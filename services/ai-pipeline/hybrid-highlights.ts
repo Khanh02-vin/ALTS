@@ -9,7 +9,8 @@ export type HybridCandidate = SemanticRerankCandidate & { highlight: Highlight }
 export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRmsFeatures, limit = 15, sceneCuts: number[] = []): HybridCandidate[] {
   if (!Number.isFinite(limit) || limit <= 0) return [];
   const count = Math.min(15, Math.max(1, Math.floor(limit)));
-  const selected = buildSemanticUnits(transcript, audioRms, { sceneCuts, limit: count }).map((unit) => unit.highlight);
+  const units = buildSemanticUnits(transcript, audioRms, { sceneCuts, limit: count });
+  const selected = units.map((unit) => unit.highlight);
   const words = transcript.words;
   return selected.map((highlight, index) => {
     const text = words.length
@@ -32,6 +33,7 @@ export function buildRerankCandidates(transcript: Transcript, audioRms?: AudioRm
       energy,
       silenceBoundary,
       componentScores: highlight.scores ?? scoreHighlightComponents({ start: highlight.start, end: highlight.end, text, transcript, audioRms }),
+      narrative: units[index]!.arc,
       highlight,
     };
   });
@@ -53,7 +55,15 @@ export async function rerankCandidates(
     const candidate = byId.get(selection.candidateId);
     if (!candidate || used.has(selection.candidateId) || !Number.isFinite(selection.score)) continue;
     used.add(selection.candidateId);
-    chosen.push({ candidate, score: Math.max(0, Math.min(100, Math.round(selection.score))), title: selection.title, reason: selection.reason });
+    // Penalise narratives that either the local check or the model says are
+    // incomplete. A missing subject or conclusion is a broken short regardless
+    // of how strong the text scores; a missing setup/core is a softer signal.
+    const local = candidate.narrative;
+    const missing = new Set(local?.missing ?? []);
+    if (selection.completenessCheck?.hasClearSubject === false) missing.add("subject");
+    if (selection.completenessCheck?.hasConclusion === false) missing.add("payoff");
+    const penalty = (missing.has("subject") ? 20 : 0) + (missing.has("payoff") ? 15 : 0) + (missing.has("core") ? 10 : 0) + (missing.has("setup") ? 5 : 0);
+    chosen.push({ candidate, score: Math.max(0, Math.min(100, Math.round(selection.score) - penalty)), title: selection.title, reason: selection.reason });
   }
   const ranked = chosen.sort((a, b) => b.score - a.score || a.candidate.start - b.candidate.start);
   const nonOverlapping: typeof ranked = [];

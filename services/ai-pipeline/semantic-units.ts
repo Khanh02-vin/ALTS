@@ -1,6 +1,7 @@
 import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript, Word } from "../../packages/contracts/transcript.ts";
 import { componentScoreMetadata, scoreAggregateHighlight, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
+import { assessNarrativeArc, type NarrativeArc } from "./narrative-arc.ts";
 
 const HOOK_CUE = /\b(how|why|problem|mistake|secret|important|key|solution|example|first|never|best)\b/i;
 const SENTENCE_END = /[.!?]["')\]]?$/;
@@ -27,6 +28,7 @@ export type SemanticUnit = {
   wordIds: string[];
   sentenceIds: string[];
   score: number;
+  arc: NarrativeArc;
   highlight: Highlight;
 };
 
@@ -163,6 +165,8 @@ export function buildSemanticUnits(
       if (!hasSceneCut(cuts, sentences[last]!.end, next.start) && next.end - sentences[first]!.start <= maxDuration) last += 1;
     }
 
+    const span = sentences.slice(first, last + 1);
+    if (span.every((sentence) => NON_SPEECH.test(sentence.text))) continue;
     for (let index = first; index <= last; index += 1) covered.add(index);
     units.push(toUnit(first, last, sentences, transcript, audioRms, `unit-${units.length}`));
   }
@@ -201,5 +205,6 @@ function toUnit(
     ...componentScoreMetadata(scores, undefined, audioRms !== undefined),
     reason: "semantic unit with sentence-aligned boundaries",
   };
-  return { id, start, end, text, wordIds, sentenceIds: span.map((sentence) => sentence.id), score, highlight };
+  const arc = assessNarrativeArc(text);
+  return { id, start, end, text, wordIds, sentenceIds: span.map((sentence) => sentence.id), score, arc, highlight };
 }

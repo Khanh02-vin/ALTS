@@ -2,9 +2,10 @@ import type { WhisperOptions } from "../../adapters/local/whisper.ts";
 import { transcribeChunkedWithWhisper, type ChunkedWhisperOptions } from "../../adapters/local/chunked-whisper.ts";
 import { REMOTE_STT_FAILED } from "../../adapters/local/whisper-remote.ts";
 import { chooseContentHighlights } from "./content-highlights.ts";
-import { chooseHeuristicHighlights } from "./heuristic.ts";
+import { chooseHeuristicHighlights, nonMaximumSuppression } from "./heuristic.ts";
 import { snapHighlightsToPauses } from "./pause-snap.ts";
 import { buildRerankCandidates, rerankCandidates } from "./hybrid-highlights.ts";
+import { buildSemanticUnits } from "./semantic-units.ts";
 import { snapHighlightsToScenes } from "./scene-snap.ts";
 import { NotImplementedSemanticProvider, type SemanticHighlightProvider } from "./semantic.ts";
 import type { AudioRmsFeatures } from "./highlight-scoring.ts";
@@ -115,10 +116,14 @@ export async function analyzeLocalVideoWithSemantic(
     : await transcribeChunkedWithWhisper(audioPath, sourceArtifactId, duration, { ...options, transcript: undefined, sourceDuration });
 
   const provider = options.semanticProvider ?? new NotImplementedSemanticProvider();
-  const fallback = duration > 120
+  const localHighlights = duration > 120
     ? chooseContentHighlights(transcript, 15, options.audioRms)
     : chooseHeuristicHighlights(transcript, 15, options.audioRms);
-  const fallbackSnapped = snapHighlightsToScenes(snapHighlightsToPauses(fallback, transcript), transcript, options.sceneCuts ?? []).slice(0, 5);
+  const fallbackHighlights = localHighlights.length
+    ? localHighlights
+    : buildSemanticUnits(transcript, options.audioRms, { sceneCuts: options.sceneCuts ?? [], limit: 15 }).map((unit) => unit.highlight);
+  const nonOverlappingFallback = nonMaximumSuppression(fallbackHighlights, 5).map(({ start, end }) => fallbackHighlights.find((highlight) => highlight.start === start && highlight.end === end)!);
+  const fallbackSnapped = snapHighlightsToScenes(snapHighlightsToPauses(nonOverlappingFallback, transcript), transcript, options.sceneCuts ?? []).slice(0, 5);
   let highlights: Highlight[];
   try {
     const candidates = buildRerankCandidates(transcript, options.audioRms, 15, options.sceneCuts ?? []);

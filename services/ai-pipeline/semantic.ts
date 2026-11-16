@@ -29,10 +29,24 @@ export type SemanticRerankCandidate = {
   energy?: number;
   silenceBoundary: boolean;
   componentScores?: HighlightScores;
+  narrative?: {
+    hasClearSubject: boolean;
+    hasSetup: boolean;
+    hasCore: boolean;
+    hasPayoff: boolean;
+    complete: boolean;
+    missing: string[];
+  };
 };
 
 export type SemanticRerankResult = {
-  selections: Array<{ candidateId: string; score: number; title?: string; reason?: string }>;
+  selections: Array<{
+    candidateId: string;
+    score: number;
+    title?: string;
+    reason?: string;
+    completenessCheck?: { hasClearSubject: boolean; hasConclusion: boolean };
+  }>;
 };
 
 export type SemanticHighlightOptions = {

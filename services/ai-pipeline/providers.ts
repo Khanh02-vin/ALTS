@@ -107,13 +107,14 @@ export function extractHighlightProposals(value: unknown): Array<Record<string, 
 /** Versions the highlight prompt + output schema. llm-cache.ts embeds this in
  *  every cache key, so editing the prompt or schema below only requires a bump
  *  here — stored LLM results from the old prompt stop being served. */
-export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v4-rubric-rerank";
+export const HIGHLIGHT_PROMPT_VERSION = "compact-wordindex-v5-narrative-check";
 
 export const RERANK_OUTPUT_SCHEMA = {
   type: "object",
   properties: { selections: { type: "array", items: {
     type: "object",
-    properties: { candidateId: { type: "string" }, score: { type: "number" }, title: { type: "string" }, reason: { type: "string" } },
+    properties: { candidateId: { type: "string" }, score: { type: "number" }, title: { type: "string" }, reason: { type: "string" },
+      completenessCheck: { type: "object", properties: { hasClearSubject: { type: "boolean" }, hasConclusion: { type: "boolean" } }, required: ["hasClearSubject", "hasConclusion"] } },
     required: ["candidateId", "score"],
   } } },
   required: ["selections"],
@@ -123,17 +124,19 @@ const GEMINI_RERANK_SCHEMA = {
   type: "OBJECT",
   properties: { selections: { type: "ARRAY", items: {
     type: "OBJECT",
-    properties: { candidateId: { type: "STRING" }, score: { type: "NUMBER" }, title: { type: "STRING" }, reason: { type: "STRING" } },
+    properties: { candidateId: { type: "STRING" }, score: { type: "NUMBER" }, title: { type: "STRING" }, reason: { type: "STRING" },
+      completenessCheck: { type: "OBJECT", properties: { hasClearSubject: { type: "BOOLEAN" }, hasConclusion: { type: "BOOLEAN" } }, required: ["hasClearSubject", "hasConclusion"] } },
     required: ["candidateId", "score"],
   } } },
   required: ["selections"],
 } as const;
 
 export function rerankPrompt(candidates: SemanticRerankCandidate[], limit: number): string {
-  const compact = candidates.map(({ id, start, end, text, confidence, energy, silenceBoundary, componentScores }) => ({
+  const compact = candidates.map(({ id, start, end, text, confidence, energy, silenceBoundary, componentScores, narrative }) => ({
     id, duration: Math.round((end - start) * 10) / 10, text, confidence,
     energy: energy === undefined ? "unavailable" : energy,
     silenceBoundary, componentScores,
+    localNarrative: narrative ?? "unavailable",
   }));
   const count = Math.min(5, Math.max(1, limit));
   // Grading each clip against explicit criteria and demanding a spread of scores
@@ -151,7 +154,7 @@ Spread the scores across the range; do not give every clip a similar score.
 
 confidence is the local heuristic score, energy is normalized audio RMS (or unavailable), and silenceBoundary marks a nearby pause — use them as weak hints only.
 
-Select up to ${count} clips using ONLY the given ids. Do not invent spans. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string}]} sorted from highest to lowest score.
+Select up to ${count} clips using ONLY the given ids. Do not invent spans. For each selection include completenessCheck with hasClearSubject and hasConclusion; a clip that merely opens a topic or stops mid-thought is not complete, even when localNarrative says otherwise. Return JSON {"selections":[{"candidateId":string,"score":0-100,"title":string,"reason":string,"completenessCheck":{"hasClearSubject":boolean,"hasConclusion":boolean}}]} sorted from highest to lowest score.
 
 Clips:\n${JSON.stringify(compact)}`;
 }
@@ -169,14 +172,17 @@ function parseJsonObject(text: string, errorCode: string): unknown {
 }
 
 /** Parse a rerank response defensively; candidate identity is verified downstream. */
-export function extractRerankSelections(value: unknown): SemanticRerankResult {
-  const selections = value && typeof value === "object" ? (value as { selections?: unknown }).selections : undefined;
+export function extractRerankSelections(value: unknown): SemanticRerankResult {  const selections = value && typeof value === "object" ? (value as { selections?: unknown }).selections : undefined;
   if (!Array.isArray(selections)) throw new Error("LLM_RERANK_SHAPE");
   return { selections: selections.flatMap((item) => {
     if (!item || typeof item !== "object") return [];
     const value = item as Record<string, unknown>;
     if (typeof value.candidateId !== "string" || typeof value.score !== "number" || !Number.isFinite(value.score)) return [];
-    return [{ candidateId: value.candidateId, score: value.score, title: typeof value.title === "string" ? value.title : undefined, reason: typeof value.reason === "string" ? value.reason : undefined }];
+    const check = value.completenessCheck;
+    const completenessCheck = check && typeof check === "object" && typeof (check as { hasClearSubject?: unknown }).hasClearSubject === "boolean" && typeof (check as { hasConclusion?: unknown }).hasConclusion === "boolean"
+      ? (check as { hasClearSubject: boolean; hasConclusion: boolean })
+      : undefined;
+    return [{ candidateId: value.candidateId, score: value.score, title: typeof value.title === "string" ? value.title : undefined, reason: typeof value.reason === "string" ? value.reason : undefined, ...(completenessCheck ? { completenessCheck } : {}) }];
   }) };
 }
 
