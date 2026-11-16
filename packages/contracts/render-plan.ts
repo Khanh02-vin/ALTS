@@ -2,7 +2,7 @@ import { assertRange, CONTRACT_VERSION, type Timestamp } from "./transcript.ts";
 
 export const ASPECT_RATIOS = ["9:16", "1:1", "16:9"] as const;
 export type AspectRatio = (typeof ASPECT_RATIOS)[number];
-export type CropMode = "track" | "general" | "split" | "screencast" | "none";
+export type CropMode = "track" | "general" | "split" | "screencast" | "none" | "center";
 export type Layout = "solo" | "picture-in-picture" | "side-by-side";
 
 export type CaptionWord = { text: string; start: Timestamp; end: Timestamp };
@@ -80,6 +80,11 @@ export function validateRenderPlan(plan: RenderPlan, duration: number): void {
       const previous = plan.ranges[other];
       if (range.start < previous.end && previous.start < range.end) throw new Error("Render ranges overlap");
     }
+  }
+  if (plan.cropMode === "track") {
+    const hasUsableCrop = plan.cropKeyframes?.some((key) => key.confirmed === true && key.confidence >= 0.5 && key.centerX >= 0 && key.centerX <= 1 && (!key.speakerId || !key.sourceFaceId || plan.speakerMap?.[key.speakerId] === key.sourceFaceId));
+    const hasUsableComposition = plan.compositionLayouts?.some((layout) => layout.confirmed === true);
+    if (!hasUsableCrop && !hasUsableComposition) throw new Error("Crop tracking requested without confirmed crop keyframes or composition layouts");
   }
   if (plan.cropKeyframes) {
     if (plan.cropKeyframes.length > 600) throw new Error("Too many crop keyframes");

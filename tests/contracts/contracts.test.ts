@@ -69,8 +69,12 @@ assert.throws(() => validateCollection({ ...collection, items: [
   { ...collection.items[0], reference: { kind: "unknown" as never, highlightId: "h1" } },
 ] }));
 
-const plan = { version: 1, sourceArtifactId: "src", ranges: [{ start: 1, end: 10 }], aspectRatio: "9:16" as const, cropMode: "track" as const, captions: [], outputProfile: { container: "mp4" as const, codec: "h264" as const } };
-validateRenderPlan(plan, 60);
+const plan = { version: 1, sourceArtifactId: "src", ranges: [{ start: 1, end: 10 }], aspectRatio: "9:16" as const, cropMode: "none" as const, captions: [], outputProfile: { container: "mp4" as const, codec: "h264" as const } };
+// "track" without usable crop data is a silent fallback to a centre crop; the
+// contract must reject it instead of letting a render mis-frame the subject.
+assert.throws(() => validateRenderPlan({ ...plan, cropMode: "track" }, 60), /tracking/i);
+validateRenderPlan({ ...plan, cropMode: "center" as never }, 60);
+validateRenderPlan({ ...plan, cropMode: "track", speakerMap: { A: "face-0" }, cropKeyframes: [{ time: 1, centerX: 0.4, speakerId: "A", sourceFaceId: "face-0", sourceArtifactId: "src", confidence: 0.9, confirmed: true }] }, 60);
 assert.throws(() => validateRenderPlan({ ...plan, version: 0 }, 60));
 assert.throws(() => validateRenderPlan({ ...plan, aspectRatio: "4:3" as never }, 60));
 assert.throws(() => validateRenderPlan({ ...plan, ranges: [] }, 60), /at least one range/);
@@ -81,7 +85,7 @@ assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "
 assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "nan", start: Number.NaN, end: 2 }] }] }, 60), /caption word/i);
 assert.throws(() => validateRenderPlan({ ...plan, captions: [{ id: "c1", text: "hello", start: 1, end: 2, words: [{ text: "reversed", start: 2, end: 2 }] }] }, 60), /caption word/i);
 validateRenderPlan({ ...plan, ranges: [{ start: 10, end: 12 }, { start: 1, end: 3 }, { start: 3, end: 4 }] }, 60);
-validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, speakerId: "Speaker 1", sourceArtifactId: "src", confidence: 0.9, confirmed: true }] }, 60);
+validateRenderPlan({ ...plan, cropMode: "none", cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, speakerId: "Speaker 1", sourceArtifactId: "src", confidence: 0.9, confirmed: true }] }, 60);
 assert.throws(() => validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 0.6, sourceArtifactId: "other", confidence: 0.9, confirmed: true }] }, 60), /source mismatch/);
 assert.throws(() => validateRenderPlan({ ...plan, cropKeyframes: [{ time: 1, centerX: 0.4, centerY: 1.1, confidence: 0.9, confirmed: true }] }, 60), /crop keyframe/);
 validateRenderPlan({ ...plan, sceneLayouts: [{ start: 1, end: 10, layout: "side-by-side", confidence: 0.8, confirmed: true }] }, 60);

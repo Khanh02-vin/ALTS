@@ -701,6 +701,7 @@ mod tests {
             &sink,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .expect("a uniform copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
@@ -756,6 +757,7 @@ mod tests {
             &sink,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .expect("the -an copy join must succeed");
         render_engine::engine::validate_joined_output(ffprobe, &joined, false, (160, 120), 4.0, 2)
@@ -812,6 +814,7 @@ mod tests {
             &sink,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .expect("the fallback must produce a valid join");
         render_engine::engine::validate_joined_output(ffprobe, &joined, true, (160, 120), 4.0, 2)
@@ -910,6 +913,7 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .unwrap();
         let probe = Command::new(ffprobe)
@@ -961,6 +965,7 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .unwrap();
         render_segments(
@@ -975,6 +980,7 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .unwrap();
         let multi_output = dir.0.join("multi.mp4");
@@ -990,6 +996,7 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
+            &[],
         )
         .unwrap();
         // Compare the decoded video frame at 0.8s (inside the caption cue) directly:

@@ -12,6 +12,7 @@ function highlight(overrides: Partial<Highlight> = {}): Highlight {
   validateHighlights([highlight()], 300);
   const state = createEditorState("src", 300, highlight());
   assert.deepEqual(state.plan.ranges, [{ start: 88, end: 191.8 }]);
+  assert.equal(state.plan.cropMode, "center", "no face tracking data means an honest center-crop plan");
 }
 
 // Two ranges keep the outer union for old consumers but export as two pieces.

@@ -549,6 +549,28 @@ pub fn has_confirmed_crop_keyframes(plan: &serde_json::Value) -> bool {
         })
 }
 
+/// A plan that asks for tracking must carry at least one signature the renderer
+/// will actually honour. Otherwise the engine silently centre-crops, which is
+/// how a speaker can end up on the left edge of a 9:16 export without any error.
+pub fn render_crop_mode_is_satisfied(plan: &serde_json::Value) -> bool {
+    let mode = plan.get("cropMode").and_then(serde_json::Value::as_str).unwrap_or("track");
+    if mode != "track" {
+        return true;
+    }
+    if has_confirmed_crop_keyframes(plan) {
+        return true;
+    }
+    plan.get("compositionLayouts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|layout| {
+                layout["confirmed"].as_bool() == Some(true)
+                    && layout["sourceArtifactId"].as_str()
+                        == plan.get("sourceArtifactId").and_then(serde_json::Value::as_str)
+            })
+        })
+}
+
 /// Builds the filter graph for a piece covered by a composition layout, mirroring the
 /// TypeScript containment solver (packages/media-engine/reframe/containment.ts): the
 /// person owns the frame, and a text box widens it only when it contains the subject.
@@ -842,6 +864,9 @@ pub fn render_segments(
         "16:9" => "crop=ih*16/9:ih:(iw-ih*16/9)/2:0,scale=1920:1080".to_string(),
         _ => "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920".to_string(),
     };
+    if plan.is_some_and(|value| !render_crop_mode_is_satisfied(value)) {
+        return Err("CROP_TRACKING_UNSATISFIED".into());
+    }
     let keyframes = plan
         .and_then(|value| value.get("cropKeyframes"))
         .and_then(serde_json::Value::as_array)
@@ -1021,6 +1046,7 @@ pub fn render_segments(
     };
     let temp = create_temporary_render_dir(temp_dir)?;
     let mut segments = Vec::new();
+    let mut piece_durations = Vec::new();
     for (index, (start, end)) in ranges.iter().enumerate() {
         let mut boundaries: Vec<f64> = vec![*start, *end];
         let mut cut_scenes: Vec<u64> = keyframes
@@ -1308,6 +1334,7 @@ pub fn render_segments(
             )?;
             drop(subtitle_file);
             segments.push(segment);
+            piece_durations.push(duration);
         }
     }
     let parent = output_path.parent().ok_or("OUTPUT_PARENT_MISSING")?;
@@ -1332,6 +1359,7 @@ pub fn render_segments(
         on_progress,
         progress_log,
         jump_cut,
+        &piece_durations,
     )?;
 
     // Atomic output: write to a sibling .tmp file first, probe-verify it, then atomically
@@ -1395,9 +1423,10 @@ pub fn join_segments(
     on_progress: &dyn ProgressSink,
     progress_log: &Path,
     jump_cut: bool,
+    piece_durations: &[f64],
 ) -> Result<PathBuf, String> {
     if jump_cut {
-        if let Some(graph) = jump_cut_graph(segments.len(), has_audio) {
+        if let Some(graph) = jump_cut_graph(&piece_durations, has_audio, expected_dimensions) {
             return join_segments_with_graph(
                 ffmpeg, segments, has_audio, total_duration, temp, on_progress, progress_log, &graph,
             );
@@ -1517,18 +1546,28 @@ fn join_segments_copy(
 /// Filter graph for a multi-range export: a gentle punch-in on each later
 /// range makes the jump deliberate, and a 30ms audio acrossfade removes the
 /// click at the splice. Returns None for a single range (normal concat).
-pub fn jump_cut_graph(count: usize, has_audio: bool) -> Option<String> {
+pub fn jump_cut_graph(durations: &[f64], has_audio: bool, dimensions: (u32, u32)) -> Option<String> {
+    let count = durations.len();
     if count < 2 {
         return None;
     }
+    let transition = 0.03_f64;
+    let (width, height) = dimensions;
     let mut graph = String::new();
     for index in 0..count {
+        if index > 0 {
+            graph.push(';');
+        }
         if index == 0 {
             graph.push_str(&format!("[{index}:v:0]null[v{index}]"));
         } else {
             graph.push_str(&format!(
-                "[{index}:v:0]scale=iw*1.04:ih*1.04,crop=iw/1.04:ih/1.04,setsar=1[v{index}]"
+                "[{index}:v:0]scale={}:{},crop={}:{},setsar=1[v{index}]",
+                width * 26 / 25, height * 26 / 25, width, height
             ));
+        }
+        if has_audio {
+            graph.push_str(&format!(";[{index}:a:0]anull[a{index}]"));
         }
     }
     let mut audio = String::new();
@@ -1537,25 +1576,27 @@ pub fn jump_cut_graph(count: usize, has_audio: bool) -> Option<String> {
             audio.push_str(&format!("[{index}:a:0]"));
         }
     }
-    // Chain acrossfades: each step folds the accumulated video/audio with the
-    // next range. 30ms is short enough to keep speech rhythm intact.
+    // Video uses xfade with an offset computed from the real piece durations;
+    // audio uses acrossfade. FFmpeg's acrossfade has video pads only on xfade,
+    // so the two chains must stay separate.
     let mut vcurrent = 0usize;
     let mut acurrent = 0usize;
+    let mut elapsed = durations[0];
     for index in 1..count {
         let vout = count + index;
+        let offset = (elapsed - transition).max(0.0);
+        graph.push_str(&format!(
+            ";[v{vcurrent}][v{index}]xfade=transition=fade:duration={transition:.3}:offset={offset:.3}[v{vout}]"
+        ));
         if has_audio {
             let aout = vout + count;
             graph.push_str(&format!(
-                ";[v{vcurrent}][a{acurrent}][v{index}][a{index}]acrossfade=d=0.03:c1=tri:c2=tri[v{vout}][a{aout}]"
+                ";[a{acurrent}][a{index}]acrossfade=d={transition:.3}:c1=tri:c2=tri[a{aout}]"
             ));
-            vcurrent = vout;
             acurrent = aout;
-        } else {
-            graph.push_str(&format!(
-                ";[v{vcurrent}][v{index}]concat=n=2:v=1:a=0[v{vout}]"
-            ));
-            vcurrent = vout;
         }
+        elapsed += durations[index] - transition;
+        vcurrent = vout;
     }
     graph.push_str(&format!(";[v{vcurrent}]setsar=1[vout]"));
     if has_audio {
@@ -1909,7 +1950,7 @@ impl Drop for TemporarySubtitle {
 mod tests {
     use super::{
         ass_dialogue, composition_graph_filter, has_confirmed_crop_keyframes, is_confirmed_zero_face_scene,
-        jump_cut_graph, text_box_delogo_filter, zero_face_scene_graph_filter,
+        jump_cut_graph, render_crop_mode_is_satisfied, text_box_delogo_filter, zero_face_scene_graph_filter,
     };
     use serde_json::json;
 
@@ -1921,15 +1962,33 @@ mod tests {
     }
 
     #[test]
+    fn crop_tracking_requires_usable_data() {
+        let plan = json!({ "cropMode": "track", "sourceArtifactId": "src" });
+        assert!(!render_crop_mode_is_satisfied(&plan));
+        let centered = json!({ "cropMode": "center", "sourceArtifactId": "src" });
+        assert!(render_crop_mode_is_satisfied(&centered));
+        let with_face = json!({
+            "cropMode": "track", "sourceArtifactId": "src", "speakerMap": { "A": "face-0" },
+            "cropKeyframes": [{ "time": 1.0, "centerX": 0.4, "confidence": 0.9, "confirmed": true, "speakerId": "A", "sourceFaceId": "face-0", "sourceArtifactId": "src" }]
+        });
+        assert!(render_crop_mode_is_satisfied(&with_face));
+    }
+
+    #[test]
     fn jump_cut_uses_acrossfade_and_punch_in_zoom() {
-        let graph = jump_cut_graph(2, true).unwrap();
+        let graph = jump_cut_graph(&[40.0, 57.0], true, (1080, 1920)).unwrap();
         assert!(graph.contains("acrossfade=d=0.03"), "{graph}");
-        assert!(graph.contains("scale=iw*1.04"), "{graph}");
-        assert!(graph.contains("1.04"), "{graph}");
+        assert!(graph.contains("scale=1123:1996,crop=1080:1920"), "{graph}");
+        assert!(graph.contains("xfade=transition=fade"), "{graph}");
+        assert!(graph.contains("offset=39.970"), "{graph}");
+        assert!(graph.contains("[0:v:0]null[v0]"), "{graph}");
+        assert!(graph.contains("[1:v:0]scale=1123:1996"), "{graph}");
+        assert!(graph.matches(";").count() >= 2, "{graph}");
+        assert!(graph.contains("1123:1996"), "{graph}");
         assert!(graph.contains("[vout]") && graph.contains("[aout]"), "{graph}");
-        let no_audio = jump_cut_graph(2, false).unwrap();
+        let no_audio = jump_cut_graph(&[40.0, 57.0], false, (1080, 1920)).unwrap();
         assert!(no_audio.contains("acrossfade") == false, "{no_audio}");
-        assert!(jump_cut_graph(1, true).is_none());
+        assert!(jump_cut_graph(&[40.0], true, (1080, 1920)).is_none());
     }
 
     #[test]

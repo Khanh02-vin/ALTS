@@ -397,6 +397,18 @@ async function runCropPathScenario(videoPath, outputPath) {
   const outputStat = await stat(outputPath);
   if (!outputStat.isFile() || outputStat.size === 0) throw new Error(`The cropped export is missing or empty: ${outputPath}`);
   report.observations.push(`The cropped export was written to ${outputPath} (${outputStat.size} bytes).`);
+  // A plan can carry keyframes that the renderer silently ignores. Check the
+  // actual export: the face must be near the centre of the 9:16 frame, not off
+  // the left edge because the renderer fell back to a static centre crop.
+  const frame = join(artifacts, "crop-export-frame.jpg");
+  execFileSync("ffmpeg", ["-y", "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", "1", "-i", outputPath, "-frames:v", "1", "-vf", "scale=640:-2", frame]);
+  const detector = resolve(root, "scripts/detect-faces.py");
+  const venvPython = join(process.env.LOCAL_FIRST_VENV ?? "", "bin/python");
+  const faces = JSON.parse(execFileSync(venvPython, [detector, frame], { encoding: "utf8" }));
+  if (faces.length === 0) throw new Error("No face in the cropped export — the crop missed the speaker.");
+  const faceCenter = (faces[0].x + faces[0].width / 2) / 640;
+  report.observations.push(`The exported frame's face centre is ${faceCenter.toFixed(3)} (expected near 0.5).`);
+  if (Math.abs(faceCenter - 0.5) > 0.2) throw new Error(`The exported face is off-centre at ${faceCenter.toFixed(3)} despite confirmed crop keyframes.`);
   await screenshot("04-crop-export-complete");
   report.output = outputPath;
 }

@@ -35,7 +35,7 @@ function updatePlan(state: EditorState, patch: PlanPatch): EditorState {
 export function createEditorState(sourceArtifactId: string, duration: number, selected: Highlight): EditorState {
   const ranges = highlightRangesToRenderRanges(selected.ranges);
   const renderRanges = ranges.length ? ranges : [{ start: selected.start, end: selected.end }];
-  const plan: RenderPlan = { version: 1, sourceArtifactId, ranges: renderRanges, aspectRatio: "9:16", cropMode: "track", layout: "solo", captions: [], hook: selected.hook ? { text: selected.hook, start: selected.start, end: Math.min(selected.start + 5, selected.end) } : undefined, ...(ranges.length > 1 ? { effects: ["jump-cut"] } : {}), outputProfile: { container: "mp4", codec: "h264" } };
+  const plan: RenderPlan = { version: 1, sourceArtifactId, ranges: renderRanges, aspectRatio: "9:16", cropMode: "center", layout: "solo", captions: [], hook: selected.hook ? { text: selected.hook, start: selected.start, end: Math.min(selected.start + 5, selected.end) } : undefined, ...(ranges.length > 1 ? { effects: ["jump-cut"] } : {}), outputProfile: { container: "mp4", codec: "h264" } };
   validateRenderPlan(plan, duration);
   return { sourceArtifactId, duration, selected, plan };
 }
