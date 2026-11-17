@@ -292,12 +292,8 @@ mod tests {
     use render_engine::contracts::RenderProgress;
     use render_engine::engine::{
         ass_dialogue, ass_timestamp, create_temporary_render_dir, escape_ass_filter_path,
-        join_segments, remap_hook, render_segments, side_by_side_graph, stable_subject_pair,
+        remap_hook, render_segments, side_by_side_graph, stable_subject_pair,
         subject_pair_continues, write_temporary_ass,
-    };
-
-    use crate::paths::{
-        app_render_temp_dir, data_dir, ffmpeg_bin, ffprobe_bin, render_progress_log,
     };
 
     use crate::runtime::{
@@ -306,7 +302,7 @@ mod tests {
     };
     use crate::youtube::{
         cookie_browser_args, preview_page, preview_query, public_video_url, remote_route,
-        youtube_search_query, youtube_video_id, youtube_video_url, RemoteRoute,
+        youtube_search_query, youtube_video_url, RemoteRoute,
     };
 
     /// Cargo runs unit tests in parallel threads inside one process; these tests mutate
@@ -913,7 +909,6 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
-            &[],
         )
         .unwrap();
         let probe = Command::new(ffprobe)
@@ -950,9 +945,13 @@ mod tests {
         assert_eq!(video["height"], 1920);
         let captioned = dir.0.join("captioned.mp4");
         let plain_output = dir.0.join("plain.mp4");
-        let caption_plan = serde_json::json!({"sourceArtifactId":"src","captions":[{"id":"c1","text":"CAPTIONVISIBLE","start":0.0,"end":2.0}]});
-        let plain_plan = serde_json::json!({"sourceArtifactId":"src","captions":[]});
-        let side_by_side_plan = serde_json::json!({"sourceArtifactId":"src","captions":[],"sceneLayouts":[{"start":0.0,"end":2.0,"layout":"side-by-side","confidence":0.8,"confirmed":true,"sourceArtifactId":"src","subjectBoxes":boxes}]});
+        // Plans must state cropMode: an absent value defaults to "track" and the
+        // renderer now fails loud when tracking data is missing. These fixtures
+        // only exercise captions/plain output, so they ask for a centre crop.
+        let caption_plan = serde_json::json!({"sourceArtifactId":"src","cropMode":"center","captions":[{"id":"c1","text":"CAPTIONVISIBLE","start":0.0,"end":2.0}]});
+        let plain_plan =
+            serde_json::json!({"sourceArtifactId":"src","cropMode":"center","captions":[]});
+        let side_by_side_plan = serde_json::json!({"sourceArtifactId":"src","cropMode":"track","captions":[],"sceneLayouts":[{"start":0.0,"end":2.0,"layout":"side-by-side","confidence":0.8,"confirmed":true,"sourceArtifactId":"src","subjectBoxes":boxes}]});
         render_segments(
             ffmpeg,
             ffprobe,
@@ -965,7 +964,6 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
-            &[],
         )
         .unwrap();
         render_segments(
@@ -980,7 +978,6 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
-            &[],
         )
         .unwrap();
         let multi_output = dir.0.join("multi.mp4");
@@ -996,7 +993,6 @@ mod tests {
             &temp_dir,
             &temp_dir.join("progress.log"),
             false,
-            &[],
         )
         .unwrap();
         // Compare the decoded video frame at 0.8s (inside the caption cue) directly:

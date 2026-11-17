@@ -3,9 +3,10 @@
 // reported "cuts off mid-thought" on a real clip whose final sentence was
 // genuinely unfinished, which this module detects without any network call.
 
+import { SENTENCE_END } from "./text-boundaries.ts";
+
 const DANGLING_START = /^(so|because|and|but|then|this|that|it|they|which|also|however|therefore|which is why|as i said|like i said|for that|vì vậy|do đó|vì thế|điều này|cái đó|như vừa nói|nên|rồi)\b/i;
 const NON_SPEECH = /^[(\[]|\b(upbeat music|music|applause|laughter|silence|subtitles)\b/i;
-const SENTENCE_END = /[.!?]["')\]]?$/;
 const SETUP_CUE = /(\?|\b(imagine|for example|last week|the problem|when we|when i|we had|i was|picture this|here is what)\b)/i;
 const CORE_CUE = /\b(mistake|key|solution|rule|never|always|should|must|because|the point|turns out|lesson|reason|the trick)\b/i;
 

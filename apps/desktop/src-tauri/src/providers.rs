@@ -371,7 +371,10 @@ pub(crate) fn flatten_cloud_stt(env: &mut HashMap<String, String>, store: &Cloud
     }
     env.insert("STT_API_KEY".into(), store.api_key.clone());
     if !store.base_url.trim().is_empty() {
-        env.insert("STT_REMOTE_BASE_URL".into(), store.base_url.trim().to_string());
+        env.insert(
+            "STT_REMOTE_BASE_URL".into(),
+            store.base_url.trim().to_string(),
+        );
     }
     if !store.model.trim().is_empty() {
         env.insert("STT_REMOTE_MODEL".into(), store.model.trim().to_string());
@@ -389,7 +392,11 @@ pub(crate) fn cloud_stt_status() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-pub(crate) fn save_cloud_stt(base_url: Option<String>, api_key: Option<String>, model: Option<String>) -> Result<(), String> {
+pub(crate) fn save_cloud_stt(
+    base_url: Option<String>,
+    api_key: Option<String>,
+    model: Option<String>,
+) -> Result<(), String> {
     let key = api_key.unwrap_or_default();
     if key.trim().is_empty() {
         return Err("STT_KEY_REQUIRED".into());

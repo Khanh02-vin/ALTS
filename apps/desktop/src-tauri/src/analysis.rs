@@ -14,7 +14,7 @@ use crate::analysis_store::{job_with_result, read_status, AnalysisStore, MAX_JOB
 use crate::contracts::AnalysisStatus;
 use crate::paths::NODE_ARGS;
 use crate::paths::{
-    analysis_range_allowed, app_render_temp_dir, ffmpeg_bin, helper_env, helper_script,
+    analysis_helper_env, analysis_range_allowed, app_render_temp_dir, ffmpeg_bin, helper_script,
     is_remote_input, jobs_path, node_bin, probe_duration, runtime_env, tool, venv_python,
 };
 use crate::runtime::storage;
@@ -129,12 +129,17 @@ fn prepare_remote_analysis_audio(
         let template = work_dir.join("source.%(ext)s");
         let cookies =
             configured_cookie_args().map_err(|e| format!("ANALYSIS_AUDIO_DOWNLOAD:{e}"))?;
-        let output = tool(&python)
-            .args([
+        let mut cmd = tool(&python);
+        // Audio for a long remote video legitimately takes a while, but a stalled
+        // CDN must not pin the worker forever: 30 min ceiling + a socket timeout.
+        let output = crate::paths::output_with_timeout(
+            cmd.args([
                 "-I",
                 "-m",
                 "yt_dlp",
                 "--no-playlist",
+                "--socket-timeout",
+                "20",
                 "-f",
                 // Facebook often only offers a muxed format, so fall back to "best".
                 "bestaudio/best",
@@ -142,9 +147,10 @@ fn prepare_remote_analysis_audio(
             ])
             .args(&cookies)
             .arg(&template)
-            .arg(input)
-            .output()
-            .map_err(|e| format!("ANALYSIS_AUDIO_DOWNLOAD:{e}"))?;
+            .arg(input),
+            std::time::Duration::from_secs(1800),
+        )
+        .map_err(|e| format!("ANALYSIS_AUDIO_DOWNLOAD:{e}"))?;
         if !output.status.success() {
             return Err(format!(
                 "ANALYSIS_AUDIO_DOWNLOAD:{}",
@@ -176,16 +182,6 @@ fn prepare_remote_analysis_audio(
         return Err(error);
     }
     Ok(cleanup)
-}
-
-fn existing_analysis_audio_path_in(temp_dir: &Path, job_id: &str) -> Option<PathBuf> {
-    let local = analysis_audio_path(temp_dir, job_id);
-    if local.is_file() {
-        return Some(local);
-    }
-    let remote_dir = temp_dir.join(format!("analysis-{job_id}-remote-audio"));
-    let remote = analysis_audio_path(&remote_dir, job_id);
-    remote.is_file().then_some(remote)
 }
 
 fn remove_existing_analysis_audio(app: &tauri::AppHandle, job_id: &str) {
@@ -280,7 +276,7 @@ pub(crate) fn start_analysis(
         .arg(format!("{duration:.3}"))
         .arg(format!("{range_start:.3}"))
         .arg(format!("{range_end:.3}"));
-    for (key, value) in helper_env(&app, &[]) {
+    for (key, value) in analysis_helper_env(&app, &[]) {
         init.env(key, value);
     }
     set_analysis_audio_env(&mut init, audio_path);
@@ -454,7 +450,7 @@ pub(crate) fn spawn_analysis_worker_reserved(
                     .arg(&job_id)
                     .arg(jobs_path());
             }
-            for (key, value) in helper_env(&app, &[]) {
+            for (key, value) in analysis_helper_env(&app, &[]) {
                 cmd.env(key, value);
             }
             set_analysis_audio_env(
@@ -510,7 +506,7 @@ pub(crate) fn spawn_analysis_worker_reserved(
                         .env("YT_PYTHON", venv_python())
                         .env("YT_CRAWLER", helper_script(&app, "yt-crawler.py")?)
                         .env("YOUTUBE_AUDIO_FALLBACK_ONLY", "1");
-                    for (key, value) in helper_env(&app, &[]) {
+                    for (key, value) in analysis_helper_env(&app, &[]) {
                         retry.env(key, value);
                     }
                     set_analysis_audio_env(&mut retry, audio_cleanup.path());
@@ -885,33 +881,6 @@ mod audio_lifecycle_tests {
             analysis_audio_path(temp, "job-123"),
             PathBuf::from("/private/tmp/analysis-job-123-audio.wav")
         );
-    }
-
-    #[test]
-    fn existing_analysis_audio_path_only_returns_existing_files() {
-        let temp = std::env::temp_dir().join(format!("analysis-audio-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&temp);
-        std::fs::create_dir_all(&temp).unwrap();
-        let audio = analysis_audio_path(&temp, "job-123");
-
-        assert_eq!(existing_analysis_audio_path_in(&temp, "job-123"), None);
-        let remote_dir = temp.join("analysis-job-123-remote-audio");
-        std::fs::create_dir_all(&remote_dir).unwrap();
-        let remote = analysis_audio_path(&remote_dir, "job-123");
-        std::fs::write(&remote, b"wav").unwrap();
-        assert_eq!(
-            existing_analysis_audio_path_in(&temp, "job-123"),
-            Some(remote.clone())
-        );
-        std::fs::remove_dir_all(&remote_dir).unwrap();
-
-        std::fs::write(&audio, b"wav").unwrap();
-        assert_eq!(
-            existing_analysis_audio_path_in(&temp, "job-123"),
-            Some(audio.clone())
-        );
-
-        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

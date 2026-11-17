@@ -92,4 +92,28 @@ function highlight(overrides: Partial<Highlight> = {}): Highlight {
   assert.ok(ranges[0]!.wordIds.length > 0, "wordIds come from the transcript, not the model");
 }
 
+// Regression: the fallback for sentences without wordIds used to call
+// Map.prototype.filter, which throws ("wordById.filter is not a function").
+// Sentence IDs without explicit wordIds must still resolve to transcript words.
+{
+  const words = Array.from({ length: 10 }, (_, index) => ({ id: `w-${index}`, text: "word", start: index * 3, end: index * 3 + 2.8 }));
+  const transcript = { version: 1 as const, sourceArtifactId: "src", language: "en", duration: 60, provider: "fixture", words, segments: [] };
+  // No wordIds on either sentence: both must fall back to timing.
+  const sentences = [
+    { id: "s-0", start: 0, end: 9, text: "first" },
+    { id: "s-1", start: 12, end: 21, text: "second" },
+  ] as unknown as Array<{ id: string; start: number; end: number; text: string; wordIds?: string[] }>;
+  const ranges = buildValidatedRanges(
+    [{ startSentenceId: "s-0", endSentenceId: "s-0" }, { startSentenceId: "s-1", endSentenceId: "s-1" }],
+    sentences as never,
+    transcript,
+    { start: 0, end: 21, wordIds: [] },
+    { minTotal: 10, maxTotal: 60, mergeGap: 1.5 },
+  );
+  assert.ok(ranges, "sentences without wordIds must not throw");
+  assert.equal(ranges.length, 2);
+  assert.ok((ranges[0]!.wordIds?.length ?? 0) > 0, "the fallback must derive wordIds from transcript timings");
+  assert.ok((ranges[1]!.wordIds?.length ?? 0) > 0, "every range needs its fallback words");
+}
+
 console.log("multi-range: ok");

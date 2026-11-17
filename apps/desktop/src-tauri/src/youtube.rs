@@ -10,8 +10,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::paths::NODE_ARGS;
 use crate::paths::{
     analysis_range_allowed, data_dir, helper_env, helper_script, jobs_path, node_bin,
-    python_binary, runtime_env, tool, venv_python, whisper_venv_bin, write_private_file,
-    write_runtime_settings,
+    output_with_timeout, python_binary, runtime_env, tool, venv_python, whisper_venv_bin,
+    write_private_file, write_runtime_settings, HELPER_TIMEOUT,
 };
 use crate::runtime::{ensure_rag_server, RagState};
 use crate::{spawn_analysis_worker, Jobs};
@@ -34,12 +34,24 @@ pub(crate) fn prepare_youtube_venv(venv: &Path) -> bool {
         return false;
     }
     let pip = whisper_venv_bin("pip");
-    let _ = tool(&pip).args(["install", "--upgrade", "pip"]).output();
-    tool(&pip)
-        .args(["install", "yt-dlp", "youtube-transcript-api"])
-        .output()
-        .map(|out| out.status.success())
-        .unwrap_or(false)
+    let mut upgrade = tool(&pip);
+    let _ = crate::paths::output_with_timeout(
+        upgrade.args(["install", "--upgrade", "pip"]),
+        std::time::Duration::from_secs(300),
+    );
+    // Pinned for the same reason as the Whisper bootstrap: these run inside the
+    // user's venv and an unpinned upgrade changes behaviour without review.
+    let mut install = tool(&pip);
+    crate::paths::output_with_timeout(
+        install.args([
+            "install",
+            "yt-dlp==2026.8.19",
+            "youtube-transcript-api==1.2.4",
+        ]),
+        std::time::Duration::from_secs(600),
+    )
+    .map(|out| out.status.success())
+    .unwrap_or(false)
 }
 
 // --- Public YouTube search ------------------------------------------------------
@@ -88,6 +100,12 @@ pub(crate) fn youtube_search_videos(query: String) -> Result<serde_json::Value, 
         .args([
             "-sS",
             "--get",
+            // Bounded network wait: stdin carries the API key config, so the
+            // process-group timeout helper cannot own the pipes here.
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
             "https://www.googleapis.com/youtube/v3/search",
             "--config",
             "-",
@@ -218,11 +236,21 @@ pub(crate) fn b64url_nopad(data: &[u8]) -> String {
 
 pub(crate) fn yt_token_request(form: &[(&str, &str)]) -> Result<serde_json::Value, String> {
     let mut cmd = tool("curl");
-    cmd.args(["-s", "-X", "POST", "https://oauth2.googleapis.com/token"]);
+    cmd.args([
+        "-s",
+        "--connect-timeout",
+        "10",
+        "--max-time",
+        "60",
+        "-X",
+        "POST",
+        "https://oauth2.googleapis.com/token",
+    ]);
     for (k, v) in form {
         cmd.arg("--data-urlencode").arg(format!("{k}={v}"));
     }
-    let out = cmd.output().map_err(|e| format!("CURL_SPAWN:{e}"))?;
+    let out =
+        output_with_timeout(&mut cmd, HELPER_TIMEOUT).map_err(|e| format!("CURL_SPAWN:{e}"))?;
     let value: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("TOKEN_JSON:{e}"))?;
     if value.get("error").is_some() {
@@ -265,11 +293,21 @@ pub(crate) fn yt_bearer() -> Result<String, String> {
 
 pub(crate) fn yt_api_get(path_with_query: &str) -> Result<serde_json::Value, String> {
     let bearer = yt_bearer()?;
-    let out = tool("curl")
-        .args(["-s", "-H", &format!("Authorization: Bearer {bearer}")])
-        .arg(format!("https://www.googleapis.com{path_with_query}"))
-        .output()
-        .map_err(|e| format!("YT_API_SPAWN:{e}"))?;
+    let mut cmd = tool("curl");
+    let out = output_with_timeout(
+        cmd.args([
+            "-s",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "60",
+            "-H",
+            &format!("Authorization: Bearer {bearer}"),
+        ])
+        .arg(format!("https://www.googleapis.com{path_with_query}")),
+        HELPER_TIMEOUT,
+    )
+    .map_err(|e| format!("YT_API_SPAWN:{e}"))?;
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|e| {
         format!(
             "YT_API_JSON:{e} — {}",
@@ -468,13 +506,23 @@ pub(crate) fn youtube_ingest_captions(
 ) -> Result<serde_json::Value, String> {
     let bearer = yt_bearer()?;
     let caps = {
-        let out = tool("curl")
-            .args(["-s", "-H", &format!("Authorization: Bearer {bearer}")])
+        let mut cmd = tool("curl");
+        let out = output_with_timeout(
+            cmd.args([
+                "-s",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
+                "-H",
+                &format!("Authorization: Bearer {bearer}"),
+            ])
             .arg(format!(
                 "https://www.googleapis.com/youtube/v3/captions?part=snippet&videoId={video_id}"
-            ))
-            .output()
-            .map_err(|e| format!("YT_API_SPAWN:{e}"))?;
+            )),
+            HELPER_TIMEOUT,
+        )
+        .map_err(|e| format!("YT_API_SPAWN:{e}"))?;
         let value: serde_json::Value =
             serde_json::from_slice(&out.stdout).map_err(|e| format!("YT_API_JSON:{e}"))?;
         if let Some(err) = value.get("error") {
@@ -490,13 +538,24 @@ pub(crate) fn youtube_ingest_captions(
     }
     let cap_id = caps[0]["id"].as_str().unwrap_or("").to_string();
     let srt = {
-        let out = tool("curl")
-            .args(["-s", "-L", "-H", &format!("Authorization: Bearer {bearer}")])
+        let mut cmd = tool("curl");
+        let out = output_with_timeout(
+            cmd.args([
+                "-s",
+                "-L",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "60",
+                "-H",
+                &format!("Authorization: Bearer {bearer}"),
+            ])
             .arg(format!(
                 "https://www.googleapis.com/youtube/v3/captions/{cap_id}?tfmt=srt"
-            ))
-            .output()
-            .map_err(|e| format!("CAP_SPAWN:{e}"))?;
+            )),
+            HELPER_TIMEOUT,
+        )
+        .map_err(|e| format!("CAP_SPAWN:{e}"))?;
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
     let segments = parse_srt_segments(&srt);
@@ -508,13 +567,18 @@ pub(crate) fn youtube_ingest_captions(
     let endpoint = ensure_rag_server(&app.state::<RagState>(), &app)?;
     let body = serde_json::json!({ "videoUrl": format!("https://www.youtube.com/watch?v={video_id}"), "segments": segments });
     let body_str = body.to_string();
-    let out = tool("curl")
-        .args([
+    let mut cmd = tool("curl");
+    let out = output_with_timeout(
+        cmd.args([
             "-s",
             "-o",
             "/dev/null",
             "-w",
             "%{http_code}",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "60",
             "-X",
             "POST",
             "-H",
@@ -524,9 +588,10 @@ pub(crate) fn youtube_ingest_captions(
             "-d",
             &body_str,
             &format!("{}/api/rag/ingest", endpoint.base),
-        ])
-        .output()
-        .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
+        ]),
+        HELPER_TIMEOUT,
+    )
+    .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
     if !String::from_utf8_lossy(&out.stdout).trim().starts_with('2') {
         return Err(format!(
             "INGEST_HTTP:{}",
@@ -762,6 +827,9 @@ pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String
         "yt_dlp",
         "--skip-download",
         "--no-playlist",
+        // A stalled CDN handshake must not pin this call forever.
+        "--socket-timeout",
+        "20",
         "--print",
         "%(title)s\t%(duration)s",
     ])
@@ -770,7 +838,8 @@ pub(crate) fn yt_video_meta(app: &tauri::AppHandle, url: &str) -> Result<(String
     for (key, value) in helper_env(app, &[]) {
         cmd.env(key, value);
     }
-    let output = cmd.output().map_err(|e| format!("YT_META_SPAWN:{e}"))?;
+    let output =
+        output_with_timeout(&mut cmd, HELPER_TIMEOUT).map_err(|e| format!("YT_META_SPAWN:{e}"))?;
     if !output.status.success() {
         return Err(format!(
             "YT_META:{}",
@@ -808,6 +877,8 @@ pub(crate) fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Ve
         "-m",
         "yt_dlp",
         "--no-playlist",
+        "--socket-timeout",
+        "20",
         "-g",
         "-f",
         "bv*[ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b",
@@ -817,7 +888,8 @@ pub(crate) fn resolve_stream_url(app: &tauri::AppHandle, url: &str) -> Result<Ve
     for (key, value) in helper_env(app, &[]) {
         cmd.env(key, value);
     }
-    let output = cmd.output().map_err(|e| format!("YT_STREAM_SPAWN:{e}"))?;
+    let output = output_with_timeout(&mut cmd, HELPER_TIMEOUT)
+        .map_err(|e| format!("YT_STREAM_SPAWN:{e}"))?;
     if !output.status.success() {
         return Err(format!(
             "YT_STREAM_RESOLVE:{}",
@@ -1074,7 +1146,9 @@ pub(crate) fn run_yt_crawler(
     for (key, value) in helper_env(app, &[]) {
         cmd.env(key, value);
     }
-    let output = cmd.output().map_err(|e| format!("CRAWLER_SPAWN:{e}"))?;
+    // A playlist crawl downloads nothing but can still stall on a slow API: bound it.
+    let output = output_with_timeout(&mut cmd, std::time::Duration::from_secs(600))
+        .map_err(|e| format!("CRAWLER_SPAWN:{e}"))?;
     if !output.status.success() {
         return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
     }
@@ -1094,13 +1168,18 @@ pub(crate) fn run_yt_crawler(
             "segments": video.get("segments").cloned().unwrap_or(serde_json::Value::Array(vec![])),
         });
         let body_str = body.to_string();
-        let out = tool("curl")
-            .args([
+        let mut cmd = tool("curl");
+        let out = output_with_timeout(
+            cmd.args([
                 "-s",
                 "-o",
                 "/dev/null",
                 "-w",
                 "%{http_code}",
+                "--connect-timeout",
+                "5",
+                "--max-time",
+                "120",
                 "-X",
                 "POST",
                 "-H",
@@ -1108,9 +1187,10 @@ pub(crate) fn run_yt_crawler(
                 "-d",
                 &body_str,
                 &ingest_url,
-            ])
-            .output()
-            .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
+            ]),
+            HELPER_TIMEOUT,
+        )
+        .map_err(|e| format!("INGEST_SPAWN:{e}"))?;
         if !out.status.success() {
             continue;
         }

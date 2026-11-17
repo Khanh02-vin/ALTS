@@ -112,7 +112,13 @@ export async function groupHighlightsIntoCollections(
   if (options.clusterer) {
     try {
       drafts = await options.clusterer(highlights);
-    } catch {
+    } catch (error) {
+      // Falling back to the local clusterer is intended, but a provider failure
+      // must be visible: otherwise a degraded result looks like a good one.
+      console.warn(
+        "[collections] clusterer failed; falling back to local grouping:",
+        error instanceof Error ? error.message : String(error),
+      );
       drafts = [];
     }
   }

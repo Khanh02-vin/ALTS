@@ -75,7 +75,11 @@ export class GeminiTranscriptVariantProvider implements VariantProvider {
   constructor(apiKey: string, model = "gemini-2.0-flash", endpoint = "https://generativelanguage.googleapis.com/v1beta/models") { this.apiKey = apiKey; this.model = model; this.endpoint = endpoint; }
   async generate({ transcript, signal }: { transcript: Transcript; signal?: AbortSignal }): Promise<EditVariant[]> {
     const schema = { ...VARIANT_OUTPUT_SCHEMA, type: "OBJECT", properties: { variants: { ...VARIANT_OUTPUT_SCHEMA.properties.variants, type: "ARRAY", items: { type: "OBJECT", properties: { title: { type: "STRING" }, reason: { type: "STRING" }, ranges: { type: "ARRAY", items: { type: "OBJECT", properties: { from: { type: "INTEGER" }, to: { type: "INTEGER" } }, required: ["from", "to"] } } }, required: ["title", "ranges"] } } }, required: ["variants"] };
-    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: editVariantPrompt(transcript) }] }], generationConfig: { responseMimeType: "application/json", responseSchema: schema } }), signal });
+    // Bound the call even when the caller supplies no signal, matching the other
+    // LLM providers: an unbounded fetch here hangs the variant button forever.
+    const timeout = AbortSignal.timeout(15 * 60_000);
+    const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+    const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: editVariantPrompt(transcript) }] }], generationConfig: { responseMimeType: "application/json", responseSchema: schema } }), signal: combined });
     if (!response.ok) throw new Error(`GEMINI_VARIANT_PROVIDER_${response.status}`);
     const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
     const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";

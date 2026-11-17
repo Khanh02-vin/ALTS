@@ -83,8 +83,12 @@ export function validateRenderPlan(plan: RenderPlan, duration: number): void {
   }
   if (plan.cropMode === "track") {
     const hasUsableCrop = plan.cropKeyframes?.some((key) => key.confirmed === true && key.confidence >= 0.5 && key.centerX >= 0 && key.centerX <= 1 && (!key.speakerId || !key.sourceFaceId || plan.speakerMap?.[key.speakerId] === key.sourceFaceId));
+    const hasUsableScene = plan.sceneLayouts?.some((layout) => layout.confirmed === true);
     const hasUsableComposition = plan.compositionLayouts?.some((layout) => layout.confirmed === true);
-    if (!hasUsableCrop && !hasUsableComposition) throw new Error("Crop tracking requested without confirmed crop keyframes or composition layouts");
+    // A confirmed scene layout is honoured by the renderer (it drives the
+    // composition/reframe graph), so it is a valid tracking signal too. Omitting it
+    // made "Approve scenes" in the editor throw on save.
+    if (!hasUsableCrop && !hasUsableScene && !hasUsableComposition) throw new Error("Crop tracking requested without confirmed crop keyframes, scene layouts or composition layouts");
   }
   if (plan.cropKeyframes) {
     if (plan.cropKeyframes.length > 600) throw new Error("Too many crop keyframes");

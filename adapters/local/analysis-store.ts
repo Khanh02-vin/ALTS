@@ -11,6 +11,11 @@ export type AnalysisJob = { id: string; input: string; duration: number; rangeSt
 /** A job that keeps dying on the same chunk must stop being auto-resumed. */
 export const MAX_JOB_ATTEMPTS = 3;
 
+/** Patch keys this store may write; explicit so no caller-supplied key can become
+ *  a SQL identifier. */
+const JOB_COLUMNS = { status: "status", phase: "phase", progress: "progress", error: "error", resultPath: "result_path" } as const;
+const CHUNK_COLUMNS = { status: "status", attempts: "attempts", error: "error" } as const;
+
 export class AnalysisStore {
   readonly db: DatabaseSync;
   private constructor(db: DatabaseSync) { this.db = db; }
@@ -24,13 +29,13 @@ export class AnalysisStore {
   listQueued(): AnalysisJob[] { const rows = this.db.prepare("SELECT id FROM analysis_jobs WHERE status='queued' ORDER BY updated_at").all() as Array<{ id: string }>; return rows.map((row) => this.get(row.id)!); }
   chunksOf(jobId: string): AnalysisChunk[] { return this.db.prepare("SELECT job_id as jobId,chunk_index as chunkIndex,start,end,cache_key as cacheKey,status,attempts,error FROM analysis_chunks WHERE job_id=? ORDER BY chunk_index").all(jobId) as AnalysisChunk[]; }
   allJobs(): AnalysisJob[] { const rows = this.db.prepare("SELECT id FROM analysis_jobs ORDER BY updated_at DESC").all() as Array<{id:string}>; return rows.map(({id}) => this.get(id)!); }
-  update(id: string, patch: Partial<Pick<AnalysisJob,"status"|"phase"|"progress"|"error"|"resultPath">>) { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const cols = entries.map(([key]) => `${key === "resultPath" ? "result_path" : key}=?`).join(","); this.db.prepare(`UPDATE analysis_jobs SET ${cols},updated_at=? WHERE id=? AND status!='cancelled'`).run(...entries.map(([,v])=>v),new Date().toISOString(),id); return this.get(id); }
+  update(id: string, patch: Partial<Pick<AnalysisJob,"status"|"phase"|"progress"|"error"|"resultPath">>) { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const cols = entries.map(([key]) => `${JOB_COLUMNS[key as keyof typeof JOB_COLUMNS]}=?`).join(","); this.db.prepare(`UPDATE analysis_jobs SET ${cols},updated_at=? WHERE id=? AND status!='cancelled'`).run(...entries.map(([,v])=>v),new Date().toISOString(),id); return this.get(id); }
   cancel(id: string) { const now = new Date().toISOString(); this.db.exec("BEGIN IMMEDIATE"); try { this.db.prepare("UPDATE analysis_jobs SET status='cancelled',phase='cancelled',error='stopped by user',updated_at=? WHERE id=? AND status IN ('queued','running')").run(now,id); this.db.prepare("UPDATE analysis_chunks SET status='queued',error='cancelled',updated_at=? WHERE job_id=? AND status='running'").run(now,id); this.db.exec("COMMIT"); } catch (error) { this.db.exec("ROLLBACK"); throw error; } return this.get(id); }
   createChunks(jobId: string, chunks: Array<Pick<AnalysisChunk,"chunkIndex"|"start"|"end"|"cacheKey">>) { const now = new Date().toISOString(); const stmt = this.db.prepare("INSERT OR IGNORE INTO analysis_chunks (job_id,chunk_index,start,end,cache_key,status,updated_at) VALUES (?,?,?,?,?,'queued',?)"); for (const chunk of chunks) stmt.run(jobId,chunk.chunkIndex,chunk.start,chunk.end,chunk.cacheKey,now); }
-  updateChunk(jobId: string, chunkIndex: number, patch: Partial<Pick<AnalysisChunk,"status"|"attempts"|"error">>) { const entries = Object.entries(patch); if (!entries.length) return; const cols = entries.map(([key]) => `${key}=?`).join(","); this.db.prepare(`UPDATE analysis_chunks SET ${cols},updated_at=? WHERE job_id=? AND chunk_index=?`).run(...entries.map(([,v])=>v),new Date().toISOString(),jobId,chunkIndex); }
+  updateChunk(jobId: string, chunkIndex: number, patch: Partial<Pick<AnalysisChunk,"status"|"attempts"|"error">>) { const entries = Object.entries(patch); if (!entries.length) return; const cols = entries.map(([key]) => `${CHUNK_COLUMNS[key as keyof typeof CHUNK_COLUMNS]}=?`).join(","); this.db.prepare(`UPDATE analysis_chunks SET ${cols},updated_at=? WHERE job_id=? AND chunk_index=?`).run(...entries.map(([,v])=>v),new Date().toISOString(),jobId,chunkIndex); }
   recover() { const now = new Date().toISOString(); this.db.prepare("UPDATE analysis_chunks SET status='queued',error='recovered after restart',updated_at=? WHERE status='running'").run(new Date().toISOString()); this.db.prepare("UPDATE analysis_jobs SET status='queued',phase='queued',error='recovered after restart',worker_pid=NULL,updated_at=? WHERE status='running'").run(now); }
   workerPid(id: string): number | null { const row = this.db.prepare("SELECT worker_pid as pid FROM analysis_jobs WHERE id=?").get(id) as { pid: number | null } | undefined; return row?.pid ?? null; }
   setWorkerPid(id: string, pid: number | null) { this.db.prepare("UPDATE analysis_jobs SET worker_pid=?,updated_at=? WHERE id=?").run(pid,new Date().toISOString(),id); }
-  clear(id: string) { const job = this.get(id); if (!job) return 0; let bytes = 0; if (job.resultPath) { try { bytes = statSync(job.resultPath).size; unlinkSync(job.resultPath); } catch {} } this.db.prepare("DELETE FROM analysis_jobs WHERE id=?").run(id); return bytes; }
+  clear(id: string) { const job = this.get(id); if (!job) return 0; let bytes = 0; if (job.resultPath) { try { bytes = statSync(job.resultPath).size; unlinkSync(job.resultPath); } catch (error) { console.warn("[analysis-store] stale result not removed:", error instanceof Error ? error.message : String(error)); } } this.db.prepare("DELETE FROM analysis_jobs WHERE id=?").run(id); return bytes; }
   close() { this.db.close(); }
 }

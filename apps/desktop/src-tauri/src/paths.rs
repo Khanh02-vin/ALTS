@@ -29,6 +29,76 @@ pub(crate) fn tool(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 
+/// How long a helper may run before it is killed. Network helpers (curl, yt-dlp)
+/// have no natural bound: a stalled TLS handshake or a CDN that never answers
+/// would otherwise pin the calling worker thread forever, and the user's cancel
+/// button cannot reach it.
+pub(crate) const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Runs a helper to completion, killing it (and its process group) after `timeout`.
+///
+/// `Command::output()` waits indefinitely, which is how the YouTube/audio helpers
+/// hung on a bad network. The child is spawned in its own group so the kill also
+/// reaches grandchildren (yt-dlp's ffmpeg, curl's TLS workers). Both pipes are
+/// drained by reader threads: polling `try_wait` alone would deadlock as soon as a
+/// chatty child (a large playlist crawl) fills the 64 KiB pipe buffer and blocks.
+pub(crate) fn output_with_timeout(
+    command: &mut Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use command_group::CommandGroup;
+    use std::io::Read;
+    use std::process::Stdio;
+
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut group = command.group();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        group.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = group.spawn().map_err(|e| format!("HELPER_SPAWN:{e}"))?;
+
+    fn drain<R: Read + Send + 'static>(stream: Option<R>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buffer = Vec::new();
+            if let Some(mut stream) = stream {
+                let _ = stream.read_to_end(&mut buffer);
+            }
+            buffer
+        })
+    }
+    let stdout_reader = drain(child.inner().stdout.take());
+    let stderr_reader = drain(child.inner().stderr.take());
+
+    let deadline = std::time::Instant::now() + timeout;
+    let timed_out = loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break false,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break true;
+            }
+            Err(e) => return Err(format!("HELPER_WAIT:{e}")),
+        }
+    };
+    let stdout = stdout_reader.join().unwrap_or_default();
+    let stderr = stderr_reader.join().unwrap_or_default();
+    if timed_out {
+        return Err(format!("HELPER_TIMEOUT:{}s", timeout.as_secs()));
+    }
+    let status = child.wait().map_err(|e| format!("HELPER_STATUS:{e}"))?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Durable app data: databases, settings, tokens, RAG playlists, licence.
 ///
 /// This is the directory the OS and cleanup tools must never treat as disposable.
@@ -374,12 +444,80 @@ pub(crate) fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), String
     file.sync_all().map_err(|e| format!("SECRET_WRITE:{e}"))
 }
 
-/// Environment for spawned helpers: bundled binaries + runtime.env defaults, real env wins.
+/// runtime.env keys that carry credentials. They are deliberately NOT part of the
+/// generic helper environment: `yt-dlp`/`curl`/crawler children have no use for an
+/// LLM key, and every extra process that holds one widens the reachable-secret
+/// surface (on Linux any same-user process can read `/proc/<pid>/environ`).
+const CREDENTIAL_KEYS: &[&str] = &[
+    "HF_TOKEN",
+    "GEMINI_API_KEY",
+    "OPENAI_API_KEY",
+    "ACTIVE_PROVIDER_API_KEY",
+    "LOCAL_LLM_API_KEY",
+    "STT_API_KEY",
+    "YOUTUBE_API_KEY",
+    "YOUTUBE_CLIENT_SECRET",
+    "YOUTUBE_REFRESH_TOKEN",
+];
+
+/// Media/transcription keys the analysis worker and its Whisper children need.
+const PIPELINE_KEYS: &[&str] = &[
+    "WHISPER_ENGINE",
+    "WHISPER_COMMAND",
+    "WHISPER_MODEL",
+    "WHISPER_MODEL_PATH",
+    "WHISPER_LANGUAGE",
+    "WHISPER_DEVICE",
+    "WHISPER_FP16",
+    "WHISPER_CHUNK_SECONDS",
+    "WHISPER_OVERLAP_SECONDS",
+    "WHISPER_PROMPT",
+    "WHISPER_DTW",
+    "WHISPER_CPP_MODEL",
+    "LF_WHISPERCPP_BIN",
+    "LF_WHISPERCPP_MODEL",
+    "LF_WHISPERCPP_ARGS",
+    "HIGHLIGHT_STRATEGY",
+    "ACTIVE_PROVIDER_ID",
+    "ACTIVE_PROVIDER_NAME",
+    "ACTIVE_PROVIDER_BASE_URL",
+    "ACTIVE_PROVIDER_MODEL",
+    "LOCAL_LLM_BASE_URL",
+    "LOCAL_LLM_MODEL",
+    "FFMPEG_COMMAND",
+    "FFPROBE_PATH",
+    "LF_AI_RENDER_BIN",
+];
+
+/// Keys that are safe for every helper: bundled binaries + paths + non-secret
+/// pipeline settings. Credentials are excluded; see `analysis_helper_env`.
 pub(crate) fn helper_env(app: &tauri::AppHandle, extra: &[(&str, &str)]) -> Vec<(String, String)> {
+    build_helper_env(app, PIPELINE_KEYS, extra)
+}
+
+/// Environment for the Node analysis worker, which is the only helper that talks
+/// to an LLM/STT provider and therefore needs the credential keys.
+pub(crate) fn analysis_helper_env(
+    app: &tauri::AppHandle,
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    let allowed: Vec<&str> = PIPELINE_KEYS
+        .iter()
+        .chain(CREDENTIAL_KEYS.iter())
+        .copied()
+        .collect();
+    build_helper_env(app, &allowed, extra)
+}
+
+fn build_helper_env(
+    app: &tauri::AppHandle,
+    allowed: &[&str],
+    extra: &[(&str, &str)],
+) -> Vec<(String, String)> {
     let file = runtime_env();
     let mut env: Vec<(String, String)> = file
         .iter()
-        .filter(|(key, _)| key.as_str() != "HF_TOKEN")
+        .filter(|(key, _)| allowed.contains(&key.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let cpp_default = file
@@ -437,13 +575,21 @@ pub(crate) fn local_preview_source(input: &str) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn preview_proxy_cache_key(source: &Path, size: u64, modified_nanos: u128) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    source.to_string_lossy().hash(&mut hasher);
-    size.hash(&mut hasher);
-    modified_nanos.hash(&mut hasher);
-    1_u32.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
+    // SHA-256 instead of DefaultHasher: DefaultHasher explicitly does not guarantee
+    // its algorithm across Rust releases, so a toolchain bump silently orphaned
+    // every cached proxy. This key is also used to delete the cache entry, and both
+    // sides must agree for years, not just for one compiler version.
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(source.to_string_lossy().as_bytes());
+    hasher.update(size.to_le_bytes());
+    hasher.update(modified_nanos.to_le_bytes());
+    hasher.update(1_u32.to_le_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 pub(crate) fn transcode_preview_proxy(
@@ -846,46 +992,29 @@ pub(crate) fn analysis_range_allowed(start: f64, end: f64) -> bool {
 /// Never commit keys/license-private.pem — generate your own keypair for production.
 pub(crate) const LICENSE_PUBLIC_KEY_B64: &str = "dj1xRsYANUUgntXmdcTd9Kv+hoG5ENBT3HyPvRmKtic=";
 
-/// Verifies license.lic against the embedded public key and expiry; returns tier ("free"|"pro").
-pub(crate) fn license_tier() -> String {
+/// Decodes and verifies license.lic, returning the signed payload only when the
+/// signature and expiry both check out. Everything that reports licence state goes
+/// through here so the tier and the licensee can never disagree.
+pub(crate) fn verified_license_payload() -> Option<serde_json::Value> {
     use base64::engine::general_purpose::STANDARD as BASE64;
     use base64::Engine as _;
     use ed25519_dalek::{Signature, VerifyingKey};
     if LICENSE_PUBLIC_KEY_B64.is_empty() {
-        return "free".into();
+        return None;
     }
-    let (Ok(pub_bytes), Ok(raw)) = (
-        BASE64.decode(LICENSE_PUBLIC_KEY_B64),
-        std::fs::read(data_dir().join("license.lic")),
-    ) else {
-        return "free".into();
-    };
-    let Ok(pub_key) = VerifyingKey::from_bytes(
-        pub_bytes
-            .as_slice()
-            .try_into()
-            .map_err(|_| ())
-            .unwrap_or(&[0u8; 32]),
-    ) else {
-        return "free".into();
-    };
-    let Ok(text) = String::from_utf8(raw) else {
-        return "free".into();
-    };
+    let pub_bytes = BASE64.decode(LICENSE_PUBLIC_KEY_B64).ok()?;
+    let pub_key = VerifyingKey::from_bytes(pub_bytes.as_slice().try_into().ok()?).ok()?;
+    let raw = std::fs::read(data_dir().join("license.lic")).ok()?;
+    let text = String::from_utf8(raw).ok()?;
     let mut lines = text.lines();
-    let (Some(payload_b64), Some(sig_b64)) = (lines.next(), lines.next()) else {
-        return "free".into();
-    };
-    let (Ok(payload), Ok(sig_bytes)) = (BASE64.decode(payload_b64), BASE64.decode(sig_b64)) else {
-        return "free".into();
-    };
-    let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap_or(&[0u8; 64]));
-    if pub_key.verify_strict(&payload, &sig).is_err() {
-        return "free".into();
-    }
-    let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&payload) else {
-        return "free".into();
-    };
+    let payload_b64 = lines.next()?;
+    let sig_b64 = lines.next()?;
+    let payload = BASE64.decode(payload_b64).ok()?;
+    let sig_bytes = BASE64.decode(sig_b64).ok()?;
+    let sig = Signature::from_bytes(sig_bytes.as_slice().try_into().ok()?);
+    // verify_strict is constant-time inside ed25519-dalek; no manual compare needed.
+    pub_key.verify_strict(&payload, &sig).ok()?;
+    let meta = serde_json::from_slice::<serde_json::Value>(&payload).ok()?;
     let expired = meta["expiresAt"]
         .as_str()
         .and_then(|s| {
@@ -893,9 +1022,16 @@ pub(crate) fn license_tier() -> String {
         })
         .is_some_and(|t| t <= time::OffsetDateTime::now_utc());
     if expired {
-        return "free".into();
+        return None;
     }
-    meta["tier"].as_str().unwrap_or("free").into()
+    Some(meta)
+}
+
+/// Verifies license.lic against the embedded public key and expiry; returns tier ("free"|"pro").
+pub(crate) fn license_tier() -> String {
+    verified_license_payload()
+        .and_then(|meta| meta["tier"].as_str().map(str::to_owned))
+        .unwrap_or_else(|| "free".into())
 }
 
 /// Pro feature gate: larger models and GPU are paid features.

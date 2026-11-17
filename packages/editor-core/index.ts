@@ -7,15 +7,22 @@ import { highlightRangesToRenderRanges } from "../../services/ai-pipeline/multi-
 
 export function createEditorStateFromVariant(transcript: Transcript, variant: EditVariant): EditorState {
   if (variant.sourceArtifactId !== transcript.sourceArtifactId) throw new Error("VARIANT_SOURCE_MISMATCH");
+  // Variants carry no crop tracking data, so requesting "track" here would fail
+  // validation (and, if it slipped through, silently centre-crop). Match
+  // createEditorState: centre unless the variant itself supplies tracking.
+  const hasTracking = Boolean(variant.plan?.cropKeyframes?.length || variant.plan?.sceneLayouts?.length || variant.plan?.compositionLayouts?.length);
   const plan: RenderPlan = {
     version: 1,
     sourceArtifactId: transcript.sourceArtifactId,
     ranges: variant.ranges.map(({ start, end }) => ({ start, end })),
     aspectRatio: "9:16",
-    cropMode: "track",
+    cropMode: hasTracking ? "track" : "center",
     layout: "solo",
     captions: variant.plan?.captions ?? variant.ranges.flatMap((range, index) => captionsFromTranscript(transcript, range).map((caption) => ({ ...caption, id: `${caption.id}-range-${index}` }))),
     hook: variant.plan?.hook,
+    cropKeyframes: variant.plan?.cropKeyframes,
+    sceneLayouts: variant.plan?.sceneLayouts,
+    compositionLayouts: variant.plan?.compositionLayouts,
     outputProfile: { container: "mp4", codec: "h264" },
   };
   validateRenderPlan(plan, transcript.duration);

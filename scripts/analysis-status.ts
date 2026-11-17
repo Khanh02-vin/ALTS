@@ -39,7 +39,11 @@ if (target === "--recover") {
   process.stdout.write(JSON.stringify(store.get(target) ?? null));
 } else if (mode === "--clear") {
   const job = store.get(target); let bytes = 0;
-  if (job) { for (const chunk of store.chunksOf(target)) { try { const path = cachePath(await sourceFingerprint(job.input), chunk.cacheKey); const info = await import("node:fs/promises").then(({ stat }) => stat(path)); bytes += info.size; await unlink(path); } catch {} } }
+  if (job) { for (const chunk of store.chunksOf(target)) { try { const path = cachePath(await sourceFingerprint(job.input), chunk.cacheKey); const info = await import("node:fs/promises").then(({ stat }) => stat(path)); bytes += info.size; await unlink(path); } catch (error) {
+    // Cleanup stays best-effort (the DB row is cleared regardless), but a failed
+    // unlink is not silent: stderr keeps the JSON on stdout parseable.
+    process.stderr.write(`[analysis-status] chunk cache cleanup failed: ${error instanceof Error ? error.message : String(error)}\n`);
+  } } }
   bytes += store.clear(target); process.stdout.write(JSON.stringify({ bytes }));
 } else if (target === "--claim") {
   process.stdout.write(JSON.stringify(store.listQueued()));

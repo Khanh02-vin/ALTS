@@ -1,8 +1,27 @@
 # ADR-009: Whisper engine selection (Python openai-whisper vs whisper.cpp)
 
-- **Status:** Accepted (with migration path)
+- **Status:** Accepted (with migration path) — **migrated 2026-11-15**
 - **Date:** 2026-10-25
+- **Updated:** 2026-11-17
 - **Owners:** Tech Lead
+
+> **Cập nhật 2026-11-17 — quyết định đã được thực thi.** G3 đã đạt và mặc định
+> đã chuyển sang `whisper.cpp`, khớp với điều khoản 5 ("sau khi G3 pass, có thể
+> đổi mặc định"). Trạng thái thực tế của code:
+>
+> | Nơi | Hành vi hiện tại |
+> |---|---|
+> | `adapters/local/chunked-whisper.ts:35` | `options.engine ?? process.env.WHISPER_ENGINE ?? "cpp"` |
+> | `apps/desktop/src-tauri/src/paths.rs:526` (`helper_env`) | thiếu `WHISPER_ENGINE` ⇒ `unwrap_or("cpp")` |
+> | `apps/desktop/src-tauri/src/runtime.rs:1206,1368` | ghi `WHISPER_ENGINE=cpp` vào `runtime.env` |
+> | `apps/desktop/src-tauri/src/runtime.rs:1467` | `whisper_cpp_status` báo mặc định `cpp` |
+> | `tests/wiring/commands.test.ts:32` | bắt buộc helper env mặc định `cpp` |
+>
+> Các mục "Quyết định" bên dưới được giữ nguyên làm hồ sơ của thời điểm ban hành.
+> Đọc chúng như *lịch sử*, không phải trạng thái hiện tại. Python venv vẫn còn
+> nhưng không còn là mặc định, và vẫn cần cho luồng YouTube (yt-dlp/caption
+> crawler) và ảnh hưởng bởi gói `openai-whisper==20250625` được pin trong
+> `models/requirements.txt`.
 
 ## Bối cảnh
 
@@ -24,7 +43,9 @@ Tuy nhiên, benchmark layer-1 (2026-10-23, dialogue-180s × 3 slices, tiny vs ti
 - Vì `chooseHeuristicHighlights` là **segment-driven** (segment gaps, segment word counts, segment text), pick sets khác nhau trên 1/3 clip (2 vs 3 picks, worst IoU 0.548).
 - → **Verdict: NO-GO** cho việc swap adapter trực tiếp với selector hiện tại.
 
-## Quyết định
+## Quyết định (bản gốc 2026-10-25)
+
+> Các mục dưới đây mô tả kế hoạch ban đầu. Trạng thái hiện tại xem phần cập nhật ở đầu tài liệu.
 
 1. **Giữ `openai-whisper` làm engine mặc định** trong `adapters/local/whisper.ts`. Không xóa, không disable.
 2. **Thêm `whisper.cpp` làm engine tuỳ chọn** qua biến môi trường `WHISPER_ENGINE=cpp` (default `python`). Khi bật, adapter tương ứng sẽ được sử dụng thay vì Python venv.

@@ -5,7 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::contracts::ProbeMetadata;
 use crate::paths::{
-    data_dir, ffprobe_bin, license_tier, tool, write_private_file, LICENSE_PUBLIC_KEY_B64,
+    data_dir, ffprobe_bin, tool, verified_license_payload, write_private_file,
+    LICENSE_PUBLIC_KEY_B64,
 };
 use crate::project_store;
 
@@ -92,11 +93,24 @@ pub(crate) async fn save_recording(data: Vec<u8>) -> Result<String, String> {
 #[tauri::command]
 pub(crate) fn license_status() -> serde_json::Value {
     if LICENSE_PUBLIC_KEY_B64.is_empty() {
-        serde_json::json!({ "licensed": false, "tier": "free", "licensee": null, "configured": false })
-    } else if license_tier() == "pro" {
-        serde_json::json!({ "licensed": true, "tier": "pro", "licensee": "Creator Test", "expiresAt": null })
-    } else {
-        serde_json::json!({ "licensed": false, "tier": "free", "licensee": null })
+        return serde_json::json!({ "licensed": false, "tier": "free", "licensee": null, "configured": false });
+    }
+    // Report the signed payload itself. A hardcoded licensee name used to be shown
+    // for every Pro licence, which is misleading in the UI and in support logs.
+    match verified_license_payload() {
+        Some(meta) if meta["tier"].as_str() == Some("pro") => serde_json::json!({
+            "licensed": true,
+            "tier": "pro",
+            "licensee": meta["licensee"].as_str(),
+            "expiresAt": meta["expiresAt"].as_str(),
+        }),
+        Some(meta) => serde_json::json!({
+            "licensed": false,
+            "tier": meta["tier"].as_str().unwrap_or("free"),
+            "licensee": meta["licensee"].as_str(),
+            "expiresAt": meta["expiresAt"].as_str(),
+        }),
+        None => serde_json::json!({ "licensed": false, "tier": "free", "licensee": null }),
     }
 }
 

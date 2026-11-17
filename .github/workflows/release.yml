@@ -309,8 +309,16 @@ jobs:
           # Rename the uploaded asset to customer-facing name
           gh api "repos/${{ github.repository }}/releases/tags/$TAG" --jq '.assets[] | select(.name=="portable-windows.zip") | .id' | xargs -r -I {} gh api "repos/${{ github.repository }}/releases/assets/{}" -X PATCH -f name="Local-first AI Video Studio Portable.zip"
       - name: Upload installers to Google Drive (customer-facing links)
+        env:
+          # Runner-specific: set a repository variable, or leave unset to fall back
+          # to rclone on PATH. Never bake one developer's home directory into CI.
+          RCLONE_BIN: ${{ vars.RCLONE_BIN }}
         run: |
-          RCLONE=/home/khanh/.local/bin/rclone
+          RCLONE="${RCLONE_BIN:-$(command -v rclone || echo rclone)}"
+          if ! command -v "$RCLONE" >/dev/null 2>&1; then
+            echo "rclone not found: set the RCLONE_BIN repository variable to its absolute path" >&2
+            exit 1
+          fi
           TAG="${{ github.ref_name }}"
           VERSION="${TAG#v}"
           DEST="gdrive:LFaIVS-Releases"

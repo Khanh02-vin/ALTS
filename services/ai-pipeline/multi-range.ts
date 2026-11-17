@@ -1,6 +1,7 @@
-import type { HighlightRange } from "../contracts/highlight.ts";
-import type { Transcript } from "../contracts/transcript.ts";
-import type { Caption, RenderRange } from "../contracts/render-plan.ts";
+// Contracts live in packages/contracts (services/contracts does not exist).
+import type { HighlightRange } from "../../packages/contracts/highlight.ts";
+import type { Transcript } from "../../packages/contracts/transcript.ts";
+import type { Caption, RenderRange } from "../../packages/contracts/render-plan.ts";
 
 export type SentenceRangeRequest = { startSentenceId: string; endSentenceId: string };
 export type ExposedSentence = { id: string; start: number; end: number; text: string; wordIds: string[] };
@@ -40,7 +41,9 @@ export function buildValidatedRanges(
 ): HighlightRange[] | undefined {
   if (!requests?.length || !exposed?.length || requests.length > 3) return undefined;
   const sentences = new Map(exposed.map((sentence) => [sentence.id, sentence]));
-  const wordById = new Map(transcript.words.map((word) => [word.id, word]));
+  // Fallback for sentences without explicit wordIds: filter the transcript words
+  // by time. (This used to call .filter on a Map, which throws at runtime.)
+  const allWords = transcript.words;
   const candidateRanges: HighlightRange[] = [];
 
   for (const request of requests.slice(0, 3)) {
@@ -49,7 +52,7 @@ export function buildValidatedRanges(
     if (!from || !to || from.start > to.start) return undefined;
     const span = exposed.filter((sentence) => sentence.start >= from.start && sentence.end <= to.end);
     if (!span.length) return undefined;
-    const wordIds = span.flatMap((sentence) => sentence.wordIds ?? wordById.filter((word) => word.start >= sentence.start && word.end <= sentence.end).map((word) => word.id));
+    const wordIds = span.flatMap((sentence) => sentence.wordIds ?? allWords.filter((word) => word.start >= sentence.start && word.end <= sentence.end).map((word) => word.id));
     candidateRanges.push({ start: from.start, end: to.end, wordIds });
   }
   candidateRanges.sort((a, b) => a.start - b.start);

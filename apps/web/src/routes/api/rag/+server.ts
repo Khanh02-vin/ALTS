@@ -1,5 +1,9 @@
 import type { RequestHandler } from "@sveltejs/kit";
-import { mkdirSync, readFileSync, writeFileSync, existsSync, readdirSync, rmSync } from "node:fs";
+import { timingSafeEqual } from "node:crypto";
+// Async I/O: this sidecar is single-threaded (adapter-node), so a synchronous
+// readdir/readFile on a growing video library blocks every other request,
+// including the health probe the desktop shell polls.
+import { mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { rankCandidates } from "../../../../../../packages/media-engine/related-videos/index.ts";
 
@@ -30,12 +34,23 @@ import { rankCandidates } from "../../../../../../packages/media-engine/related-
  * body rather than a stack trace, so the UI can display the error as-is.
  */
 
-function dataDir(): string {
+/** Creates the state subdirectories once per process, then memoises. */
+let dataDirReady: Promise<string> | undefined;
+function dataDirReadyPromise(): Promise<string> {
   const state = process.env.LOCAL_FIRST_STATE_DIR ?? join(process.env.HOME ?? ".", ".cache", "local-first-ai-video-studio");
   const dir = join(state, "youtube");
-  mkdirSync(join(dir, "playlists"), { recursive: true });
-  mkdirSync(join(dir, "videos"), { recursive: true });
-  return dir;
+  dataDirReady ??= (async () => {
+    await mkdir(join(dir, "playlists"), { recursive: true });
+    await mkdir(join(dir, "videos"), { recursive: true });
+    return dir;
+  })();
+  return dataDirReady;
+}
+
+/** Sync accessor kept for path building only; callers await `dataDirReadyPromise` first. */
+function dataDirSync(): string {
+  const state = process.env.LOCAL_FIRST_STATE_DIR ?? join(process.env.HOME ?? ".", ".cache", "local-first-ai-video-studio");
+  return join(state, "youtube");
 }
 
 type Segment = { start: number; end: number; text: string };
@@ -71,21 +86,30 @@ type PlaylistDoc = {
   updatedAt: string;
 };
 
-function loadPlaylist(id: string): PlaylistDoc | null {
-  const file = join(dataDir() + "/playlists", `${id}.json`);
-  if (!existsSync(file)) return null;
-  return JSON.parse(readFileSync(file, "utf8")) as PlaylistDoc;
+/** Reads a JSON file, returning null when it is missing or unreadable. */
+async function readJson<T>(file: string): Promise<T | null> {
+  try {
+    return JSON.parse(await readFile(file, "utf8")) as T;
+  } catch {
+    return null;
+  }
 }
-function savePlaylist(doc: PlaylistDoc): void {
-  writeFileSync(join(dataDir() + "/playlists", `${doc.id}.json`), JSON.stringify(doc, null, 2));
+
+async function loadPlaylist(id: string): Promise<PlaylistDoc | null> {
+  await dataDirReadyPromise();
+  return readJson<PlaylistDoc>(join(dataDirSync(), "playlists", `${id}.json`));
 }
-function loadVideo(videoId: string): VideoDoc | null {
-  const file = join(dataDir() + "/videos", `${videoId}.json`);
-  if (!existsSync(file)) return null;
-  return JSON.parse(readFileSync(file, "utf8")) as VideoDoc;
+async function savePlaylist(doc: PlaylistDoc): Promise<void> {
+  await dataDirReadyPromise();
+  await writeFile(join(dataDirSync(), "playlists", `${doc.id}.json`), JSON.stringify(doc, null, 2));
 }
-function saveVideo(doc: VideoDoc): void {
-  writeFileSync(join(dataDir() + "/videos", `${doc.videoId}.json`), JSON.stringify(doc, null, 2));
+async function loadVideo(videoId: string): Promise<VideoDoc | null> {
+  await dataDirReadyPromise();
+  return readJson<VideoDoc>(join(dataDirSync(), "videos", `${videoId}.json`));
+}
+async function saveVideo(doc: VideoDoc): Promise<void> {
+  await dataDirReadyPromise();
+  await writeFile(join(dataDirSync(), "videos", `${doc.videoId}.json`), JSON.stringify(doc, null, 2));
 }
 
 function parseVideoIdFromUrl(url: string): string | null {
@@ -102,21 +126,26 @@ function tokenize(text: string): string[] {
   return text.toLowerCase().split(/\W+/).filter((t) => t.length > 2);
 }
 
-function loadIndex(): Record<string, Record<string, number>> {
-  const file = join(dataDir(), "index.json");
-  if (!existsSync(file)) return {};
-  return JSON.parse(readFileSync(file, "utf8")) as Record<string, Record<string, number>>;
+async function loadIndex(): Promise<Record<string, Record<string, number>>> {
+  await dataDirReadyPromise();
+  return (await readJson<Record<string, Record<string, number>>>(join(dataDirSync(), "index.json"))) ?? {};
 }
 
-// ponytail: full scan on every ingest — O(n) blocking sync I/O. Async version avoids blocking
-// the SvelteKit request thread, but still rebuilds everything. Consider incremental index update
-// (append-only segment merge) when ingest frequency grows.
+// Rebuilds the whole TF-IDF index from the per-video docs. O(n) across the
+// library; asynchronously reading keeps the event loop free while it runs.
+// Consider an append-only incremental update when ingest frequency grows.
 async function rebuildIndex(): Promise<void> {
   const index: Record<string, Record<string, number>> = {};
-  const dir = dataDir() + "/videos";
-  for (const name of readdirSync(dir)) {
+  const dir = join(await dataDirReadyPromise(), "videos");
+  let names: string[] = [];
+  try {
+    names = await readdir(dir);
+  } catch {
+    names = [];
+  }
+  for (const name of names) {
     if (!name.endsWith(".json")) continue;
-    const doc = loadVideo(name.replace(/\.json$/, ""));
+    const doc = await loadVideo(name.replace(/\.json$/, ""));
     if (!doc) continue;
     for (const segment of doc.segments) {
       const key = `${doc.videoId}:${segment.start.toFixed(1)}`;
@@ -124,7 +153,7 @@ async function rebuildIndex(): Promise<void> {
       for (const token of tokenize(segment.text)) index[key][token] = (index[key][token] ?? 0) + 1;
     }
   }
-  writeFileSync(join(dataDir(), "index.json"), JSON.stringify(index));
+  await writeFile(join(dataDirSync(), "index.json"), JSON.stringify(index));
 }
 
 // --- local LLM client (llama-server) for embeddings + answer synthesis ---
@@ -139,27 +168,33 @@ function llmBase(): string {
 
 // The desktop app spawns this sidecar with a per-session token (LFAI_RAG_TOKEN) and
 // hands the same token to the webview, so a web page in the user's browser gets 401
-// instead of the user's playlists. Standalone/dev runs set no token and stay open.
+// instead of the user's playlists.
+//
+// Fail-closed: a sidecar started without a token rejects every request. The old
+// behaviour (`if (!RAG_TOKEN) return true`) meant one missing env var silently
+// exposed the playlist store to any other local process.
 const RAG_TOKEN = process.env.LFAI_RAG_TOKEN ?? "";
 
 function authorized(request: Request): boolean {
-  if (!RAG_TOKEN) return true;
+  if (!RAG_TOKEN) return false;
   const header = request.headers.get("authorization") ?? "";
-  return header === `Bearer ${RAG_TOKEN}`;
+  const expected = Buffer.from(`Bearer ${RAG_TOKEN}`);
+  const actual = Buffer.from(header);
+  // Constant-time compare: `===` returns at the first differing byte, which leaks
+  // the token prefix to a local attacker who can time requests.
+  return actual.length === expected.length && timingSafeEqual(actual, expected);
 }
 
 type EmbeddingStore = { version: 1; model: string; dim: number; vectors: Record<string, number[]> };
 
-function loadEmbeddings(): EmbeddingStore | null {
-  const file = join(dataDir(), "embeddings.json");
-  if (!existsSync(file)) return null;
-  try {
-    const parsed = JSON.parse(readFileSync(file, "utf8")) as EmbeddingStore;
-    return parsed?.version === 1 && parsed.vectors && typeof parsed.vectors === "object" ? parsed : null;
-  } catch { return null; }
+async function loadEmbeddings(): Promise<EmbeddingStore | null> {
+  await dataDirReadyPromise();
+  const parsed = await readJson<EmbeddingStore>(join(dataDirSync(), "embeddings.json"));
+  return parsed?.version === 1 && parsed.vectors && typeof parsed.vectors === "object" ? parsed : null;
 }
-function saveEmbeddings(store: EmbeddingStore): void {
-  writeFileSync(join(dataDir(), "embeddings.json"), JSON.stringify(store));
+async function saveEmbeddings(store: EmbeddingStore): Promise<void> {
+  await dataDirReadyPromise();
+  await writeFile(join(dataDirSync(), "embeddings.json"), JSON.stringify(store));
 }
 
 /** Embeds texts via the local llama-server. Returns null when the server is down
@@ -207,12 +242,12 @@ async function embedVideoSegments(videoId: string, segments: Segment[]): Promise
   }
   const count = Object.keys(embedded).length;
   if (!count) return 0;
-  const store = loadEmbeddings() ?? { version: 1, model: "local", dim, vectors: {} };
+  const store = (await loadEmbeddings()) ?? { version: 1, model: "local", dim, vectors: {} };
   // A dim change means the loaded model changed: stored vectors are incomparable.
   if (store.dim !== dim) { store.dim = dim; store.vectors = {}; }
   for (const key of Object.keys(store.vectors)) if (key.startsWith(`${videoId}:`)) delete store.vectors[key];
   Object.assign(store.vectors, embedded);
-  saveEmbeddings(store);
+  await saveEmbeddings(store);
   return count;
 }
 
@@ -250,15 +285,24 @@ export const GET: RequestHandler = async ({ url, request }) => {
   // to this module. Match the exact /api/rag/* sub-paths only, so an unrelated
   // /api/foo request still gets a JSON 404 instead of the SPA HTML fallback.
   if (url.pathname === "/api/rag/playlists") {
-    const dir = dataDir() + "/playlists";
-    const playlists = readdirSync(dir)
-      .filter((n) => n.endsWith(".json"))
-      .map((n) => loadPlaylist(n.replace(/\.json$/, "")))
-      .filter((p): p is PlaylistDoc => p !== null);
+    const dir = join(await dataDirReadyPromise(), "playlists");
+    let names: string[] = [];
+    try {
+      names = await readdir(dir);
+    } catch {
+      names = [];
+    }
+    const playlists = (
+      await Promise.all(
+        names
+          .filter((n) => n.endsWith(".json"))
+          .map((n) => loadPlaylist(n.replace(/\.json$/, ""))),
+      )
+    ).filter((p): p is PlaylistDoc => p !== null);
     playlists.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     return Response.json({ playlists });
   }
-  if (url.pathname === "/api/rag/index") return Response.json(loadIndex());
+  if (url.pathname === "/api/rag/index") return Response.json(await loadIndex());
   return jsonError(404, "UNKNOWN_ENDPOINT");
 };
 
@@ -276,7 +320,7 @@ export const POST: RequestHandler = async ({ request }) => {
     }
     const id = `pl-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const now = new Date().toISOString();
-    savePlaylist({ id, playlistId: id, playlistUrl, title: typeof title === "string" ? title : null, status: "queued", createdAt: now, updatedAt: now });
+    await savePlaylist({ id, playlistId: id, playlistUrl, title: typeof title === "string" ? title : null, status: "queued", createdAt: now, updatedAt: now });
     return Response.json({ id, status: "queued" }, { status: 202 });
   }
 
@@ -287,11 +331,11 @@ export const POST: RequestHandler = async ({ request }) => {
     if (typeof playlistRecordId !== "string" || typeof newStatus !== "string" || !["indexing", "indexed", "failed"].includes(newStatus)) {
       return jsonError(400, "INVALID_STATUS_UPDATE");
     }
-    const doc = loadPlaylist(playlistRecordId);
+    const doc = await loadPlaylist(playlistRecordId);
     if (!doc) return jsonError(404, "PLAYLIST_NOT_FOUND");
     doc.status = newStatus as PlaylistDoc["status"];
     doc.updatedAt = new Date().toISOString();
-    savePlaylist(doc);
+    await savePlaylist(doc);
     return Response.json({ id: doc.id, status: doc.status });
   }
 
@@ -310,13 +354,13 @@ export const POST: RequestHandler = async ({ request }) => {
     }
     // Idempotency: check if video with same idempotencyKey already exists
     if (idempotencyKey) {
-      const existing = loadVideo(videoId);
+      const existing = await loadVideo(videoId);
       if (existing?.idempotencyKey === idempotencyKey) {
         return Response.json({ videoId, segments: existing.segments.length, embedded: 0, idempotent: true });
       }
     }
     const now = new Date().toISOString();
-    saveVideo({
+    await saveVideo({
       videoId,
       playlistId: "manual",
       title: typeof title === "string" ? title : null,
@@ -326,8 +370,14 @@ export const POST: RequestHandler = async ({ request }) => {
       indexedAt: now,
       idempotencyKey,
     });
-    // ponytail: index rebuild is async, run without blocking ingest response.
-    void rebuildIndex();
+    // Rebuild before responding. The I/O is async now, so this no longer blocks
+    // the event loop, and awaiting removes a real race: a query arriving right
+    // after ingest used to read a stale/absent index.json.
+    try {
+      await rebuildIndex();
+    } catch (error) {
+      console.warn("[rag] index rebuild failed; TF-IDF results may be stale:", error instanceof Error ? error.message : String(error));
+    }
     // Best-effort vector indexing: 0 when the local LLM is down (TF-IDF still works).
     const embedded = await embedVideoSegments(videoId, segments);
     return Response.json({ videoId, segments: segments.length, embedded, idempotent: false });
@@ -364,16 +414,27 @@ export const POST: RequestHandler = async ({ request }) => {
 
     // 1) Semantic retrieval: cosine over stored embeddings. Falls through to
     //    TF-IDF when the LLM is down, vectors are missing, or dims mismatch.
+    //    Docs are loaded once per request: the loops below revisit the same
+    //    videoId for every segment, and re-reading the file each time would turn
+    //    an O(videos) scan into O(segments) disk I/O.
     let top: Scored[] = [];
     let retrieval = "tfidf";
-    const store = loadEmbeddings();
+    const docs = new Map<string, VideoDoc>();
+    const docFor = async (videoId: string): Promise<VideoDoc | null> => {
+      const cached = docs.get(videoId);
+      if (cached) return cached;
+      const doc = await loadVideo(videoId);
+      if (doc) docs.set(videoId, doc);
+      return doc;
+    };
+    const store = await loadEmbeddings();
     if (store && Object.keys(store.vectors).length) {
       const query = await embedTexts([question]);
       if (query && query.dim === store.dim && query.vectors[0]) {
         const qvec = query.vectors[0];
         for (const [key, vector] of Object.entries(store.vectors)) {
           const [docVideoId, startStr] = key.split(":");
-          const doc = loadVideo(docVideoId);
+          const doc = await docFor(docVideoId);
           if (!doc || !passesFilters(doc)) continue;
           const start = Number(startStr);
           const segment = doc.segments.find((s) => Math.abs(s.start - start) < 0.05);
@@ -390,7 +451,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
     // 2) Keyword fallback: TF-IDF over the token index.
     if (!top.length) {
-      const index = loadIndex();
+      const index = await loadIndex();
       const scored: Scored[] = [];
       let df: Record<string, number> = {};
       for (const token of queryTokens) df[token] = 0;
@@ -398,7 +459,7 @@ export const POST: RequestHandler = async ({ request }) => {
 
       for (const [key, entry] of Object.entries(index)) {
         const [docVideoId] = key.split(":");
-        const doc = loadVideo(docVideoId);
+        const doc = await docFor(docVideoId);
         if (!doc || !passesFilters(doc)) continue;
         let score = 0;
         const totalTokens = Math.max(1, Object.values(entry).reduce((sum, n) => sum + n, 0));
@@ -458,10 +519,10 @@ export const DELETE: RequestHandler = async ({ url, request }) => {
   if (!authorized(request)) return jsonError(401, "UNAUTHORIZED");
   const match = url.pathname.match(/^\/api\/rag\/playlists\/(pl-[\w-]+)$/);
   if (!match) return jsonError(404, "UNKNOWN_ENDPOINT");
-  const doc = loadPlaylist(match[1]);
+  const doc = await loadPlaylist(match[1]);
   if (!doc) return jsonError(404, "PLAYLIST_NOT_FOUND");
-  const dir = dataDir() + "/playlists";
-  rmSync(join(dir, `${doc.id}.json`), { force: true });
+  const dir = join(await dataDirReadyPromise(), "playlists");
+  await rm(join(dir, `${doc.id}.json`), { force: true });
   return Response.json({ id: doc.id, removed: true });
 };
 

@@ -21,7 +21,9 @@ python3 -m venv "$VENV"
 
 echo "==> Installing openai-whisper (CPU)"
 "$VENV/bin/pip" install --upgrade pip >/dev/null
-"$VENV/bin/pip" install openai-whisper
+# Pinned: models/requirements.txt is the single source of truth for the Python
+# side. Keep this in sync with the versions the Rust bootstrap installs.
+"$VENV/bin/pip" install "openai-whisper==20250625" "yt-dlp==2026.8.19" "youtube-transcript-api==1.2.4"
 
 # The local crop-path analysis (analyze_crop_path / sample_speaker_faces) runs the
 # Haar-cascade face detector in scripts/detect-face-boxes.py and scripts/detect-faces.py,
@@ -33,14 +35,24 @@ echo "==> Installing opencv-python-headless (face detection)"
 "$VENV/bin/pip" install "opencv-python-headless<5"
 
 echo "==> Downloading model '$MODEL'"
-"$VENV/bin/whisper" --model "$MODEL" --device cpu --fp16 False /dev/null --output_format json --language en 2>/dev/null || true
-
+# The whisper CLI downloads the weights on first run and exits non-zero for purely
+# cosmetic reasons (it prints a warning to stderr on some platforms). Capture the
+# real exit status and only treat it as ignorable when the model file did arrive,
+# so a broken download is reported instead of looking like success.
 MODEL_PATH="$HOME/.cache/whisper/$MODEL.pt"
+download_status=0
+"$VENV/bin/whisper" --model "$MODEL" --device cpu --fp16 False /dev/null --output_format json --language en >/dev/null 2>"$STATE/whisper-download.log" || download_status=$?
+
 if [ ! -f "$MODEL_PATH" ]; then
-  echo "ERROR: model not found at $MODEL_PATH" >&2
+  echo "ERROR: model not found at $MODEL_PATH (whisper exited $download_status)" >&2
+  echo "       see $STATE/whisper-download.log" >&2
   echo "Try: WHISPER_MODEL=tiny $0" >&2
   exit 1
 fi
+if [ "$download_status" -ne 0 ]; then
+  echo "==> WARNING: whisper exited $download_status but $MODEL is present; continuing" >&2
+fi
+rm -f "$STATE/whisper-download.log"
 
 echo "==> Writing runtime env"
 cat > "$STATE/runtime.env" <<EOF

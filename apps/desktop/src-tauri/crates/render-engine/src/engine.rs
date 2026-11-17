@@ -560,6 +560,23 @@ pub fn render_crop_mode_is_satisfied(plan: &serde_json::Value) -> bool {
     if has_confirmed_crop_keyframes(plan) {
         return true;
     }
+    // A confirmed scene layout is a real tracking signal: `scene_layouts` below
+    // feeds the composition/reframe graph. Accepting only compositionLayouts here
+    // rejected plans the renderer can honour (the Editor's "Approve scenes"
+    // produced exactly such a plan) and failed them with CROP_TRACKING_UNSATISFIED.
+    if plan
+        .get("sceneLayouts")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|items| {
+            items.iter().any(|layout| {
+                layout["confirmed"].as_bool() == Some(true)
+                    && layout["sourceArtifactId"].as_str()
+                        == plan.get("sourceArtifactId").and_then(serde_json::Value::as_str)
+            })
+        })
+    {
+        return true;
+    }
     plan.get("compositionLayouts")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|items| {
@@ -776,6 +793,31 @@ pub fn video_codec(prefer_hardware: bool) -> (&'static str, Vec<&'static str>) {
         }
     }
     ("libx264", vec!["-preset", "fast", "-crf", "22"])
+}
+
+/// Splits hook text into display lines short enough to fit the frame; drawtext does
+/// not wrap on its own. Kept at module scope (it was nested inside `render_segments`)
+/// so the wrapping rule is named, testable and reusable.
+fn wrap_hook_lines(text: &str) -> Vec<String> {
+    const MAX_LINE: usize = 24;
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        if !current.is_empty() && current.len() + 1 + word.len() > MAX_LINE {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Renders the given source ranges into `output`.
@@ -1011,28 +1053,6 @@ pub fn render_segments(
             .replace(';', "\\;")
     }
 
-    /// Splits hook text into display lines short enough to fit the frame; drawtext does not wrap.
-    fn wrap_hook_lines(text: &str) -> Vec<String> {
-        const MAX_LINE: usize = 24;
-        let mut lines = Vec::new();
-        let mut current = String::new();
-        for word in text.split_whitespace() {
-            if !current.is_empty() && current.len() + 1 + word.len() > MAX_LINE {
-                lines.push(std::mem::take(&mut current));
-            }
-            if !current.is_empty() {
-                current.push(' ');
-            }
-            current.push_str(word);
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        lines
-    }
     let captions = plan
         .and_then(|value| value.get("captions"))
         .and_then(serde_json::Value::as_array);

@@ -26,7 +26,7 @@ if [[ -f "$TARGET" ]]; then
 fi
 rm -f "$PART"
 trap 'rm -f "$PART"' EXIT
-curl -L --fail --retry 3 -o "$PART" "$URL"
+curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$PART" "$URL"
 ACTUAL=$(sha256sum "$PART" | cut -d ' ' -f1)
 if [[ "$ACTUAL" != "$CHECKSUM" ]]; then
   echo "Checksum mismatch: expected $CHECKSUM, got $ACTUAL" >&2

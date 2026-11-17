@@ -1,12 +1,18 @@
+# Cloud-dependency sandbox for the deferred cloud runtime.
+#
+# The shipped product is local-first and never starts these services; they exist
+# only so the cloud boundary in services/api + adapters/cloud can be exercised
+# locally later. Credentials therefore come from the environment — never a
+# literal that could be mistaken for a production password.
 services:
   postgres:
     image: postgres:16
     environment:
-      POSTGRES_DB: studio
-      POSTGRES_USER: studio
-      POSTGRES_PASSWORD: studio-dev-only
+      POSTGRES_DB: ${POSTGRES_DB:-studio}
+      POSTGRES_USER: ${POSTGRES_USER:-studio}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD for the cloud sandbox}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U studio -d studio"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-studio} -d $${POSTGRES_DB:-studio}"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -21,6 +27,6 @@ services:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: studio
-      MINIO_ROOT_PASSWORD: studio-dev-only
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-studio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD for the cloud sandbox}
     ports: ["9000:9000", "9001:9001"]

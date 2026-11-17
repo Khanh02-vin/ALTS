@@ -2,9 +2,9 @@ import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript, Word } from "../../packages/contracts/transcript.ts";
 import { componentScoreMetadata, scoreAggregateHighlight, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
 import { assessNarrativeArc, type NarrativeArc } from "./narrative-arc.ts";
+import { SENTENCE_END } from "./text-boundaries.ts";
 
 const HOOK_CUE = /\b(how|why|problem|mistake|secret|important|key|solution|example|first|never|best)\b/i;
-const SENTENCE_END = /[.!?]["')\]]?$/;
 const SENTENCE_PAUSE_SECONDS = 0.7;
 // A clip that begins with a connector has no referent yet; step back at most
 // two sentences to find the subject it points at.

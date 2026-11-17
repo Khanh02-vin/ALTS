@@ -42,6 +42,10 @@ export class LocalRunner {
               sourceArtifactId: job.id,
               ranges: [{ start, end }],
               aspectRatio: job.aspectRatio as "9:16" | "1:1" | "16:9",
+              // This queue never carries crop tracking data. Leaving cropMode out
+              // made the engine default to "track" and fail with
+              // CROP_TRACKING_UNSATISFIED; ask for the centre crop it can honour.
+              cropMode: "center" as const,
             },
           },
           { ...this.options, signal: controller.signal, onProgress: (progress) => this.store.update(job!.id, { progress }) },

@@ -41,11 +41,23 @@ export function jobContentKey(input: string, start: number | null, end: number |
 
 function migrate(db: DatabaseSync): void {
   const columns = db.prepare("PRAGMA table_info(jobs)").all() as Array<{ name: string }>;
+  // Both values come from this literal, never from a request. They are still
+  // quoted so the statement stays correct if a future column name needs escapes
+  // (and so a reader never has to prove the input is constant).
   for (const [name, definition] of [["idempotency_key", "TEXT"], ["analysis_job_id", "TEXT"]] as const) {
-    if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE jobs ADD COLUMN ${name} ${definition}`);
+    if (!columns.some((column) => column.name === name)) db.exec(`ALTER TABLE jobs ADD COLUMN "${name}" ${definition}`);
   }
   db.exec("CREATE UNIQUE INDEX IF NOT EXISTS jobs_idempotency ON jobs(idempotency_key)");
 }
+
+/** Patch keys this store may write. Naming is explicit so a request-shaped object
+ *  can never smuggle a SQL identifier into the UPDATE statement. */
+const JOB_COLUMNS = {
+  status: "status",
+  progress: "progress",
+  error: "error",
+  outputBytes: "output_bytes",
+} as const;
 
 export class LocalStore {
   readonly db: DatabaseSync;
@@ -114,7 +126,7 @@ export class LocalStore {
     const status = this.analysis.get(job.analysisJobId)?.status;
     return status !== undefined && status !== "completed";
   }
-  update(id: string, patch: Partial<Pick<LocalJob, "status" | "progress" | "error" | "outputBytes">>): LocalJob | undefined { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const columns = entries.map(([key]) => `${key === "outputBytes" ? "output_bytes" : key}=?`).join(","); this.db.prepare(`UPDATE jobs SET ${columns} WHERE id=?`).run(...entries.map(([, value]) => value), id); return this.get(id); }
+  update(id: string, patch: Partial<Pick<LocalJob, "status" | "progress" | "error" | "outputBytes">>): LocalJob | undefined { const entries = Object.entries(patch); if (!entries.length) return this.get(id); const columns = entries.map(([key]) => `${JOB_COLUMNS[key as keyof typeof JOB_COLUMNS]}=?`).join(","); this.db.prepare(`UPDATE jobs SET ${columns} WHERE id=?`).run(...entries.map(([, value]) => value), id); return this.get(id); }
   retry(id: string): LocalJob | undefined {
     const job = this.get(id);
     if (!job || !["failed", "cancelled", "interrupted"].includes(job.status)) return undefined;

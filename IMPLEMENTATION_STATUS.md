@@ -1,6 +1,28 @@
 # Implementation status — v0.1.4
 
-Updated: 2026-11-10. Scope: local working tree on `release/v0.1.4`, including uncommitted changes. These results do not certify a published installer or a clean machine.
+Updated: 2026-11-17. Scope: local working tree on `release/v0.1.4`, including uncommitted changes. These results do not certify a published installer or a clean machine.
+
+> **Delta since 2026-11-10.** The working tree at HEAD `a7ce2be` is 15 commits
+> ahead of `origin/release/v0.1.4` and the pushed `v0.1.4` tag still points at
+> `8e37279`. Everything below describes the working tree, not a shipped artefact.
+> Changes landed since the previous revision:
+>
+> - Transcription default is **whisper.cpp** (`WHISPER_ENGINE` unset ⇒ `cpp`);
+>   see the update note in ADR-009. Python remains available opt-in.
+> - Highlight selection is a hybrid two-round shortlist with an LLM rerank pass
+>   (`hybrid-highlights.ts`), plus rubric-based candidate grading and
+>   setup/core/payoff validation. Multi-range jump-cut now uses locally validated
+>   sentence ranges.
+> - Scoring ranks candidates with RMS and speech-rate and snaps them to detected
+>   scene cuts.
+> - Cloud STT (BYOK) and subtitle-first transcription are wired.
+> - Full-video analysis is the default; the 600 s UI default was removed (the
+>   backend still caps one range at 1800 s).
+> - Hardening pass on this revision: helper process timeouts, credential scoping
+>   for spawned helpers, loopback-only sidecars, constant-time token compare,
+>   pinned Python deps, and an `npm audit` step in CI that now audits the real
+>   workspace lockfiles instead of failing with ENOLOCK at the repo root.
+
 
 ## Local-first MVP decision
 
@@ -42,28 +64,25 @@ Svelte UI → Tauri commands → SQLite/filesystem
 - Render plans support the subtitle-burn toggle and selected ranges. Final output uses the shared Rust renderer.
 - Crop tracking includes deadzone/smoothing and confirmed speaker/face mappings. Scene-layout proposals require user review; blur is a fill mode, not proof of slide/chart classification.
 
-## Verification on this machine — 2026-11-10
+## Verification on this machine — 2026-11-17
 
-Environment: Linux x64, Node.js v24.21.0, existing development dependencies/resources. Commands were run in this checkout, not against a downloaded installer.
+Environment: Linux x64, Node.js v24.21.0, Rust 1.99.1, existing development dependencies/resources. Commands were run in this checkout, not against a downloaded installer or a published tag.
 
 | Check | Observed result |
 |---|---|
-| Quota regression before fix | Failed: in-flight temporary MP4 was deleted |
-| Focused Rust preview tests after fix | 5 passed, 0 failed |
-| Desktop `cargo test` | 76 passed, 0 failed, 19.78 s |
-| `cargo build -p lfai-render` then `npm test` | Passed, including real MP4 render tests |
-| Newly included npm suites | `test:wav-rms`, `test:script-outline`, `test:highlight-status` all passed through `npm test` |
-| Command wiring | 54 UI invocations registered |
-| `npm run check --prefix apps/web` | 0 errors, 0 warnings |
-| `npm run build --prefix apps/web` | Passed; emitted layout warning about missing `<slot />` / `{@render ...}` |
+| `npm test` (47 suites, `pretest` builds the engine) | Passed, exit 0 |
+| Desktop `cargo test` | 76 passed, 0 failed |
+| `cargo fmt --check` | Passed |
+| `cargo check` warnings | 0 |
+| `npm run check --prefix apps/web` (svelte-check) | 0 errors, 0 warnings |
+| `git diff --check` | Passed |
+| `npm audit --omit=dev` (apps/web, apps/desktop) | 0 vulnerabilities |
+| Sidecar bind (spawned wrapper) | `127.0.0.1` confirmed via `ss` |
+| Dev-only advisories (`npm audit`, all deps) | 7, all in build tooling (vite/launch-editor); not shipped |
 
-The initial `npm test` failed in FFmpeg argument parsing because the existing debug CLI was stale. Rebuilding the CLI from current source, as CI does, resolved it without changing renderer source.
+Not performed in this pass: live provider calls (no API key), a live Facebook/TikTok download, a clean-machine run, installer/signing verification, or a Windows/macOS run. Passing local checks is not evidence of release readiness.
 
-Rust reported four unused-import warnings. A formatting check initially flagged the new test assertion; that formatting was corrected. Final `cargo fmt --check` and `git diff --check` both passed (exit code 0) after the code and documentation changes.
-
-The Rust total remains 76: the duplicate `#[test]` on the quota test was removed and the missing `#[test]` on the cache-key test was added. The total is not evidence that those two issues were absent.
-
-### Highlight evaluation from this run
+### Highlight evaluation (last recorded run)
 
 Dataset: 8 cases, 10 expected highlights, IoU threshold 0.3.
 
@@ -84,8 +103,7 @@ Live Gemini evaluation was skipped because `GEMINI_API_KEY` was not set. Live lo
 Run from the repository root:
 
 ```bash
-cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml -p lfai-render
-npm test
+npm test   # pretest builds lfai-render first — no separate build step needed
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
 npm run check --prefix apps/web
@@ -93,7 +111,9 @@ npm run build --prefix apps/web
 git diff --check
 ```
 
-The CLI build is a prerequisite: `npm test` does not rebuild an existing `target/debug/lfai-render`. Both CI and release test jobs build it first.
+`npm test` runs `scripts/ensure-render-engine.sh` before the suites (the `pretest`
+hook), so the CLI can no longer be stale: the render tests always exercise the
+current renderer source. CI performs the same build explicitly.
 
 ## Deferred until measured demand
 

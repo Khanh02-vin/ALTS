@@ -2,10 +2,9 @@ import type { Highlight } from "../../packages/contracts/highlight.ts";
 import type { Transcript } from "../../packages/contracts/transcript.ts";
 import { validateHighlights } from "../../packages/contracts/highlight.ts";
 import { componentScoreMetadata, scoreAggregateHighlight, scoreHighlightComponents, type AudioRmsFeatures } from "./highlight-scoring.ts";
+import { PAUSE_SECONDS, SENTENCE_END } from "./text-boundaries.ts";
 
 const HOOK_WORDS = /\b(how|why|secret|mistake|important|best|never|first|problem|solution|learn|key)\b/i;
-const PAUSE_SECONDS = 0.7;
-const SENTENCE_END = /[.!?]["')\]]?$/;
 // A candidate window may not exceed this many seconds. Whisper segments rarely
 // run longer; without a cap an engine that emits neither punctuation nor pauses
 // would collapse a whole recording into one highlight.
@@ -27,10 +26,7 @@ export type HeuristicWindow = {
 
 /** Builds candidate windows from transcript boundaries for ranking and evaluation. */
 export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures): HeuristicWindow[] {
-
-  const words = transcript.words;
   const windows: HeuristicWindow[] = [];
-
   const addWindow = (
     start: number,
     end: number,
@@ -54,86 +50,109 @@ export function buildWindows(transcript: Transcript, audioRms?: AudioRmsFeatures
     windows.push({ start, end, wordIds, text, hook, complete, pauseBoundary, score, scores });
   };
 
-  if (words.length > 0) {
-    type Group = { start: number; end: number; words: typeof words };
-
-    // Sentence mode: walk the words and cut at sentence ends, pauses and the
-    // max-length cap. Boundaries come from the words, never from a clock tick,
-    // so a candidate is the same span no matter which engine produced the words.
-    const groups: Group[] = [];
-    let group: Group | undefined;
-    for (let i = 0; i < words.length; i++) {
-      const word = words[i]!;
-      const prev = words[i - 1];
-      if (
-        group && prev &&
-        (SENTENCE_END.test(prev.text.trim()) ||
-          word.start - prev.end >= PAUSE_SECONDS ||
-          word.end - group.start > MAX_WINDOW_SECONDS)
-      ) {
-        groups.push(group);
-        group = undefined;
-      }
-      group ??= { start: word.start, end: word.end, words: [] };
-      group.end = word.end;
-      group.words.push(word);
-    }
-    if (group) groups.push(group);
-
-    for (const candidate of groups) {
-      if (candidate.end - candidate.start < MIN_WINDOW_SECONDS) continue;
-      const text = candidate.words.map((w) => w.text).join(" ");
-      const hook = candidate.words.some((w) => HOOK_WORDS.test(w.text));
-      const complete = SENTENCE_END.test(
-        candidate.words[candidate.words.length - 1]!.text.trim(),
-      );
-      const prevWord = words.findLast((w) => w.end <= candidate.start);
-      const nextWord = words.find((w) => w.start >= candidate.end);
-      const gapBefore = prevWord ? candidate.start - prevWord.end : 0;
-      const gapAfter = nextWord ? nextWord.start - candidate.end : 0;
-      const pauseBoundary =
-        gapBefore >= PAUSE_SECONDS || gapAfter >= PAUSE_SECONDS;
-      addWindow(
-        candidate.start,
-        candidate.end,
-        candidate.words.map((w) => w.id),
-        text,
-        hook,
-        complete,
-        pauseBoundary,
-      );
-    }
+  if (transcript.words.length > 0) {
+    addWordWindows(transcript, addWindow);
   } else {
-    // No words at all: each segment is one candidate window.
-    for (const segment of transcript.segments) {
-      const duration = segment.end - segment.start;
-      if (duration < MIN_WINDOW_SECONDS) continue;
-      const text = segment.text.trim();
-      const hook = HOOK_WORDS.test(text);
-      const complete = SENTENCE_END.test(text);
-      const prevSegment = transcript.segments.findLast(
-        (s) => s.end <= segment.start,
-      );
-      const nextSegment = transcript.segments.find(
-        (s) => s.start >= segment.end,
-      );
-      const gapBefore = prevSegment ? segment.start - prevSegment.end : 0;
-      const gapAfter = nextSegment ? nextSegment.start - segment.end : 0;
-      const pauseBoundary =
-        gapBefore >= PAUSE_SECONDS || gapAfter >= PAUSE_SECONDS;
-      addWindow(
-        segment.start,
-        segment.end,
-        segment.wordIds,
-        text,
-        hook,
-        complete,
-        pauseBoundary,
-      );
-    }
+    addSegmentWindows(transcript, addWindow);
   }
 
   return windows;
+}
+
+type WindowSink = (
+  start: number,
+  end: number,
+  wordIds: string[],
+  text: string,
+  hook: boolean,
+  complete: boolean,
+  pauseBoundary: boolean,
+) => void;
+
+/** True when the gap on either side of [start, end) is long enough to be a cut. */
+function hasPauseBoundary(
+  beforeEnd: number | undefined,
+  afterStart: number | undefined,
+  start: number,
+  end: number,
+): boolean {
+  const gapBefore = beforeEnd === undefined ? 0 : start - beforeEnd;
+  const gapAfter = afterStart === undefined ? 0 : afterStart - end;
+  return gapBefore >= PAUSE_SECONDS || gapAfter >= PAUSE_SECONDS;
+}
+
+/**
+ * Sentence mode: walk the words and cut at sentence ends, pauses and the
+ * max-length cap. Boundaries come from the words, never from a clock tick, so a
+ * candidate is the same span no matter which engine produced the words.
+ */
+function addWordWindows(transcript: Transcript, addWindow: WindowSink): void {
+  const words = transcript.words;
+  type Group = { start: number; end: number; words: typeof words };
+
+  const groups: Group[] = [];
+  let group: Group | undefined;
+  for (let i = 0; i < words.length; i++) {
+    const word = words[i]!;
+    const prev = words[i - 1];
+    if (
+      group && prev &&
+      (SENTENCE_END.test(prev.text.trim()) ||
+        word.start - prev.end >= PAUSE_SECONDS ||
+        word.end - group.start > MAX_WINDOW_SECONDS)
+    ) {
+      groups.push(group);
+      group = undefined;
+    }
+    group ??= { start: word.start, end: word.end, words: [] };
+    group.end = word.end;
+    group.words.push(word);
+  }
+  if (group) groups.push(group);
+
+  for (const candidate of groups) {
+    if (candidate.end - candidate.start < MIN_WINDOW_SECONDS) continue;
+    const text = candidate.words.map((w) => w.text).join(" ");
+    const hook = candidate.words.some((w) => HOOK_WORDS.test(w.text));
+    const complete = SENTENCE_END.test(
+      candidate.words[candidate.words.length - 1]!.text.trim(),
+    );
+    const prevWord = words.findLast((w) => w.end <= candidate.start);
+    const nextWord = words.find((w) => w.start >= candidate.end);
+    addWindow(
+      candidate.start,
+      candidate.end,
+      candidate.words.map((w) => w.id),
+      text,
+      hook,
+      complete,
+      hasPauseBoundary(prevWord?.end, nextWord?.start, candidate.start, candidate.end),
+    );
+  }
+}
+
+/** No words at all: each segment is one candidate window. */
+function addSegmentWindows(transcript: Transcript, addWindow: WindowSink): void {
+  for (const segment of transcript.segments) {
+    const duration = segment.end - segment.start;
+    if (duration < MIN_WINDOW_SECONDS) continue;
+    const text = segment.text.trim();
+    const prevSegment = transcript.segments.findLast(
+      (s) => s.end <= segment.start,
+    );
+    const nextSegment = transcript.segments.find(
+      (s) => s.start >= segment.end,
+    );
+    addWindow(
+      segment.start,
+      segment.end,
+      segment.wordIds,
+      text,
+      HOOK_WORDS.test(text),
+      SENTENCE_END.test(text),
+      hasPauseBoundary(prevSegment?.end, nextSegment?.start, segment.start, segment.end),
+    );
+  }
 }
 
 /** Non-maximum suppression: keep the highest-scoring window, drop any later window

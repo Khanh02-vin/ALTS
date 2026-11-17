@@ -11,6 +11,17 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      # Key material must never reach the repository. .gitignore already covers
+      # keys/ and *.pem, but `git add -f` bypasses ignore rules silently; this
+      # fails the build if anything key-shaped is actually tracked.
+      - name: Guard against committed key material
+        run: |
+          tracked=$(git ls-files | grep -Ei '\.(pem|key|p12|pfx|jks)$|(^|/)id_(rsa|ed25519)$|credentials\.json$' || true)
+          if [ -n "$tracked" ]; then
+            echo "::error::key material is tracked by git:" >&2
+            echo "$tracked" >&2
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -41,8 +52,41 @@ jobs:
           npm run build:node
       - run: cargo test
         working-directory: apps/desktop/src-tauri
-      - run: npm audit --audit-level=high
+      # `npm audit` at the repo root has no lockfile (each workspace has its own),
+      # so the old step failed with ENOLOCK and `continue-on-error` hid it — it
+      # audited nothing. Audit the real lockfiles instead: production deps must be
+      # clean; dev-only advisories (build tooling like vite/launch-editor) are
+      # reported but do not block, since they never ship in the app bundle.
+      - name: Audit production dependencies
+        run: |
+          set -euo pipefail
+          for dir in apps/web apps/desktop; do
+            echo "== $dir (production) =="
+            ( cd "$dir" && npm audit --omit=dev --audit-level=high )
+          done
+      - name: Report dev-only advisories
         continue-on-error: true
+        run: |
+          for dir in apps/web apps/desktop; do
+            echo "== $dir (all deps) =="
+            ( cd "$dir" && npm audit --audit-level=high ) || true
+          done
+      # ai-engine pins `ort` to an exact release candidate because 2.x has no stable
+      # release yet (1.x is an incompatible API line). This records when a stable
+      # 2.0.0 finally ships so the pin can be lifted deliberately instead of being
+      # rediscovered by an audit months later. Informational: never fails the build.
+      - name: Note when ort ships a stable 2.x
+        continue-on-error: true
+        run: |
+          latest=$(curl -fsS --max-time 30 https://crates.io/api/v1/crates/ort \
+            | python3 -c "import json,sys; print(json.load(sys.stdin)['crate']['max_stable_version'])")
+          echo "ort latest stable-looking version: ${latest:-unknown}"
+          pinned=$(grep -oE 'ort = \{ version = "=[0-9a-zA-Z.\-]+"' apps/desktop/src-tauri/crates/ai-engine/Cargo.toml | head -1)
+          echo "pinned: ${pinned}"
+          case "$latest" in
+            *-rc*|*"") echo "::notice::ort is still pre-release; keep the exact pin" ;;
+            *) echo "::warning::ort ${latest} is stable — revisit the =2.0.0-rc.15 pin" ;;
+          esac
 
   # The hardening work (ADR-004) added cfg(windows) code paths — Job Object spawn,
   # taskkill/tasklist worker control, %APPDATA% state layout — that only compile on a

@@ -274,7 +274,11 @@ export class GeminiHighlightProvider implements HighlightProvider {
   async chooseTranscript(transcript: Transcript, signal?: AbortSignal): Promise<Highlight[]> {
     return this.circuitBreaker.execute(async () => {
       const prompt = highlightPrompt(transcript);
-      const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal });
+      // Every other provider in this file bounds the request; without this a caller
+      // that passes no signal (CLI, a new UI path) would hang on a stuck socket.
+      const timeout = AbortSignal.timeout(15 * 60_000);
+      const combined = signal ? AbortSignal.any([signal, timeout]) : timeout;
+      const response = await fetch(`${this.endpoint}/${this.model}:generateContent?key=${encodeURIComponent(this.apiKey)}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }], generationConfig: { responseMimeType: "application/json", responseSchema: GEMINI_HIGHLIGHT_SCHEMA } }), signal: combined });
       if (!response.ok) throw new Error(`GEMINI_PROVIDER_${response.status}`);
       const raw = await response.json() as { candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }> };
       const text = raw.candidates?.[0]?.content?.parts?.map((part) => part.text ?? "").join("") ?? "";

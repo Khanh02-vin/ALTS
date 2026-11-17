@@ -63,7 +63,16 @@ export async function render(
   const scratch = await mkdtemp(join(tmpdir(), "lfai-engine-"));
   const requestPath = join(scratch, "request.json");
   try {
-    await writeFile(requestPath, JSON.stringify(request), "utf8");
+    // The engine defaults an absent cropMode to "track" and now fails loud when no
+    // tracking data exists. Callers of this client that do not carry keyframes or
+    // layouts (the local queue, CLI demos, tests) want a centre crop; callers that
+    // do carry tracking already set "track" explicitly, so this never overrides them.
+    const plan = { ...request.plan };
+    if (plan.cropMode === undefined) {
+      plan.cropMode =
+        plan.cropKeyframes || plan.sceneLayouts || plan.compositionLayouts ? "track" : "center";
+    }
+    await writeFile(requestPath, JSON.stringify({ ...request, plan }), "utf8");
     const args = ["render", requestPath];
     if (options.ffmpegPath) args.push("--ffmpeg", options.ffmpegPath);
     if (options.ffprobePath) args.push("--ffprobe", options.ffprobePath);

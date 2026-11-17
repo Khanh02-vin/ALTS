@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use crate::paths::{
-    app_render_temp_dir, data_dir, ffmpeg_bin, is_remote_input, runtime_env, tool, venv_python,
+    app_render_temp_dir, ffmpeg_bin, is_remote_input, runtime_env, tool, venv_python,
 };
 use crate::youtube::{youtube_video_url, yt_video_meta};
 use ai_engine::{
@@ -28,6 +28,17 @@ use serde_json::Value;
 pub(crate) const REMOTE_CROP_MAX_SECONDS: f64 = 600.0;
 pub(crate) const REMOTE_CROP_MAX_BYTES: u64 = 600 * 1024 * 1024;
 
+/// Upper bound for one diarization/crop analysis window. Every duration check in
+/// this module uses it; a bare 1800.0 repeated at each call site drifts away from
+/// the analysis cap as soon as one of them is edited.
+pub(crate) const DIARIZATION_MAX_SECONDS: f64 = 1800.0;
+/// Upper bound for the extracted audio a diarization pass may read.
+pub(crate) const DIARIZATION_MAX_AUDIO_BYTES: u64 = REMOTE_CROP_MAX_BYTES;
+
+/// One gate for every remote-section limit: supported single-video URL, finite
+/// bounds, bounded duration, and a download under the size cap. Production calls
+/// it before downloading and again with the measured size; the tests exercise the
+/// same function, so the rules cannot drift out of coverage.
 pub(crate) fn remote_section_allowed(url: &str, start: f64, end: f64, download_bytes: u64) -> bool {
     youtube_video_url(url)
         && start.is_finite()
@@ -229,11 +240,30 @@ pub(crate) fn save_diarization_token(token: String) -> Result<(), String> {
     crate::paths::write_runtime_settings(&settings)
 }
 
-/// Legacy command kept for backwards compatibility: installs nothing (Python
-/// runtime no longer needed). Returns ok so old UI callers do not break.
+/// Legacy command kept for old UI callers. It used to install a Python runtime;
+/// diarization now uses the bundled ONNX models, so there is nothing to install.
+/// It must still tell the truth: report which prerequisites are actually present
+/// instead of returning a blanket `Ok(())` that makes a broken install look ready.
 #[tauri::command]
-pub(crate) fn install_diarization_runtime() -> Result<(), String> {
-    Ok(())
+pub(crate) fn install_diarization_runtime(app: tauri::AppHandle) -> Result<(), String> {
+    let ort = ai_engine::AiEngine::new().is_ok();
+    let face = ai_engine::AiEngine::model_path(&app, "face-detection.onnx").is_ok();
+    let vad = ai_engine::AiEngine::model_path(&app, "silero_vad.onnx").is_ok();
+    if ort && face && vad {
+        return Ok(());
+    }
+    let missing: Vec<&str> = [
+        (!ort).then_some("ONNX runtime"),
+        (!face).then_some("face-detection.onnx"),
+        (!vad).then_some("silero_vad.onnx"),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    Err(format!(
+        "DIARIZATION_RUNTIME_INCOMPLETE: missing {} — reinstall the app so the bundled models are restored",
+        missing.join(", ")
+    ))
 }
 
 /// Last outcome of [`auto_person_layouts`], kept for observability/verification.
@@ -290,7 +320,7 @@ fn diarize_video_blocking(
     if is_remote_input(path) {
         return Err("DIARIZATION_LOCAL_SOURCE_ONLY".into());
     }
-    if !duration.is_finite() || duration <= 0.0 || duration > 1800.0 {
+    if !duration.is_finite() || duration <= 0.0 || duration > DIARIZATION_MAX_SECONDS {
         return Err("DIARIZATION_DURATION_LIMIT".into());
     }
     let input = Path::new(&path)
@@ -324,7 +354,7 @@ fn diarize_video_blocking(
     let audio_bytes = std::fs::metadata(&audio)
         .map_err(|e| format!("DIARIZATION_AUDIO_STAT:{e}"))?
         .len();
-    if audio_bytes == 0 || audio_bytes > 600 * 1024 * 1024 {
+    if audio_bytes == 0 || audio_bytes > DIARIZATION_MAX_AUDIO_BYTES {
         return Err("DIARIZATION_AUDIO_SIZE_LIMIT".into());
     }
 
@@ -515,7 +545,7 @@ fn sample_speaker_faces_blocking(
             .ok_or("FACE_SPEAKER_INVALID")?;
         let time = sample["time"]
             .as_f64()
-            .filter(|value| value.is_finite() && *value >= 0.0 && *value < 1800.0)
+            .filter(|value| value.is_finite() && *value >= 0.0 && *value < DIARIZATION_MAX_SECONDS)
             .ok_or("FACE_TIME_INVALID")?;
         let frame = temp.0.join(format!("frame-{index:02}.jpg"));
         let status = tool(ffmpeg_bin(app))
@@ -570,8 +600,9 @@ fn sample_speaker_faces_blocking(
 /// 96 px-wide JPEG instead.
 fn encode_thumbnail(img: &RgbImage) -> String {
     let width = 96u32.min(img.width().max(1));
-    let height =
-        ((img.height() as f64 / img.width().max(1) as f64) * width as f64).round().max(1.0) as u32;
+    let height = ((img.height() as f64 / img.width().max(1) as f64) * width as f64)
+        .round()
+        .max(1.0) as u32;
     let thumb = image::imageops::resize(img, width, height, image::imageops::FilterType::Triangle);
     let mut buf = Vec::new();
     let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 70);
@@ -686,7 +717,7 @@ pub(crate) fn auto_person_layouts(
     let mut layouts = Vec::new();
     for &(start, end) in ranges {
         let mut range_info = serde_json::json!({ "start": start, "end": end });
-        if !start.is_finite() || !end.is_finite() || end <= start || end > 1800.0 {
+        if !start.is_finite() || !end.is_finite() || end <= start || end > DIARIZATION_MAX_SECONDS {
             range_info["skipped"] = serde_json::json!("invalid-range");
             report.per_range.push(range_info);
             continue;
@@ -795,7 +826,12 @@ pub(crate) fn auto_text_boxes(
     let mut layouts = Vec::new();
 
     for (range_index, &(start, end)) in ranges.iter().enumerate() {
-        if !start.is_finite() || !end.is_finite() || start < 0.0 || end <= start || end > 1800.0 {
+        if !start.is_finite()
+            || !end.is_finite()
+            || start < 0.0
+            || end <= start
+            || end > DIARIZATION_MAX_SECONDS
+        {
             return Err("OCR_INVALID_RANGE".into());
         }
         let samples = sample_counts[range_index];
@@ -903,7 +939,7 @@ fn analyze_crop_path_blocking(
     if is_remote_input(path) {
         return Err("CROP_LOCAL_SOURCE_ONLY".into());
     }
-    if !duration.is_finite() || duration <= 0.0 || duration > 1800.0 {
+    if !duration.is_finite() || duration <= 0.0 || duration > DIARIZATION_MAX_SECONDS {
         return Err("CROP_DURATION_LIMIT".into());
     }
     let intervals = speaker_intervals
@@ -995,12 +1031,9 @@ fn analyze_remote_crop_section_blocking(
     if !youtube_video_url(url) {
         return Err("INVALID_PUBLIC_VIDEO_URL".into());
     }
-    if !start.is_finite()
-        || !end.is_finite()
-        || start < 0.0
-        || end <= start
-        || end - start > REMOTE_CROP_MAX_SECONDS
-    {
+    // 0 bytes: this call checks the URL/bounds half only; the size half runs after
+    // the download below with the measured byte count.
+    if !remote_section_allowed(url, start, end, 0) {
         return Err("CROP_DURATION_LIMIT".into());
     }
     let (_title, source_duration) = yt_video_meta(app, url)?;
@@ -1026,6 +1059,8 @@ fn analyze_remote_crop_section_blocking(
             "-m",
             "yt_dlp",
             "--no-playlist",
+            "--socket-timeout",
+            "20",
             "-f",
             "bestvideo[ext=mp4]/bestvideo/best",
             "-o",
@@ -1035,16 +1070,19 @@ fn analyze_remote_crop_section_blocking(
         command.arg(arg);
     }
     command.arg(url);
-    let output = command
-        .output()
-        .map_err(|e| format!("REMOTE_SECTION_DOWNLOAD:{e}"))?;
+    // The section is capped in duration, so a 10-minute ceiling is generous while
+    // still failing fast on a stalled CDN.
+    let output =
+        crate::paths::output_with_timeout(&mut command, std::time::Duration::from_secs(600))
+            .map_err(|e| format!("REMOTE_SECTION_DOWNLOAD:{e}"))?;
     if !output.status.success() {
         return Err(format!(
             "REMOTE_SECTION_DOWNLOAD:{}",
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    if dir_size(&temp.0)? >= REMOTE_CROP_MAX_BYTES {
+    let measured = dir_size(&temp.0)?;
+    if !remote_section_allowed(url, start, end, measured) {
         return Err("REMOTE_SECTION_SIZE_LIMIT".into());
     }
     let source = std::fs::read_dir(&temp.0)
@@ -1261,7 +1299,7 @@ fn analyze_scene_layouts_blocking(
     if is_remote_input(path) {
         return Err("SCENE_LOCAL_SOURCE_ONLY".into());
     }
-    if !duration.is_finite() || duration <= 0.0 || duration > 1800.0 {
+    if !duration.is_finite() || duration <= 0.0 || duration > DIARIZATION_MAX_SECONDS {
         return Err("SCENE_DURATION_LIMIT".into());
     }
     let input = Path::new(&path)

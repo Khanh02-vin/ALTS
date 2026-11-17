@@ -5,6 +5,11 @@ edition = "2021"
 
 [dependencies]
 # ONNX Runtime bindings for running face-detection / VAD models without Python.
+#
+# Pinned to an RC on purpose: 2.0.0-rc.15 is the latest published version and the
+# whole 2.x API line is still pre-release (1.x is a different, incompatible API).
+# The pin is exact so a silent RC bump cannot land without review; revisit when a
+# 2.0.0 stable is published.
 ort = { version = "=2.0.0-rc.15", features = [] }
 image = "0.25"
 serde = { version = "1", features = ["derive"] }

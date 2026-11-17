@@ -39,7 +39,7 @@ if [[ "${LIGHTWEIGHT:-0}" != "1" ]]; then
     tmp_model="$OCR_MODEL.part"
     rm -f "$tmp_model"
     echo "==> OCR model: downloading pinned PP-OCRv6_det_small.onnx"
-    curl -L --fail --retry 3 -o "$tmp_model" "$OCR_MODEL_URL"
+    curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$tmp_model" "$OCR_MODEL_URL"
     if command -v sha256sum >/dev/null 2>&1; then actual="$(sha256sum "$tmp_model" | cut -d' ' -f1)"
     elif command -v shasum >/dev/null 2>&1; then actual="$(shasum -a 256 "$tmp_model" | cut -d' ' -f1)"
     else echo "No SHA-256 utility available" >&2; rm -f "$tmp_model"; exit 1
@@ -111,7 +111,7 @@ else
   url="https://nodejs.org/dist/${NODE_VERSION}/node-${NODE_VERSION}-${NODE_OS}-${NODE_ARCH}.${NODE_PKG}"
   echo "==> node: downloading $url"
   tmp="$(mktemp -d)"
-  curl -L --fail --retry 3 -o "$tmp/node.pkg" "$url"
+  curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$tmp/node.pkg" "$url"
   if [[ "$NODE_PKG" == "zip" ]]; then
     mkdir -p "$tmp/x"
     extract_zip "$tmp/node.pkg" "$tmp/x"
@@ -178,7 +178,7 @@ else
     found_fp="$(find "$tmp/x" -type f \( -name 'ffprobe' -o -name 'ffprobe.exe' \) | head -1)"
     [[ -n "$found_ff" && -n "$found_fp" ]] && break
     echo "==> ffmpeg: downloading $url"
-    curl -L --fail --retry 3 -o "$tmp/ff.pkg" "$url" || { echo "    download failed, trying next mirror" >&2; continue; }
+    curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$tmp/ff.pkg" "$url" || { echo "    download failed, trying next mirror" >&2; continue; }
     # Integrity guard: a truncated or HTML error page fails extraction here
     # and we fall through to the next mirror instead of aborting the fetch.
     if [[ "$url" == *.zip ]]; then
@@ -233,7 +233,7 @@ for model in $WHISPER_MODELS; do
     *) echo "    unknown whisper model '$model'" >&2; exit 1 ;;
   esac
   echo "  Fetching: $url -> $final"
-  curl -L --fail --retry 3 -o "$final" "$url"
+  curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$final" "$url"
 done
 
 # --- whisper-cli binary (standalone, no Python) --------------------------------
@@ -274,7 +274,7 @@ elif [[ "$OS" == Darwin ]]; then
   trap 'rm -rf "$tmp"' EXIT
   mkdir -p "$tmp/source" "$tmp/build"
   echo "  Fetching whisper.cpp source: $WHISPER_CPP_SOURCE_REF"
-  curl -L --fail --retry 3 -o "$tmp/whisper.cpp.tar.gz" \
+  curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$tmp/whisper.cpp.tar.gz" \
     "https://github.com/ggml-org/whisper.cpp/archive/${WHISPER_CPP_SOURCE_REF}.tar.gz"
   tar -xzf "$tmp/whisper.cpp.tar.gz" -C "$tmp/source" --strip-components=1
   cmake -S "$tmp/source" -B "$tmp/build" \
@@ -296,7 +296,7 @@ else
   echo "  Fetching whisper-cli: $WHISPER_CLI_URL"
   tmp="$(mktemp -d)"
   mkdir -p "$tmp/x"
-  curl -L --fail --retry 3 -o "$tmp/whisper-cli.pkg.part" "$WHISPER_CLI_URL"
+  curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$tmp/whisper-cli.pkg.part" "$WHISPER_CLI_URL"
   mv "$tmp/whisper-cli.pkg.part" "$tmp/whisper-cli.pkg"
   case "$WHISPER_CLI_URL" in
     *.tar.gz|*.tgz) tar xf "$tmp/whisper-cli.pkg" -C "$tmp/x" ;;
@@ -334,7 +334,7 @@ if [[ -s "$WHISPER_MODEL_TINY" ]]; then
   echo "    whisper.cpp model ggml-tiny.bin already present"
 else
   echo "  Fetching whisper.cpp model: $WHISPER_MODEL_TINY_URL"
-  curl -L --fail --retry 3 -o "$WHISPER_MODEL_TINY" "$WHISPER_MODEL_TINY_URL"
+  curl -L --fail --retry 3 --retry-max-time 300 --connect-timeout 15 --max-time 1800 -o "$WHISPER_MODEL_TINY" "$WHISPER_MODEL_TINY_URL"
   echo "    whisper.cpp model ggml-tiny.bin installed"
 fi
 

@@ -273,18 +273,24 @@ fn rag_clear_session() {
 /// Where the bundled adapter-node RAG server entry lives (web/build-node/index.js
 /// bundled as the `build-node` resource). Falls back to the dev-tree build so a
 /// `tauri dev` run without a packaged resource still works.
+/// Path to the RAG sidecar entry produced by `npm run build:node`.
+///
+/// Prefers `sidecar.mjs`, the generated wrapper that pins HOST to loopback even
+/// when the artefact is launched by hand; falls back to adapter-node's own
+/// `index.js` for builds that predate the wrapper.
 pub(crate) fn rag_entry(app: &tauri::AppHandle) -> Result<PathBuf, String> {
-    let candidate = app
+    let resource_dir = app
         .path()
         .resource_dir()
-        .map_err(|e| format!("RESOURCE_DIR:{e}"))?
-        .join("build-node/index.js");
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-    let dev = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/build-node/index.js");
-    if dev.is_file() {
-        return Ok(dev);
+        .map_err(|e| format!("RESOURCE_DIR:{e}"))?;
+    let dev_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../web/build-node");
+    for dir in [resource_dir.join("build-node"), dev_dir] {
+        for name in ["sidecar.mjs", "index.js"] {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return Ok(candidate);
+            }
+        }
     }
     Err("RAG_SERVER_MISSING: web/build-node/index.js not found in resources or dev tree (run: npm run build:node)".into())
 }
@@ -500,11 +506,12 @@ pub(crate) fn run_whisper_bootstrap<R: tauri::Runtime>(
             None,
         );
         std::fs::create_dir_all(cache_dir()).map_err(|e| format!("STATE_DIR:{e}"))?;
-        let out = tool(&python)
-            .args(["-m", "venv"])
-            .arg(&venv)
-            .output()
-            .map_err(|e| format!("PYTHON_SPAWN:{e}"))?;
+        let mut cmd = tool(&python);
+        let out = crate::paths::output_with_timeout(
+            cmd.args(["-m", "venv"]).arg(&venv),
+            std::time::Duration::from_secs(300),
+        )
+        .map_err(|e| format!("PYTHON_SPAWN:{e}"))?;
         if !out.status.success() {
             return Err(format!(
                 "VENV_FAILED:{}",
@@ -514,7 +521,11 @@ pub(crate) fn run_whisper_bootstrap<R: tauri::Runtime>(
     }
     let pip = whisper_venv_bin("pip");
     set_bootstrap(state, "pip", "Upgrading pip…", false, None);
-    let _ = tool(&pip).args(["install", "--upgrade", "pip"]).output();
+    let mut upgrade = tool(&pip);
+    let _ = crate::paths::output_with_timeout(
+        upgrade.args(["install", "--upgrade", "pip"]),
+        std::time::Duration::from_secs(300),
+    );
     set_bootstrap(
         state,
         "whisper",
@@ -522,15 +533,22 @@ pub(crate) fn run_whisper_bootstrap<R: tauri::Runtime>(
         false,
         None,
     );
-    let install = tool(&pip)
-        .args([
+    // Pinned versions: an unpinned `pip install yt-dlp` silently upgrades a library
+    // that is executed inside the user's venv. Bump these deliberately with
+    // models/requirements.txt, not at bootstrap time.
+    let mut install_cmd = tool(&pip);
+    let install = crate::paths::output_with_timeout(
+        install_cmd.args([
             "install",
-            "openai-whisper",
-            "yt-dlp",
-            "youtube-transcript-api",
-        ])
-        .output()
-        .map_err(|e| format!("PIP_SPAWN:{e}"))?;
+            "openai-whisper==20250625",
+            "yt-dlp==2026.8.19",
+            "youtube-transcript-api==1.2.4",
+        ]),
+        // PyTorch is ~2 GB: a generous ceiling, but still bounded so a hung CDN
+        // mirror fails the bootstrap instead of pinning the setup dialog forever.
+        std::time::Duration::from_secs(1800),
+    )
+    .map_err(|e| format!("PIP_SPAWN:{e}"))?;
     if !install.status.success() {
         return Err(format!(
             "WHISPER_INSTALL_FAILED:{}",
@@ -1446,7 +1464,10 @@ pub(crate) fn whisper_cpp_status(app: tauri::AppHandle) -> serde_json::Value {
     let binary = whisper_cpp_bin(&app);
     let model = whisper_cpp_model(&app);
     serde_json::json!({
-        "engine": runtime_env().get("WHISPER_ENGINE").cloned().unwrap_or_else(|| "python".into()),
+        // Must match the actual default used by chunked-whisper.ts and helper_env:
+        // reporting "python" here made Settings show the wrong engine whenever
+        // runtime.env had no explicit WHISPER_ENGINE.
+        "engine": runtime_env().get("WHISPER_ENGINE").cloned().unwrap_or_else(|| "cpp".into()),
         "binary": binary,
         "model": model,
         "binaryReady": binary.is_file(),

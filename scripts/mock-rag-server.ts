@@ -5,14 +5,28 @@
 import { createServer } from "node:http";
 import { parse } from "node:url";
 
-const PORT = 1420;
+const PORT = Number(process.env.MOCK_RAG_PORT ?? 1420);
+// Dev-only stub, but binding all interfaces on a laptop with a LAN would publish
+// it to every machine on the network. Loopback unless explicitly overridden.
+const HOST = process.env.MOCK_RAG_HOST ?? "127.0.0.1";
 const state: { playlists: unknown[]; videos: unknown[] } = { playlists: [], videos: [] };
 
 createServer((req, res) => {
   const { pathname } = parse(req.url ?? "/", true);
 
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  // The real sidecar is same-origin (the webview fetches 127.0.0.1 directly), so
+  // the mock only needs CORS for local tooling. Echo the loopback origin instead
+  // of "*" so a page open in a browser cannot read another service's data here.
+  const origin = req.headers.origin;
+  const allowedOrigin =
+    origin === undefined || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)
+      ? origin ?? "*"
+      : null;
+  if (allowedOrigin) {
+    res.setHeader("Access-Control-Allow-Origin", allowedOrigin);
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    res.setHeader("Vary", "Origin");
+  }
   res.setHeader("Content-Type", "application/json");
 
   if (req.method === "OPTIONS") return res.writeHead(204).end();
@@ -46,4 +60,4 @@ createServer((req, res) => {
 
   res.writeHead(404);
   res.end(JSON.stringify({ message: "UNKNOWN_ENDPOINT" }));
-}).listen(PORT, () => console.log(`Ponytail mock RAG server: http://localhost:${PORT}`));
+}).listen(PORT, HOST, () => console.log(`Ponytail mock RAG server: http://${HOST}:${PORT}`));

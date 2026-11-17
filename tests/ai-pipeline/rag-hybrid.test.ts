@@ -53,13 +53,39 @@ const stubPort = (stub.address() as { port: number }).port;
 const state = mkdtempSync(join(tmpdir(), "rag-hybrid-"));
 process.env.LOCAL_FIRST_STATE_DIR = state;
 process.env.LOCAL_LLM_BASE_URL = `http://127.0.0.1:${stubPort}`;
+// The sidecar is fail-closed without a token, so the test supplies one and sends
+// it on every call — exactly what the desktop shell does at spawn time.
+const RAG_TOKEN = "test-session-token";
+process.env.LFAI_RAG_TOKEN = RAG_TOKEN;
 
 const { POST, GET } = await import("../../apps/web/src/routes/api/rag/+server.ts");
 
 async function call(method: "GET" | "POST", path: string, payload?: unknown): Promise<Response> {
-  if (method === "GET") return GET({ url: new URL(`http://127.0.0.1${path}`) } as Parameters<typeof GET>[0]);
-  const request = new Request(`http://127.0.0.1${path}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload) });
+  const headers = { authorization: `Bearer ${RAG_TOKEN}` };
+  if (method === "GET") {
+    return GET({
+      url: new URL(`http://127.0.0.1${path}`),
+      request: new Request(`http://127.0.0.1${path}`, { headers }),
+    } as Parameters<typeof GET>[0]);
+  }
+  const request = new Request(`http://127.0.0.1${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", ...headers },
+    body: JSON.stringify(payload),
+  });
   return POST({ request } as Parameters<typeof POST>[0]);
+}
+
+// A missing/wrong bearer must be refused before any state is read.
+{
+  const unauthorized = await POST({
+    request: new Request("http://127.0.0.1/api/rag/ingest", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ videoUrl: "https://www.youtube.com/watch?v=vidAAAA1", segments: [{ start: 0, end: 1, text: "x" }] }),
+    }),
+  } as Parameters<typeof POST>[0]);
+  assert.equal(unauthorized.status, 401, "a request without the session token must be rejected");
 }
 
 // --- ingest: two videos, embeddings must be written --------------------------
