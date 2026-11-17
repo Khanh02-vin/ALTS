@@ -1,11 +1,11 @@
-# Implementation status — v0.1.4
+# Implementation status — v0.1.5
 
-Updated: 2026-11-17. Scope: local working tree on `release/v0.1.4`, including uncommitted changes. These results do not certify a published installer or a clean machine.
+Updated: 2026-11-17. Scope: the working tree built into the `v0.1.5` tag. These
+results come from this checkout; they do not certify the CI-built installers or a
+clean machine.
 
-> **Delta since 2026-11-10.** The working tree at HEAD `a7ce2be` is 15 commits
-> ahead of `origin/release/v0.1.4` and the pushed `v0.1.4` tag still points at
-> `8e37279`. Everything below describes the working tree, not a shipped artefact.
-> Changes landed since the previous revision:
+> **Delta since v0.1.4.** The `v0.1.4` tag points at `8e37279` (2026-11-08) and is
+> unchanged; everything below describes v0.1.5. Changes since that tag:
 >
 > - Transcription default is **whisper.cpp** (`WHISPER_ENGINE` unset ⇒ `cpp`);
 >   see the update note in ADR-009. Python remains available opt-in.
@@ -131,5 +131,5 @@ Consistent with `docs/backlog.md` and the local-first scope:
 - Silero VAD is used in diarization; clip boundaries use transcript timing heuristics.
 - Facebook/TikTok availability depends on upstream access restrictions and yt-dlp; there is no equivalent in-app YouTube embed for those sources.
 - Best-effort preview quota does not bound temporary files during active transcodes or guarantee deletion when the OS denies it.
-- Passing the local checks is not evidence of live-provider quality or installer readiness. Historical v0.1.0 run IDs, download sizes and signing claims must not be reused as v0.1.4 provenance.
+- Passing the local checks is not evidence of live-provider quality or installer readiness. Historical v0.1.0 run IDs, download sizes and signing claims must not be reused as v0.1.5 provenance.
 - `release/linux-pilot-validation.md` remains historical v0.1.0 evidence until its checklist is rerun against a specific new artifact. No release was published by this maintenance pass.
