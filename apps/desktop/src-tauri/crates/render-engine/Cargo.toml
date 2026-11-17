@@ -6,11 +6,15 @@ edition = "2021"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The contract structs carry the typeshare attribute, so the TypeScript contract is
+# generated from these declarations. A regular dependency: the attribute lives on the
+# structs, so a release build needs the macro too.
+#
+# It must stay in [dependencies], not under the cfg(unix) block below: it was nested
+# there and the Windows build failed with "unresolved import `typeshare`".
+typeshare = "1.0.5"
+
 # PR_SET_PDEATHSIG on the ffmpeg child: a SIGKILLed app must not leave an
 # encoding tree running (the main app crate guards its own spawns the same way).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# The contract structs carry the typeshare attribute, so the TypeScript contract is
-# generated from these declarations. A regular dependency: the attribute lives on the
-# structs, so a release build needs the macro too.
-typeshare = "1.0.5"

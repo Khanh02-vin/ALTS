@@ -7,9 +7,11 @@
 
 use std::process::Command;
 
-/// Applies PR_SET_PDEATHSIG (SIGKILL) on unix. Call before `spawn()`/`group()`.
+/// Applies PR_SET_PDEATHSIG (SIGKILL) on Linux. Call before `spawn()`/`group()`.
 pub(crate) fn set_parent_death_sig(cmd: &mut Command) {
-    #[cfg(unix)]
+    // Linux only: prctl has no macOS/BSD equivalent and the release workflow
+    // builds on macOS, where the previous cfg(unix) failed to compile.
+    #[cfg(target_os = "linux")]
     {
         use std::os::unix::process::CommandExt;
         let app_pid = std::process::id();
@@ -29,7 +31,7 @@ pub(crate) fn set_parent_death_sig(cmd: &mut Command) {
             });
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(not(target_os = "linux"))]
     let _ = cmd;
 }
 

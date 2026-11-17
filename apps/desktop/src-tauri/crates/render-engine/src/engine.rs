@@ -87,19 +87,27 @@ pub fn run_render_child(
         command.process_group(0);
         // PR_SET_PDEATHSIG: a SIGKILLed app (OOM killer, force-quit) must not
         // leave this encoding tree running — Drop handlers never run on SIGKILL.
-        let app_pid = std::process::id();
-        unsafe {
-            command.pre_exec(move || {
-                const PR_SET_PDEATHSIG: libc::c_int = 1;
-                if libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // Close the fork/prctl race: if the app died in between, die too.
-                if libc::getppid() as u32 != app_pid {
-                    libc::_exit(1);
-                }
-                Ok(())
-            });
+        //
+        // Linux-only: PR_SET_PDEATHSIG is a Linux prctl. macOS/BSD are unix too
+        // but have no `prctl`, so a plain cfg(unix) here failed the macOS release
+        // build with "cannot find function prctl in crate libc". macOS keeps the
+        // process-group kill; the orphan-on-SIGKILL case is Linux-only today.
+        #[cfg(target_os = "linux")]
+        {
+            let app_pid = std::process::id();
+            unsafe {
+                command.pre_exec(move || {
+                    const PR_SET_PDEATHSIG: libc::c_int = 1;
+                    if libc::prctl(PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    // Close the fork/prctl race: if the app died in between, die too.
+                    if libc::getppid() as u32 != app_pid {
+                        libc::_exit(1);
+                    }
+                    Ok(())
+                });
+            }
         }
     }
     #[cfg(windows)]
